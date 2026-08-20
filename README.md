@@ -132,6 +132,39 @@ cargo run -p nexusd db migration run
 
 The manager will automatically handle migrations in the appropriate order, progressing through phases as needed.
 
+### Runbook: backfilling auction terms on listing rows (`ListingAuctionTermsReindex1787256279`)
+
+Marketplace listings indexed before the index carried the auction term fields
+(`auction_starts_at`, `auction_ends_at`, and the reserve/buy-now/minimum-increment
+prices) serve `null` terms until re-indexed. This single-staged migration finds
+every auction row without terms in the graph, re-reads each listing's canonical
+record from its seller's homeserver (`/pub/pubky.app/marketplace/v1/listings/…`),
+and re-runs the normal listing ingest — upserting the full details in Neo4j and
+Redis and rescoring the listing in the auction end-time sorted set.
+
+To run it, an operator executes on a host with access to the deployment's
+Neo4j and Redis (connection settings in `~/.pubky-nexus/migrations/config.toml`;
+the file is created with defaults on first run):
+
+```bash
+cargo run -p nexusd -- db migration run
+```
+
+Operational notes:
+
+- The migration needs outbound access to homeservers (it reads canonical
+  records over the Pubky client, mainnet by default). For a local testnet
+  deployment set `testnet = true` and `testnet_host` in the migration config.
+- It is **idempotent**: reindexed listings gain their terms and drop out of the
+  candidate query. If some listings fail (e.g. a homeserver was unreachable),
+  the migration reports the count, stays in the backfill phase, and a re-run
+  retries only the failed ones.
+- A listing whose canonical record no longer exists on its homeserver is
+  logged and left untouched; removals stay with the watcher's DEL pipeline.
+- The watcher does not need to be stopped: the backfill runs the same ingest
+  as a PUT event, and a concurrent seller re-publish simply wins with newer
+  data.
+
 ## 🧪 Running Tests
 
 Running tests requires setting up mock data (`docker/test-graph/mocks`) into Neo4j and Redis.

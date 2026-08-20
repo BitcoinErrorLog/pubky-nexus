@@ -5,6 +5,12 @@ name = "nexusd.migration"
 #backfill_ready = ["Xakala1741101644"]
 backfill_ready = []
 
+# Backfills that re-read canonical records from homeservers (e.g. the
+# auction-terms reindex) use the Pubky client. Set testnet = true and the
+# host when the homeservers live on a local testnet; mainnet by default.
+testnet = false
+testnet_host = "localhost"
+
 [stack]
 # Logging, options: error, warn, info, debug and trace
 log_level = "debug"

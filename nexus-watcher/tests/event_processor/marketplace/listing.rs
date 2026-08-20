@@ -2,12 +2,14 @@ use super::utils::{test_auction_listing, test_listing};
 use crate::event_processor::utils::watcher::WatcherTest;
 use anyhow::Result;
 use nexus_common::db::kv::SortOrder;
+use nexus_common::db::reindex::get_auction_listings_missing_terms;
 use nexus_common::db::RedisOps;
 use nexus_common::models::marketplace::{
     ListingDetails, ListingSaleFormat, ListingStream, ListingStreamFilters, ListingStreamSorting,
     LISTING_AUCTION_ENDS_KEY_PARTS,
 };
 use nexus_common::types::Pagination;
+use nexus_watcher::events::handlers::listing::backfill_missing_auction_terms;
 use pubky::Keypair;
 use pubky_app_specs::{
     PubkyAppListingCondition, PubkyAppListingSale, PubkyAppListingState, PubkyAppMoney,
@@ -596,6 +598,124 @@ async fn test_stream_listings_sorted_by_auction_end() -> Result<()> {
     assert_eq!(stream_titles(&stream), vec!["Soonest", "Middle", "Latest"]);
 
     // Cleanup user
+    test.cleanup_user(&user_kp).await?;
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_auction_terms_backfill_reindexes_pre_term_rows() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+
+    let user_kp = Keypair::random();
+    let user = PubkyAppUser {
+        bio: Some("test_auction_terms_backfill_reindexes_pre_term_rows".to_string()),
+        image: None,
+        links: None,
+        name: "Watcher:AuctionBackfill:User".to_string(),
+        status: None,
+    };
+    let user_id = test.create_user(&user_kp, &user).await?;
+
+    // Index an auction listing through the normal pipeline; the canonical
+    // record stays on the test homeserver for the backfill to re-read
+    let starts_at = "2025-02-01T00:00:00Z";
+    let ends_at = "2025-02-08T00:00:00Z";
+    let listing = test_auction_listing(
+        &user_id,
+        "Backfill pocket watch",
+        "collectibles",
+        starts_at,
+        ends_at,
+    );
+    let (listing_id, listing_path) = test.create_listing(&user_kp, &listing).await?;
+
+    let indexed_listing = ListingDetails::get_from_index(&user_id, &listing_id)
+        .await
+        .unwrap()
+        .expect("The auction listing details were not indexed");
+    assert!(indexed_listing.auction_ends_at.is_some());
+
+    // Simulate a row written before the index carried the auction term
+    // fields: rewrite the graph node and the index entry from details whose
+    // terms are all None. `create_listing` SETs the null params, which
+    // removes the properties from the node — exactly the legacy shape — and
+    // the index rewrite drops the listing from the auction sorted set the
+    // same way legacy rows were never in it.
+    let legacy_details = ListingDetails {
+        auction_starts_at: None,
+        auction_ends_at: None,
+        auction_reserve_price_minor: None,
+        auction_buy_now_price_minor: None,
+        auction_minimum_increment_minor: None,
+        ..indexed_listing
+    };
+    legacy_details.put_to_graph().await.unwrap();
+    legacy_details.put_to_index(true).await.unwrap();
+
+    let graph_listing = ListingDetails::get_from_graph(&user_id, &listing_id)
+        .await
+        .unwrap()
+        .expect("The legacy-shaped listing should still be in the graph");
+    assert_eq!(graph_listing.sale_format, ListingSaleFormat::Auction);
+    assert!(
+        graph_listing.auction_ends_at.is_none(),
+        "The simulated pre-term row must serve null auction terms"
+    );
+    let ends_at_ms = rfc3339_ms(ends_at);
+    let member = format!("{user_id}:{listing_id}");
+    let entries = auction_set_entries(ends_at_ms, ends_at_ms).await;
+    assert!(
+        !entries.iter().any(|(key, _)| key == &member),
+        "The simulated pre-term row must not be in the auction sorted set"
+    );
+
+    // Run the backfill: it must find the pre-term row and reindex it from
+    // the homeserver record
+    let summary = backfill_missing_auction_terms().await.unwrap();
+    assert!(
+        summary.reindexed >= 1,
+        "The backfill should have reindexed the pre-term listing, got {summary:?}"
+    );
+
+    // The row gained its auction terms in both the graph and the index
+    let graph_listing = ListingDetails::get_from_graph(&user_id, &listing_id)
+        .await
+        .unwrap()
+        .expect("The backfilled listing should be in the graph");
+    assert_eq!(graph_listing.auction_starts_at.as_deref(), Some(starts_at));
+    assert_eq!(graph_listing.auction_ends_at.as_deref(), Some(ends_at));
+    assert_eq!(graph_listing.auction_reserve_price_minor, Some(2_000));
+    assert_eq!(graph_listing.auction_buy_now_price_minor, Some(10_000));
+    assert_eq!(graph_listing.auction_minimum_increment_minor, Some(100));
+
+    let indexed_listing = ListingDetails::get_from_index(&user_id, &listing_id)
+        .await
+        .unwrap()
+        .expect("The backfilled listing details should be indexed");
+    assert_eq!(indexed_listing.auction_ends_at.as_deref(), Some(ends_at));
+    assert_eq!(indexed_listing.auction_ends_at_ms(), Some(ends_at_ms));
+
+    // ...and is scored by its end time in the auction sorted set again
+    let entries = auction_set_entries(ends_at_ms, ends_at_ms).await;
+    assert!(
+        entries
+            .iter()
+            .any(|(key, score)| key == &member && *score == ends_at_ms as f64),
+        "The backfilled auction listing should be scored by its end time in the auction sorted set"
+    );
+
+    // Backfilled rows leave the candidate set, so the mechanism is idempotent
+    let candidates = get_auction_listings_missing_terms().await.unwrap();
+    assert!(
+        !candidates
+            .iter()
+            .any(|(owner, id)| owner == &user_id && id == &listing_id),
+        "A backfilled listing must no longer be a backfill candidate"
+    );
+
+    // Cleanup
+    test.del(&user_kp, &listing_path).await?;
     test.cleanup_user(&user_kp).await?;
 
     Ok(())

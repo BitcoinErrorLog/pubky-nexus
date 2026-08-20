@@ -1,5 +1,6 @@
 use super::MigrationManager;
 use async_trait::async_trait;
+use nexus_common::db::PubkyConnector;
 use nexus_common::file::ConfigLoader;
 use nexus_common::types::DynError;
 use nexus_common::StackConfig;
@@ -19,8 +20,19 @@ const DEFAULT_CONFIG_TOML: &str = include_str!("default.config.toml");
 pub struct MigrationConfig {
     pub name: String,
     pub backfill_ready: Vec<String>,
+    /// True when the homeservers that backfills re-read canonical records
+    /// from live on a local testnet (mirrors the watcher config).
+    #[serde(default)]
+    pub testnet: bool,
+    /// Hostname of the local testnet, only used when `testnet` is true.
+    #[serde(default = "default_testnet_host")]
+    pub testnet_host: String,
     // TODO: Choose a right name
     pub stack: StackConfig,
+}
+
+fn default_testnet_host() -> String {
+    "localhost".to_string()
 }
 
 #[derive(Debug)]
@@ -59,6 +71,15 @@ impl MigrationBuilder {
     pub async fn init_stack(&self) -> Result<MigrationManager, DynError> {
         // Open ddbb connections and init tracing layer
         StackManager::setup(&self.0.name, &self.0.stack).await?;
+        // Backfills that re-read canonical records from homeservers (e.g. the
+        // auction-terms reindex) need the Pubky client, initialised exactly
+        // like the watcher builder does
+        let testnet_host = if self.0.testnet {
+            Some(self.0.testnet_host.as_str())
+        } else {
+            None
+        };
+        let _ = PubkyConnector::initialise(testnet_host).await;
         Ok(MigrationManager::default())
     }
 
