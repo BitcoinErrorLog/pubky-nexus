@@ -23,6 +23,7 @@ async fn test_homeserver_self_untag_post_no_notification() -> Result<()> {
 
     // User creates a post
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:SelfUntagPostNotification:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

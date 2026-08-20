@@ -4,6 +4,7 @@ pub mod event;
 pub mod file;
 pub mod follow;
 pub mod homeserver;
+pub mod marketplace;
 pub mod notification;
 pub mod post;
 pub mod tag;

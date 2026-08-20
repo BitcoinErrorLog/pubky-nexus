@@ -55,6 +55,7 @@ async fn test_homeserver_mentions() -> Result<()> {
         "This is a post mentioning pk:{mentioned_user_1_id}, and also pubky{mentioned_user_2_id}"
     );
     let post = PubkyAppPost {
+        lock: None,
         content: post_content.clone(),
         kind: PubkyAppPostKind::Short,
         parent: None,

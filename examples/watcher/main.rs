@@ -29,7 +29,7 @@ async fn main() -> Result<(), DynError> {
             let homeserver =
                 PubkyId::try_from("8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty").unwrap();
             let moderation_id =
-                PubkyId::try_from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+                PubkyId::try_from("51y9w1skwcryb3iq4sia3x49qwpgstc5feo5tqon65gid7o99khy").unwrap();
             let stack = StackConfig {
                 log_level: LOG_LEVEL,
                 files_path: get_files_dir_pathbuf(),

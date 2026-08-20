@@ -87,6 +87,12 @@ pub async fn handle_put_event(
             )
             .await?
         }
+        (PubkyAppObject::Shop(shop), Resource::Shop) => {
+            handlers::shop::sync_put(shop, user_id).await?
+        }
+        (PubkyAppObject::Listing(listing), Resource::Listing(listing_id)) => {
+            handlers::listing::sync_put(*listing, user_id, listing_id).await?
+        }
         other => debug!("Event type not handled, Resource: {other:?}"),
     }
     Ok(())
@@ -111,6 +117,10 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
         Resource::Tag(tag_id) => handlers::tag::del(user_id, tag_id.clone()).await?,
         Resource::File(file_id) => {
             handlers::file::del(&user_id, file_id.clone(), event.files_path.clone()).await?
+        }
+        Resource::Shop => handlers::shop::del(user_id).await?,
+        Resource::Listing(listing_id) => {
+            handlers::listing::del(user_id, listing_id.clone()).await?
         }
         other => debug!("DEL event type not handled for resource: {other:?}"),
     }

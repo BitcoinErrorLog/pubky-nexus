@@ -28,6 +28,7 @@ async fn test_delete_user_with_relationships() -> Result<()> {
 
     // Create a post to establish a relationship
     let post = PubkyAppPost {
+        lock: None,
         content: "User's first post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -150,6 +151,7 @@ async fn test_delete_user_with_relationships() -> Result<()> {
 
     // Create a post to establish a relationship
     let post_b = PubkyAppPost {
+        lock: None,
         content: "User's Second post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -272,6 +274,7 @@ async fn test_delete_recommended_user() -> Result<()> {
     // Carol is an active user (has at least 5 posts)
     for i in 0..5 {
         let post = PubkyAppPost {
+            lock: None,
             content: format!("Carol's post {i}"),
             kind: PubkyAppPostKind::Short,
             parent: None,

@@ -1,7 +1,9 @@
 pub mod bookmark;
 pub mod file;
 pub mod follow;
+pub mod listing;
 pub mod post;
+pub mod shop;
 pub mod tag;
 pub mod user;
 pub mod utils;

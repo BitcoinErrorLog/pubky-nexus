@@ -18,7 +18,7 @@ pub const DEFAULT_MONITORED_HOMESERVERS_LIMIT: usize = 50;
 /// Default for [WatcherConfig::watcher_sleep]
 pub const DEFAULT_WATCHER_SLEEP: u64 = 5_000;
 // Moderation service key
-pub const MODERATION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub const MODERATION_ID: &str = "51y9w1skwcryb3iq4sia3x49qwpgstc5feo5tqon65gid7o99khy";
 // Moderation service key
 pub const MODERATED_TAGS: [&str; 6] = [
     "hatespeech",

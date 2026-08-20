@@ -35,6 +35,7 @@ async fn test_delete_parent_post_notification() -> Result<()> {
 
     // User A creates a post
     let post = PubkyAppPost {
+        lock: None,
         content: "Original post by User A".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -45,6 +46,7 @@ async fn test_delete_parent_post_notification() -> Result<()> {
 
     // User B replies to User A's post
     let reply = PubkyAppPost {
+        lock: None,
         content: "Reply by User B".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(post_uri_builder(user_a_id.clone(), post_id.clone())),

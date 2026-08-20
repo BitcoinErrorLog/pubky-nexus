@@ -29,6 +29,7 @@ async fn test_homeserver_put_post_event() -> Result<()> {
     let user_id = test.create_user(&user_kp, &user).await?;
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostEvent:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

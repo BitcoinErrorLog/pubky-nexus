@@ -191,7 +191,7 @@ async fn put_sync_user(
     {
         OperationOutcome::Updated => Ok(()),
         OperationOutcome::MissingDependency => {
-            if let Err(e) = Homeserver::maybe_ingest_for_user(tagged_user_id.as_str()).await {
+            if let Err(e) = Homeserver::maybe_ingest_for_user(tagged_user_id.as_ref()).await {
                 tracing::error!("Failed to ingest homeserver: {e}");
             }
 

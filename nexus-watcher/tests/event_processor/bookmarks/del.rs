@@ -35,6 +35,7 @@ async fn test_homeserver_unbookmark() -> Result<()> {
 
     // Step 2: Create a post under that user
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:Unbookmark:Author:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

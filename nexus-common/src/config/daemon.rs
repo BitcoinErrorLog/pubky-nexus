@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(c.watcher.watcher_sleep, 5_000);
         assert_eq!(
             c.watcher.moderation_id,
-            PubkyId::try_from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap()
+            PubkyId::try_from("51y9w1skwcryb3iq4sia3x49qwpgstc5feo5tqon65gid7o99khy").unwrap()
         );
         assert_eq!(
             c.watcher.moderated_tags,

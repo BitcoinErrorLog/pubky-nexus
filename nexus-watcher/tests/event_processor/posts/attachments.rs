@@ -47,6 +47,7 @@ async fn test_homeserver_post_attachments() -> Result<()> {
 
     let post_attachments = Some(vec![file_uri_builder(user_id.clone(), file_id.clone())]);
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostEvent:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

@@ -18,6 +18,7 @@ async fn test_homeserver_post_cannot_index() -> Result<()> {
     test.register_user(&user_kp).await?;
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:IndexFail:PostEvent:PostWithoutUser".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

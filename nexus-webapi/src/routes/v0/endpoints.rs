@@ -28,6 +28,12 @@ pub const POST_DETAILS_ROUTE: &str = concatcp!(POST_ROUTE, "/details");
 pub const POST_TAGS_ROUTE: &str = concatcp!(POST_ROUTE, "/tags");
 pub const POST_TAGGERS_ROUTE: &str = concatcp!(POST_ROUTE, "/taggers/{label}");
 
+// -- MARKETPLACE endpoints --
+const SHOP_PREFIX: &str = concatcp!(VERSION_ROUTE, "/shop");
+pub const SHOP_ROUTE: &str = concatcp!(SHOP_PREFIX, "/{seller_id}");
+const LISTING_PREFIX: &str = concatcp!(VERSION_ROUTE, "/listing");
+pub const LISTING_ROUTE: &str = concatcp!(LISTING_PREFIX, "/{seller_id}/{listing_id}");
+
 // -- STREAM endpoints --
 const STREAM_PREFIX: &str = concatcp!(VERSION_ROUTE, "/stream");
 // STREAM of UserView objects
@@ -39,6 +45,8 @@ pub const STREAM_USERS_BY_IDS_ROUTE: &str = concatcp!(STREAM_USERS_ROUTE, "/by_i
 pub const STREAM_POSTS_ROUTE: &str = concatcp!(STREAM_PREFIX, "/posts");
 pub const STREAM_POSTS_BY_IDS_ROUTE: &str = concatcp!(STREAM_POSTS_ROUTE, "/by_ids");
 pub const STREAM_POST_KEYS_ROUTE: &str = concatcp!(STREAM_POSTS_ROUTE, "/keys");
+// STREAM of ListingDetails objects
+pub const STREAM_LISTINGS_ROUTE: &str = concatcp!(STREAM_PREFIX, "/listings");
 // STREAM of Tags for posts
 pub const STREAM_TAGS_ROUTE: &str = concatcp!(STREAM_PREFIX, "/tags");
 pub const STREAM_TAGS_GLOBAL_ROUTE: &str = concatcp!(STREAM_TAGS_ROUTE, "/global");

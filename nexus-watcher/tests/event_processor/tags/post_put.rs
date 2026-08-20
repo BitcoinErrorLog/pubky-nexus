@@ -36,6 +36,7 @@ async fn test_homeserver_put_tag_post() -> Result<()> {
 
     // Step 2: Create a post under that user
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PutTagPost:User:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,
@@ -176,6 +177,7 @@ async fn test_homeserver_put_tag_post_unique_count() -> Result<()> {
 
     // Create a post under that user
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PutTagPost:User:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

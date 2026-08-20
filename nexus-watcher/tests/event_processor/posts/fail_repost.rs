@@ -37,6 +37,7 @@ async fn test_homeserver_post_repost_without_post_parent() -> Result<()> {
     test = test.remove_event_processing().await;
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostRepostFail:PostAuthor:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -48,6 +49,7 @@ async fn test_homeserver_post_repost_without_post_parent() -> Result<()> {
 
     // Create repost
     let repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostRepostFail:RepostAuthor:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

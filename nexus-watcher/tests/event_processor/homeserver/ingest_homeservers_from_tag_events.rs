@@ -29,6 +29,7 @@ async fn test_tag_post_on_unknown_homeserver() -> Result<()> {
 
     // Create tagged post
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:Homeserver:Tagged:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

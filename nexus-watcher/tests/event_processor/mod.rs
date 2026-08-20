@@ -2,6 +2,7 @@ mod bookmarks;
 mod files;
 mod follows;
 mod homeserver;
+mod marketplace;
 mod mentions;
 mod network;
 mod posts;

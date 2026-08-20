@@ -39,6 +39,7 @@ async fn test_homeserver_untag_post_notification() -> Result<()> {
 
     // Author creates a post
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:UntagPostNotification:Author:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

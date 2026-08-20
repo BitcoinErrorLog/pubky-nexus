@@ -23,6 +23,7 @@ async fn test_homeserver_post_reply_without_post_parent() -> Result<()> {
     test = test.remove_event_processing().await;
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostReplyFail:Author:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -36,6 +37,7 @@ async fn test_homeserver_post_reply_without_post_parent() -> Result<()> {
     let parent_absolute_uri = post_uri_builder(author_id.clone(), post_id);
 
     let reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostReplyFail:Author:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(parent_absolute_uri.clone()),

@@ -1,8 +1,16 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
+use crate::models::marketplace::{ListingDetails, ShopDetails};
 use crate::models::post::PostRelationships;
 use crate::models::{file::FileDetails, post::PostDetails, user::UserDetails};
 use pubky_app_specs::{ParsedUri, Resource};
+
+/// Serializes a unit enum variant into its snake_case string form for graph storage.
+fn enum_to_graph_string<T: serde::Serialize>(value: &T) -> GraphResult<String> {
+    let json =
+        serde_json::to_string(value).map_err(|e| GraphError::SerializationFailed(Box::new(e)))?;
+    Ok(json.trim_matches('"').to_string())
+}
 
 /// Create a user node
 pub fn create_user(user: &UserDetails) -> GraphResult<Query> {
@@ -128,7 +136,7 @@ fn add_relationship_params(
         };
 
         return Ok(cypher_query
-            .param(author_param, parent_author_id.as_str())
+            .param(author_param, parent_author_id.as_ref() as &str)
             .param(post_param, parent_post_id.as_str()));
     }
     Ok(cypher_query)
@@ -305,6 +313,116 @@ pub fn create_file(file: &FileDetails) -> GraphResult<Query> {
     .param("name", file.name.to_string())
     .param("content_type", file.content_type.to_string())
     .param("urls", urls);
+
+    Ok(query)
+}
+
+/// Creates or updates the marketplace shop node of a seller.
+/// The query returns no rows when the owner user is not yet indexed (missing dependency).
+pub fn create_shop(shop: &ShopDetails) -> Query {
+    Query::new(
+        "create_shop",
+        "MATCH (owner:User {id: $owner_id})
+        OPTIONAL MATCH (owner)-[:HAS_SHOP]->(existing_shop:Shop)
+        MERGE (owner)-[:HAS_SHOP]->(shop:Shop {owner_id: $owner_id})
+        ON CREATE SET shop.indexed_at = $indexed_at
+        SET shop.uri = $uri,
+            shop.name = $name,
+            shop.bio = $bio,
+            shop.country_code = $country_code,
+            shop.region = $region,
+            shop.avatar_url = $avatar_url,
+            shop.banner_url = $banner_url,
+            shop.shipping_policy = $shipping_policy,
+            shop.return_policy = $return_policy,
+            shop.vacation_mode = $vacation_mode,
+            shop.created_at = $created_at,
+            shop.updated_at = $updated_at,
+            shop.revision = $revision
+        // Returns true if the shop node already existed
+        RETURN existing_shop IS NOT NULL AS flag;",
+    )
+    .param("owner_id", shop.owner_id.to_string())
+    .param("uri", shop.uri.to_string())
+    .param("indexed_at", shop.indexed_at)
+    .param("name", shop.name.to_string())
+    .param("bio", shop.bio.to_string())
+    .param("country_code", shop.country_code.to_string())
+    .param("region", shop.region.clone())
+    .param("avatar_url", shop.avatar_url.clone())
+    .param("banner_url", shop.banner_url.clone())
+    .param("shipping_policy", shop.shipping_policy.to_string())
+    .param("return_policy", shop.return_policy.to_string())
+    .param("vacation_mode", shop.vacation_mode)
+    .param("created_at", shop.created_at.to_string())
+    .param("updated_at", shop.updated_at.to_string())
+    .param("revision", shop.revision)
+}
+
+/// Creates or updates a marketplace listing node of a seller.
+/// The query returns no rows when the seller user is not yet indexed (missing dependency).
+pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
+    let state = enum_to_graph_string(&listing.state)?;
+    let condition = enum_to_graph_string(&listing.condition)?;
+    let sale_format = enum_to_graph_string(&listing.sale_format)?;
+    let fulfillment_methods = listing
+        .fulfillment_methods
+        .iter()
+        .map(enum_to_graph_string)
+        .collect::<GraphResult<Vec<String>>>()?;
+
+    let query = Query::new(
+        "create_listing",
+        "MATCH (seller:User {id: $owner_id})
+        OPTIONAL MATCH (seller)-[:SELLS]->(existing_listing:Listing {id: $listing_id, owner_id: $owner_id})
+        MERGE (seller)-[:SELLS]->(listing:Listing {id: $listing_id, owner_id: $owner_id})
+        ON CREATE SET listing.indexed_at = $indexed_at
+        SET listing.uri = $uri,
+            listing.state = $state,
+            listing.title = $title,
+            listing.description = $description,
+            listing.category_id = $category_id,
+            listing.condition = $condition,
+            listing.tags = $tags,
+            listing.country_code = $country_code,
+            listing.region = $region,
+            listing.media_urls = $media_urls,
+            listing.sale_format = $sale_format,
+            listing.price_amount_minor = $price_amount_minor,
+            listing.price_currency = $price_currency,
+            listing.price_exponent = $price_exponent,
+            listing.price_major = $price_major,
+            listing.fulfillment_methods = $fulfillment_methods,
+            listing.adult_only = $adult_only,
+            listing.created_at = $created_at,
+            listing.updated_at = $updated_at,
+            listing.revision = $revision
+        // Returns true if the listing node already existed
+        RETURN existing_listing IS NOT NULL AS flag;",
+    )
+    .param("owner_id", listing.owner_id.to_string())
+    .param("listing_id", listing.id.to_string())
+    .param("uri", listing.uri.to_string())
+    .param("indexed_at", listing.indexed_at)
+    .param("state", state)
+    .param("title", listing.title.to_string())
+    .param("description", listing.description.to_string())
+    .param("category_id", listing.category_id.to_string())
+    .param("condition", condition)
+    .param("tags", listing.tags.clone())
+    .param("country_code", listing.country_code.to_string())
+    .param("region", listing.region.clone())
+    .param("media_urls", listing.media_urls.clone())
+    .param("sale_format", sale_format)
+    .param("price_amount_minor", listing.price_amount_minor)
+    .param("price_currency", listing.price_currency.to_string())
+    .param("price_exponent", listing.price_exponent)
+    .param("price_major", listing.price_major())
+    .param("fulfillment_methods", fulfillment_methods)
+    .param("adult_only", listing.adult_only)
+    .param("created_at", listing.created_at.to_string())
+    .param("updated_at", listing.updated_at.to_string())
+    .param("revision", listing.revision);
 
     Ok(query)
 }

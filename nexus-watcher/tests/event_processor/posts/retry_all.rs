@@ -31,6 +31,7 @@ async fn test_homeserver_post_with_reply_repost_cannot_index() -> Result<()> {
     let repost_absolute_uri = post_uri_builder(user_id.clone(), repost_fake_post_id.into());
 
     let repost_reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:IndexFail:PostRepost:User:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(reply_absolute_uri.clone()),

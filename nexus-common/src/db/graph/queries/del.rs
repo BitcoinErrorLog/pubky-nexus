@@ -82,6 +82,32 @@ pub fn delete_tag(user_id: &str, tag_id: &str) -> Query {
     .param("tag_id", tag_id)
 }
 
+/// Deletes the shop node of a seller and all its relationships
+/// # Arguments
+/// * `owner_id` - The unique identifier of the user who owns the shop
+pub fn delete_shop(owner_id: &str) -> Query {
+    Query::new(
+        "delete_shop",
+        "MATCH (u:User {id: $owner_id})-[:HAS_SHOP]->(shop:Shop)
+         DETACH DELETE shop;",
+    )
+    .param("owner_id", owner_id.to_string())
+}
+
+/// Deletes a listing node and all its relationships
+/// # Arguments
+/// * `owner_id` - The unique identifier of the user who owns the listing
+/// * `listing_id` - The unique identifier of the listing to be deleted
+pub fn delete_listing(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "delete_listing",
+        "MATCH (listing:Listing {id: $listing_id, owner_id: $owner_id})
+         DETACH DELETE listing;",
+    )
+    .param("owner_id", owner_id.to_string())
+    .param("listing_id", listing_id.to_string())
+}
+
 /// Deletes a file node and all its relationships
 /// # Arguments
 /// * `owner_id` - The unique identifier of the user who owns the file
