@@ -9,4 +9,4 @@ docker/.database*
 # Build artifacts
 /target
 # System-specific files
-**/.DS_Store
+**/.DS_Store._*
