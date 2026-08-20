@@ -13,6 +13,19 @@ use utoipa::ToSchema;
 
 pub const LISTING_TIMELINE_KEY_PARTS: [&str; 3] = ["Listings", "Global", "Timeline"];
 pub const LISTING_PER_SELLER_KEY_PARTS: [&str; 2] = ["Listings", "Seller"];
+pub const LISTING_AUCTION_ENDS_KEY_PARTS: [&str; 3] = ["Listings", "Auctions", "EndsAt"];
+
+/// Property the listing stream is sorted by.
+#[derive(Serialize, Deserialize, ToSchema, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListingStreamSorting {
+    /// Sort listings by the time they were indexed.
+    #[default]
+    Timeline,
+    /// Sort auction listings by their auction end time. Listings without an
+    /// auction end time (fixed-price listings) are excluded from the stream.
+    EndsAt,
+}
 
 /// Filters supported by the listing stream. Any filter besides `seller_id`
 /// requires falling back to a graph query.
@@ -65,8 +78,9 @@ impl ListingStream {
         filters: ListingStreamFilters,
         pagination: Pagination,
         order: SortOrder,
+        sorting: ListingStreamSorting,
     ) -> ModelResult<Option<Self>> {
-        let listing_keys = Self::collect_listing_keys(filters, pagination, order).await?;
+        let listing_keys = Self::collect_listing_keys(filters, pagination, order, sorting).await?;
 
         if listing_keys.is_empty() {
             return Ok(None);
@@ -79,11 +93,22 @@ impl ListingStream {
         filters: ListingStreamFilters,
         pagination: Pagination,
         order: SortOrder,
+        sorting: ListingStreamSorting,
     ) -> ModelResult<Vec<String>> {
-        // Any filter besides the seller requires querying the graph
-        match filters.has_graph_only_filters() {
-            false => Ok(Self::get_from_index(&filters, pagination, order).await?),
-            true => Ok(Self::get_from_graph(&filters, pagination).await?),
+        match sorting {
+            // Any filter besides the seller requires querying the graph
+            ListingStreamSorting::Timeline => match filters.has_graph_only_filters() {
+                false => Ok(Self::get_from_index(&filters, pagination, order).await?),
+                true => Ok(Self::get_from_graph(&filters, pagination, order, sorting).await?),
+            },
+            // The auction end-time sorted set is global, so any filter
+            // (including the seller) requires querying the graph
+            ListingStreamSorting::EndsAt => {
+                match filters.seller_id.is_none() && !filters.has_graph_only_filters() {
+                    true => Ok(Self::get_auction_keys_from_index(pagination, order).await?),
+                    false => Ok(Self::get_from_graph(&filters, pagination, order, sorting).await?),
+                }
+            }
         }
     }
 
@@ -130,15 +155,43 @@ impl ListingStream {
         }
     }
 
+    // Fetch auction listing keys from the Redis sorted set scored by auction end time
+    async fn get_auction_keys_from_index(
+        pagination: Pagination,
+        order: SortOrder,
+    ) -> RedisResult<Vec<String>> {
+        let Pagination {
+            skip,
+            limit,
+            start,
+            end,
+        } = pagination;
+
+        let listing_keys = Self::try_from_index_sorted_set(
+            &LISTING_AUCTION_ENDS_KEY_PARTS,
+            start,
+            end,
+            skip,
+            limit,
+            order,
+            None,
+        )
+        .await?
+        .unwrap_or_default();
+        Ok(listing_keys.into_iter().map(|(key, _)| key).collect())
+    }
+
     // Fetch listing keys from the graph when filters cannot be resolved from the index
     async fn get_from_graph(
         filters: &ListingStreamFilters,
         pagination: Pagination,
+        order: SortOrder,
+        sorting: ListingStreamSorting,
     ) -> GraphResult<Vec<String>> {
         let mut result;
         {
             let graph = get_neo4j_graph()?;
-            let query = queries::get::listing_stream(filters, pagination)?;
+            let query = queries::get::listing_stream(filters, pagination, order, sorting)?;
 
             // Set a 10-second timeout for the query execution
             result = match timeout(Duration::from_secs(10), graph.execute(query)).await {
@@ -225,5 +278,39 @@ impl ListingStream {
     ) -> RedisResult<()> {
         let key_parts = [&LISTING_PER_SELLER_KEY_PARTS[..], &[owner_id]].concat();
         Self::remove_from_index_sorted_set(None, &key_parts, &[listing_id]).await
+    }
+
+    /// Keeps the auction end-time sorted set in sync with the listing details.
+    /// An auction listing is added (or its score refreshed) using the auction
+    /// end time as the score; a listing without an auction end time is removed,
+    /// covering edits that change the sale format.
+    pub async fn upsert_auction_ends_sorted_set(details: &ListingDetails) -> RedisResult<()> {
+        match details.auction_ends_at_ms() {
+            Some(ends_at_ms) => {
+                let element = format!("{}:{}", details.owner_id, details.id);
+                Self::put_index_sorted_set(
+                    &LISTING_AUCTION_ENDS_KEY_PARTS,
+                    &[(ends_at_ms as f64, element.as_str())],
+                    None,
+                    None,
+                )
+                .await
+            }
+            None => Self::remove_from_auction_ends_sorted_set(&details.owner_id, &details.id).await,
+        }
+    }
+
+    /// Removes the listing from the auction end-time sorted set.
+    pub async fn remove_from_auction_ends_sorted_set(
+        owner_id: &str,
+        listing_id: &str,
+    ) -> RedisResult<()> {
+        let element = format!("{owner_id}:{listing_id}");
+        Self::remove_from_index_sorted_set(
+            None,
+            &LISTING_AUCTION_ENDS_KEY_PARTS,
+            &[element.as_str()],
+        )
+        .await
     }
 }

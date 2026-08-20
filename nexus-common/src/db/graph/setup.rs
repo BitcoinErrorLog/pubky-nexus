@@ -46,6 +46,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE INDEX listingSaleFormatIndex IF NOT EXISTS FOR (l:Listing) ON (l.sale_format)",
         "CREATE INDEX listingStateIndex IF NOT EXISTS FOR (l:Listing) ON (l.state)",
         "CREATE INDEX listingPriceIndex IF NOT EXISTS FOR (l:Listing) ON (l.price_currency, l.price_major)",
+        "CREATE INDEX listingAuctionEndsAtIndex IF NOT EXISTS FOR (l:Listing) ON (l.auction_ends_at_ms)",
     ];
 
     let queries = constraints.iter().chain(indexes.iter());

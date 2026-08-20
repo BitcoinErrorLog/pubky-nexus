@@ -31,6 +31,11 @@ impl From<&PubkyAppListingSale> for ListingSaleFormat {
 }
 
 /// Represents the indexed details of a marketplace listing.
+///
+/// The `auction_*` fields carry the auction sale terms and are `null` for
+/// fixed-price listings. The auction money terms are expressed in minor units
+/// of the listing's primary asset (`price_currency` / `price_exponent`); the
+/// specs validation guarantees all auction prices share that asset.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq)]
 pub struct ListingDetails {
     pub id: String,
@@ -50,6 +55,11 @@ pub struct ListingDetails {
     pub price_amount_minor: i64,
     pub price_currency: String,
     pub price_exponent: i64,
+    pub auction_starts_at: Option<String>,
+    pub auction_ends_at: Option<String>,
+    pub auction_reserve_price_minor: Option<i64>,
+    pub auction_buy_now_price_minor: Option<i64>,
+    pub auction_minimum_increment_minor: Option<i64>,
     pub fulfillment_methods: Vec<PubkyAppFulfillmentMethod>,
     pub adult_only: bool,
     pub created_at: String,
@@ -66,6 +76,29 @@ impl ListingDetails {
         listing_id: &str,
     ) -> Self {
         let primary_price = homeserver_listing.sale.primary_price().clone();
+        let (
+            auction_starts_at,
+            auction_ends_at,
+            auction_reserve_price_minor,
+            auction_buy_now_price_minor,
+            auction_minimum_increment_minor,
+        ) = match &homeserver_listing.sale {
+            PubkyAppListingSale::FixedPrice { .. } => (None, None, None, None, None),
+            PubkyAppListingSale::Auction {
+                reserve_price,
+                buy_now_price,
+                minimum_increment,
+                starts_at,
+                ends_at,
+                ..
+            } => (
+                Some(starts_at.clone()),
+                Some(ends_at.clone()),
+                reserve_price.as_ref().map(|price| price.amount_minor),
+                buy_now_price.as_ref().map(|price| price.amount_minor),
+                Some(minimum_increment.amount_minor),
+            ),
+        };
         ListingDetails {
             id: listing_id.to_string(),
             uri: listing_uri_builder(owner_id.to_string(), listing_id.into()),
@@ -88,6 +121,11 @@ impl ListingDetails {
             price_amount_minor: primary_price.amount_minor,
             price_currency: primary_price.currency,
             price_exponent: primary_price.exponent,
+            auction_starts_at,
+            auction_ends_at,
+            auction_reserve_price_minor,
+            auction_buy_now_price_minor,
+            auction_minimum_increment_minor,
             fulfillment_methods: homeserver_listing.fulfillment_methods,
             adult_only: homeserver_listing.adult_only,
             created_at: homeserver_listing.created_at,
@@ -99,6 +137,16 @@ impl ListingDetails {
     /// The price expressed in major units, used for range filtering in the graph.
     pub fn price_major(&self) -> f64 {
         self.price_amount_minor as f64 / 10f64.powi(self.price_exponent as i32)
+    }
+
+    /// The auction end time as epoch milliseconds, used as the score of the
+    /// auction end-time sorted set and for end-time sorting in the graph.
+    /// `None` for fixed-price listings.
+    pub fn auction_ends_at_ms(&self) -> Option<i64> {
+        let ends_at = self.auction_ends_at.as_deref()?;
+        chrono::DateTime::parse_from_rfc3339(ends_at)
+            .ok()
+            .map(|datetime| datetime.timestamp_millis())
     }
 
     /// Retrieves listing details by seller ID and listing ID, first trying Redis,
@@ -150,10 +198,13 @@ impl ListingDetails {
     }
 
     /// Stores the listing details JSON and, unless this is an edit of an already
-    /// indexed listing, adds the listing to the stream sorted sets.
+    /// indexed listing, adds the listing to the stream sorted sets. The auction
+    /// end-time sorted set is refreshed on every write because an edit can
+    /// change the auction end time or the sale format.
     pub async fn put_to_index(&self, is_edit: bool) -> RedisResult<()> {
         self.put_index_json(&[&self.owner_id, &self.id], None, None)
             .await?;
+        ListingStream::upsert_auction_ends_sorted_set(self).await?;
         if is_edit {
             return Ok(());
         }
@@ -170,6 +221,7 @@ impl ListingDetails {
         // Remove from stream sorted sets
         ListingStream::remove_from_timeline_sorted_set(owner_id, listing_id).await?;
         ListingStream::remove_from_per_seller_sorted_set(owner_id, listing_id).await?;
+        ListingStream::remove_from_auction_ends_sorted_set(owner_id, listing_id).await?;
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-use super::{ListingStream, ListingStreamFilters, ShopDetails};
+use super::{ListingStream, ListingStreamFilters, ListingStreamSorting, ShopDetails};
 use crate::db::kv::SortOrder;
 use crate::models::error::ModelResult;
 use crate::types::Pagination;
@@ -24,9 +24,14 @@ impl ShopView {
             seller_id: Some(seller_id.to_string()),
             ..Default::default()
         };
-        let listings = ListingStream::get_listings(filters, pagination, SortOrder::Descending)
-            .await?
-            .unwrap_or_default();
+        let listings = ListingStream::get_listings(
+            filters,
+            pagination,
+            SortOrder::Descending,
+            ListingStreamSorting::Timeline,
+        )
+        .await?
+        .unwrap_or_default();
 
         Ok(Some(ShopView { details, listings }))
     }

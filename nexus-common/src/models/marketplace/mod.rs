@@ -6,6 +6,7 @@ mod view;
 pub use listing::{ListingDetails, ListingSaleFormat};
 pub use shop::ShopDetails;
 pub use stream::{
-    ListingStream, ListingStreamFilters, LISTING_PER_SELLER_KEY_PARTS, LISTING_TIMELINE_KEY_PARTS,
+    ListingStream, ListingStreamFilters, ListingStreamSorting, LISTING_AUCTION_ENDS_KEY_PARTS,
+    LISTING_PER_SELLER_KEY_PARTS, LISTING_TIMELINE_KEY_PARTS,
 };
 pub use view::ShopView;

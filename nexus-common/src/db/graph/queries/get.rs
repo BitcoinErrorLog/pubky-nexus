@@ -1,6 +1,7 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
-use crate::models::marketplace::ListingStreamFilters;
+use crate::db::kv::SortOrder;
+use crate::models::marketplace::{ListingStreamFilters, ListingStreamSorting};
 use crate::models::post::StreamSource;
 use crate::types::routes::HotTagsInputDTO;
 use crate::types::Pagination;
@@ -861,6 +862,11 @@ pub fn get_listing_by_id(owner_id: &str, listing_id: &str) -> Query {
                 price_amount_minor: listing.price_amount_minor,
                 price_currency: listing.price_currency,
                 price_exponent: listing.price_exponent,
+                auction_starts_at: listing.auction_starts_at,
+                auction_ends_at: listing.auction_ends_at,
+                auction_reserve_price_minor: listing.auction_reserve_price_minor,
+                auction_buy_now_price_minor: listing.auction_buy_now_price_minor,
+                auction_minimum_increment_minor: listing.auction_minimum_increment_minor,
                 fulfillment_methods: COALESCE(listing.fulfillment_methods, []),
                 adult_only: listing.adult_only,
                 created_at: listing.created_at,
@@ -880,15 +886,33 @@ fn enum_query_param<T: serde::Serialize>(value: &T) -> GraphResult<String> {
     Ok(json.trim_matches('"').to_string())
 }
 
-// Build the listing stream graph query based on the provided filters
+// Build the listing stream graph query based on the provided filters. The
+// stream is ordered by the property matching `sorting`; when sorting by the
+// auction end time, listings without one (fixed-price listings) are excluded
+// and the pagination timeframe bounds apply to the auction end time.
 pub fn listing_stream(
     filters: &ListingStreamFilters,
     pagination: Pagination,
+    order: SortOrder,
+    sorting: ListingStreamSorting,
 ) -> GraphResult<Query> {
     let mut cypher = String::new();
     let mut where_clause_applied = false;
 
+    let sort_property = match sorting {
+        ListingStreamSorting::Timeline => "listing.indexed_at",
+        ListingStreamSorting::EndsAt => "listing.auction_ends_at_ms",
+    };
+
     cypher.push_str("MATCH (seller:User)-[:SELLS]->(listing:Listing)\n");
+
+    if sorting == ListingStreamSorting::EndsAt {
+        append_condition(
+            &mut cypher,
+            "listing.auction_ends_at_ms IS NOT NULL",
+            &mut where_clause_applied,
+        );
+    }
 
     if filters.seller_id.is_some() {
         append_condition(
@@ -949,23 +973,27 @@ pub fn listing_stream(
     if pagination.start.is_some() {
         append_condition(
             &mut cypher,
-            "listing.indexed_at <= $start",
+            &format!("{sort_property} <= $start"),
             &mut where_clause_applied,
         );
     }
     if pagination.end.is_some() {
         append_condition(
             &mut cypher,
-            "listing.indexed_at >= $end",
+            &format!("{sort_property} >= $end"),
             &mut where_clause_applied,
         );
     }
 
-    cypher.push_str(
+    let sort_direction = match order {
+        SortOrder::Ascending => "ASC",
+        SortOrder::Descending => "DESC",
+    };
+    cypher.push_str(&format!(
         "WITH DISTINCT listing, seller
-        RETURN seller.id AS owner_id, listing.id AS listing_id, listing.indexed_at AS indexed_at
-        ORDER BY listing.indexed_at DESC\n",
-    );
+        RETURN seller.id AS owner_id, listing.id AS listing_id
+        ORDER BY {sort_property} {sort_direction}\n",
+    ));
 
     if let Some(skip) = pagination.skip {
         cypher.push_str(&format!("SKIP {skip}\n"));

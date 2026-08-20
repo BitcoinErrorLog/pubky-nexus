@@ -392,6 +392,12 @@ pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
             listing.price_currency = $price_currency,
             listing.price_exponent = $price_exponent,
             listing.price_major = $price_major,
+            listing.auction_starts_at = $auction_starts_at,
+            listing.auction_ends_at = $auction_ends_at,
+            listing.auction_ends_at_ms = $auction_ends_at_ms,
+            listing.auction_reserve_price_minor = $auction_reserve_price_minor,
+            listing.auction_buy_now_price_minor = $auction_buy_now_price_minor,
+            listing.auction_minimum_increment_minor = $auction_minimum_increment_minor,
             listing.fulfillment_methods = $fulfillment_methods,
             listing.adult_only = $adult_only,
             listing.created_at = $created_at,
@@ -418,6 +424,21 @@ pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
     .param("price_currency", listing.price_currency.to_string())
     .param("price_exponent", listing.price_exponent)
     .param("price_major", listing.price_major())
+    .param("auction_starts_at", listing.auction_starts_at.clone())
+    .param("auction_ends_at", listing.auction_ends_at.clone())
+    .param("auction_ends_at_ms", listing.auction_ends_at_ms())
+    .param(
+        "auction_reserve_price_minor",
+        listing.auction_reserve_price_minor,
+    )
+    .param(
+        "auction_buy_now_price_minor",
+        listing.auction_buy_now_price_minor,
+    )
+    .param(
+        "auction_minimum_increment_minor",
+        listing.auction_minimum_increment_minor,
+    )
     .param("fulfillment_methods", fulfillment_methods)
     .param("adult_only", listing.adult_only)
     .param("created_at", listing.created_at.to_string())

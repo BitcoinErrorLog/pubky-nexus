@@ -99,6 +99,42 @@ pub fn test_listing(
     )
 }
 
+/// Builds a valid auction listing record owned by the given user with the
+/// given start and end times (RFC 3339). The auction terms are fixed: a
+/// starting price of 10.00 USD, a reserve of 20.00 USD, a buy-now price of
+/// 100.00 USD and a minimum increment of 1.00 USD.
+pub fn test_auction_listing(
+    owner_id: &str,
+    title: &str,
+    category_id: &str,
+    starts_at: &str,
+    ends_at: &str,
+) -> PubkyAppListing {
+    let usd = |amount_minor: i64| PubkyAppMoney {
+        amount_minor,
+        currency: "USD".to_string(),
+        exponent: 2,
+    };
+    let mut listing = test_listing(
+        owner_id,
+        title,
+        category_id,
+        PubkyAppListingCondition::New,
+        1_000,
+    );
+    listing.sale = PubkyAppListingSale::Auction {
+        starting_price: usd(1_000),
+        reserve_price: Some(usd(2_000)),
+        buy_now_price: Some(usd(10_000)),
+        minimum_increment: usd(100),
+        starts_at: starts_at.to_string(),
+        ends_at: ends_at.to_string(),
+        anti_sniping_window_seconds: 300,
+        anti_sniping_extension_seconds: 300,
+    };
+    listing
+}
+
 impl WatcherTest {
     /// Publishes a listing with a freshly generated timestamp ID and returns
     /// the assigned ID together with the homeserver path.
