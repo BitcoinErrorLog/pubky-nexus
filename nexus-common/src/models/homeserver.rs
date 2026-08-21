@@ -161,8 +161,9 @@ impl Homeserver {
 
         // The specs crate's `From<pubky::PublicKey>` impl targets a newer
         // pubky crate than the one this workspace pins; convert through the
-        // z-base-32 string form, which is version-independent.
-        let hs_pk = PubkyId::try_from(ref_post_author_hs.to_string().as_str())
+        // bare z-base-32 form, which is version-independent. (`to_string()`
+        // would render the `pubky`-prefixed form, which PubkyId rejects.)
+        let hs_pk = PubkyId::try_from(ref_post_author_hs.z32().as_str())
             .map_err(ModelError::from_generic)?;
         Self::persist_if_unknown(hs_pk.clone())
             .await
