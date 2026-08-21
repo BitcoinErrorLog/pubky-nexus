@@ -35,7 +35,7 @@ homeserver = "${HOMESERVER}"
 events_limit = ${EVENTS_LIMIT}
 monitored_homeservers_limit = 50
 watcher_sleep = ${WATCHER_SLEEP}
-moderation_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+moderation_id = "${NEXUS_MODERATION_ID:-51y9w1skwcryb3iq4sia3x49qwpgstc5feo5tqon65gid7o99khy}"
 moderated_tags = []
 
 [stack]
