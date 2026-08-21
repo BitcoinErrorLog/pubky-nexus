@@ -159,7 +159,11 @@ impl Homeserver {
             return Ok(());
         };
 
-        let hs_pk = PubkyId::from(ref_post_author_hs);
+        // The specs crate's `From<pubky::PublicKey>` impl targets a newer
+        // pubky crate than the one this workspace pins; convert through the
+        // z-base-32 string form, which is version-independent.
+        let hs_pk = PubkyId::try_from(ref_post_author_hs.to_string().as_str())
+            .map_err(ModelError::from_generic)?;
         Self::persist_if_unknown(hs_pk.clone())
             .await
             .inspect(|_| tracing::info!("Ingested homeserver {hs_pk}"))

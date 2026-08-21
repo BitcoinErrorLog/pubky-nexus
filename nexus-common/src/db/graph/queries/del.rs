@@ -111,6 +111,20 @@ pub fn delete_listing(owner_id: &str, listing_id: &str) -> Query {
     .param("listing_id", listing_id.to_string())
 }
 
+/// Deletes a review edge between a reviewer and its subject
+/// # Arguments
+/// * `reviewer_id` - The unique identifier of the user who authored the review
+/// * `review_id` - The deterministic identifier of the review to be deleted
+pub fn delete_review(reviewer_id: &str, review_id: &str) -> Query {
+    Query::new(
+        "delete_review",
+        "MATCH (reviewer:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+         DELETE r;",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
+}
+
 /// Deletes a file node and all its relationships
 /// # Arguments
 /// * `owner_id` - The unique identifier of the user who owns the file

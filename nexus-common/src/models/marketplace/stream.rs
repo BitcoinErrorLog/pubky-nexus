@@ -1,4 +1,6 @@
-use super::{ListingDetails, ListingSaleFormat, ListingsByTagSearch};
+use super::{
+    ListingDetails, ListingSaleFormat, ListingsByTagSearch, ReputationSnippet, ReputationSummary,
+};
 use crate::db::kv::{RedisResult, SortOrder};
 use crate::db::{get_neo4j_graph, queries, GraphError, GraphResult, RedisOps};
 use crate::models::error::{ModelError, ModelResult};
@@ -6,6 +8,7 @@ use crate::types::Pagination;
 use futures::TryStreamExt;
 use pubky_app_specs::{PubkyAppListingCondition, PubkyAppListingState};
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 use tokio::task::spawn;
 use tokio::time::{timeout, Duration};
 use tracing::warn;
@@ -104,8 +107,36 @@ impl ListingStreamFilters {
     }
 }
 
+/// One listing stream entry: the full card projection plus the compact
+/// reputation objects (ADR 0024 §9 — anything a card renders must be in the
+/// stream projection; per-card hydration is a bug, not a pattern).
+///
+/// Both reputation fields are additive and optional: a seller or listing
+/// without any indexed review carries no object at all — honest absence,
+/// which clients must render as "New seller", never as a fabricated 0.0.
+#[derive(Serialize, Deserialize, ToSchema, Debug, PartialEq)]
+pub struct ListingStreamEntry {
+    #[serde(flatten)]
+    pub details: ListingDetails,
+    /// Seller-scoped reputation (reviews about the seller in the
+    /// buyer-reviewing-seller role, across all their listings).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reputation: Option<ReputationSnippet>,
+    /// Listing-scoped reputation (buyer reviews of this listing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listing_reputation: Option<ReputationSnippet>,
+}
+
+impl Deref for ListingStreamEntry {
+    type Target = ListingDetails;
+
+    fn deref(&self) -> &Self::Target {
+        &self.details
+    }
+}
+
 #[derive(Serialize, Deserialize, ToSchema, Debug, Default)]
-pub struct ListingStream(pub Vec<ListingDetails>);
+pub struct ListingStream(pub Vec<ListingStreamEntry>);
 
 impl RedisOps for ListingStream {}
 
@@ -293,7 +324,49 @@ impl ListingStream {
             }
         }
 
-        Ok(Some(Self(listings)))
+        let entries = Self::hydrate_reputation(listings).await?;
+        Ok(Some(Self(entries)))
+    }
+
+    /// Attaches the compact reputation objects to the card projections with
+    /// two batched Redis reads (one per scope) — the stream stays a single
+    /// index round-trip regardless of page size. Missing aggregates stay
+    /// `None`: absence is the honest state, not a zero.
+    async fn hydrate_reputation(
+        listings: Vec<ListingDetails>,
+    ) -> ModelResult<Vec<ListingStreamEntry>> {
+        if listings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let seller_ids: Vec<&str> = listings
+            .iter()
+            .map(|listing| listing.owner_id.as_str())
+            .collect();
+        let listing_keys: Vec<(&str, &str)> = listings
+            .iter()
+            .map(|listing| (listing.owner_id.as_str(), listing.id.as_str()))
+            .collect();
+
+        let (seller_snippets, listing_snippets) = tokio::join!(
+            ReputationSummary::snippets_by_subjects(&seller_ids),
+            ReputationSummary::snippets_by_listings(&listing_keys),
+        );
+        let seller_snippets = seller_snippets?;
+        let listing_snippets = listing_snippets?;
+
+        Ok(listings
+            .into_iter()
+            .zip(seller_snippets)
+            .zip(listing_snippets)
+            .map(
+                |((details, reputation), listing_reputation)| ListingStreamEntry {
+                    details,
+                    reputation,
+                    listing_reputation,
+                },
+            )
+            .collect())
     }
 
     /// Adds the listing to the global timeline sorted set using `indexed_at` as the score.

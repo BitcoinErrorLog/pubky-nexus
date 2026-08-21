@@ -93,6 +93,12 @@ pub async fn handle_put_event(
         (PubkyAppObject::Listing(listing), Resource::Listing(listing_id)) => {
             handlers::listing::sync_put(*listing, user_id, listing_id).await?
         }
+        (PubkyAppObject::MarketplaceReview(review), Resource::MarketplaceReview(review_id)) => {
+            handlers::review::sync_put(review, user_id, review_id).await?
+        }
+        (PubkyAppObject::ReviewResponse(response), Resource::ReviewResponse(review_id)) => {
+            handlers::review_response::sync_put(response, user_id, review_id).await?
+        }
         other => debug!("Event type not handled, Resource: {other:?}"),
     }
     Ok(())
@@ -121,6 +127,12 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
         Resource::Shop => handlers::shop::del(user_id).await?,
         Resource::Listing(listing_id) => {
             handlers::listing::del(user_id, listing_id.clone()).await?
+        }
+        Resource::MarketplaceReview(review_id) => {
+            handlers::review::del(user_id, review_id.clone()).await?
+        }
+        Resource::ReviewResponse(review_id) => {
+            handlers::review_response::del(user_id, review_id.clone()).await?
         }
         other => debug!("DEL event type not handled for resource: {other:?}"),
     }

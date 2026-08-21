@@ -79,10 +79,7 @@ impl Event {
                 )))
             }
             // Known resources not handled by Nexus
-            Resource::LastRead
-            | Resource::Feed(_)
-            | Resource::Blob(_)
-            | Resource::MarketplaceReview(_) => return Ok(None),
+            Resource::LastRead | Resource::Feed(_) | Resource::Blob(_) => return Ok(None),
             _ => (),
         };
 

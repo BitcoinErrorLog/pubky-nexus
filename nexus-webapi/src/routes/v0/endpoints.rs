@@ -33,10 +33,13 @@ const SHOP_PREFIX: &str = concatcp!(VERSION_ROUTE, "/shop");
 pub const SHOP_ROUTE: &str = concatcp!(SHOP_PREFIX, "/{seller_id}");
 pub const SHOP_TAGS_ROUTE: &str = concatcp!(SHOP_ROUTE, "/tags");
 pub const SHOP_TAGGERS_ROUTE: &str = concatcp!(SHOP_ROUTE, "/taggers/{label}");
+pub const SHOP_REVIEWS_ROUTE: &str = concatcp!(SHOP_ROUTE, "/reviews");
+pub const SHOP_REPUTATION_ROUTE: &str = concatcp!(SHOP_ROUTE, "/reputation");
 const LISTING_PREFIX: &str = concatcp!(VERSION_ROUTE, "/listing");
 pub const LISTING_ROUTE: &str = concatcp!(LISTING_PREFIX, "/{seller_id}/{listing_id}");
 pub const LISTING_TAGS_ROUTE: &str = concatcp!(LISTING_ROUTE, "/tags");
 pub const LISTING_TAGGERS_ROUTE: &str = concatcp!(LISTING_ROUTE, "/taggers/{label}");
+pub const LISTING_REVIEWS_ROUTE: &str = concatcp!(LISTING_ROUTE, "/reviews");
 
 // -- STREAM endpoints --
 const STREAM_PREFIX: &str = concatcp!(VERSION_ROUTE, "/stream");

@@ -1,6 +1,6 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
-use crate::models::marketplace::{ListingDetails, ShopDetails};
+use crate::models::marketplace::{ListingDetails, ReviewDetails, ShopDetails};
 use crate::models::post::PostRelationships;
 use crate::models::{file::FileDetails, post::PostDetails, user::UserDetails};
 use pubky_app_specs::{ParsedUri, Resource};
@@ -519,6 +519,74 @@ pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
     .param("revision", listing.revision);
 
     Ok(query)
+}
+
+/// Creates or updates the `REVIEWED` edge between a reviewer and the review
+/// subject. The edge is uniquely identified by the deterministic review ID.
+/// The query returns no rows when either user is not yet indexed (missing
+/// dependency). `has_response` is only initialised on creation so a review
+/// edit never clobbers an indexed response flag.
+pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
+    let query = Query::new(
+        "create_review",
+        "MATCH (reviewer:User {id: $reviewer_id})
+        MATCH (subject:User {id: $subject_id})
+        OPTIONAL MATCH (reviewer)-[existing:REVIEWED {review_id: $review_id}]->(subject)
+        MERGE (reviewer)-[r:REVIEWED {review_id: $review_id}]->(subject)
+        ON CREATE SET r.indexed_at = $indexed_at,
+                      r.has_response = false
+        SET r.role = $role,
+            r.listing_owner_id = $listing_owner_id,
+            r.listing_id = $listing_id,
+            r.rating_overall = $rating_overall,
+            r.rating_item_accuracy = $rating_item_accuracy,
+            r.rating_shipping = $rating_shipping,
+            r.rating_communication = $rating_communication,
+            r.verified = $verified,
+            r.attestor_id = $attestor_id,
+            r.order_ref = $order_ref,
+            r.edited_late = $edited_late,
+            r.created_at = $created_at,
+            r.updated_at = $updated_at,
+            r.revision = $revision
+        // Returns true if the review edge already existed
+        RETURN existing IS NOT NULL AS flag;",
+    )
+    .param("reviewer_id", review.reviewer_id.to_string())
+    .param("subject_id", review.subject_id.to_string())
+    .param("review_id", review.review_id.to_string())
+    .param("indexed_at", review.indexed_at)
+    .param("role", review.role.as_str())
+    .param("listing_owner_id", review.listing_owner_id.to_string())
+    .param("listing_id", review.listing_id.to_string())
+    .param("rating_overall", review.rating_overall)
+    .param("rating_item_accuracy", review.rating_item_accuracy)
+    .param("rating_shipping", review.rating_shipping)
+    .param("rating_communication", review.rating_communication)
+    .param("verified", review.verified)
+    .param("attestor_id", review.attestor_id.clone())
+    .param("order_ref", review.order_ref.clone())
+    .param("edited_late", review.edited_late)
+    .param("created_at", review.created_at.to_string())
+    .param("updated_at", review.updated_at.to_string())
+    .param("revision", review.revision);
+
+    Ok(query)
+}
+
+/// Sets or clears the `has_response` flag on a review edge (maintained by
+/// the review-response ingest pipeline; feeds the aggregate response count).
+/// The query returns no rows when the review edge is not indexed.
+pub fn set_review_response_flag(reviewer_id: &str, review_id: &str, has_response: bool) -> Query {
+    Query::new(
+        "set_review_response_flag",
+        "MATCH (reviewer:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+        SET r.has_response = $has_response
+        RETURN true AS flag;",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
+    .param("has_response", has_response)
 }
 
 /// Create a homeserver

@@ -1248,3 +1248,51 @@ pub fn get_tag_by_tagger_and_id(tagger_id: &str, tag_id: &str) -> Query {
     .param("tagger_id", tagger_id)
     .param("tag_id", tag_id)
 }
+
+/// The aggregate projection shared by the reputation queries. Averages skip
+/// null sub-ratings (Cypher `avg` ignores nulls); the attestor list carries
+/// one entry per verified review for per-attestor counting in Rust.
+const REPUTATION_RETURN: &str = "
+        RETURN count(r) AS total,
+            sum(CASE WHEN r.verified THEN 1 ELSE 0 END) AS verified_count,
+            avg(toFloat(r.rating_overall)) AS average,
+            sum(CASE WHEN r.rating_overall = 1 THEN 1 ELSE 0 END) AS stars_1,
+            sum(CASE WHEN r.rating_overall = 2 THEN 1 ELSE 0 END) AS stars_2,
+            sum(CASE WHEN r.rating_overall = 3 THEN 1 ELSE 0 END) AS stars_3,
+            sum(CASE WHEN r.rating_overall = 4 THEN 1 ELSE 0 END) AS stars_4,
+            sum(CASE WHEN r.rating_overall = 5 THEN 1 ELSE 0 END) AS stars_5,
+            avg(toFloat(r.rating_item_accuracy)) AS avg_item_accuracy,
+            avg(toFloat(r.rating_shipping)) AS avg_shipping,
+            avg(toFloat(r.rating_communication)) AS avg_communication,
+            sum(CASE WHEN r.has_response THEN 1 ELSE 0 END) AS response_count,
+            sum(CASE WHEN r.edited_late THEN 1 ELSE 0 END) AS edited_late_count,
+            [x IN collect(CASE WHEN r.verified THEN r.attestor_id ELSE null END) WHERE x IS NOT NULL] AS attestors,
+            max(r.created_at) AS last_reviewed_at
+        ";
+
+/// Aggregates every `REVIEWED` edge pointing at a subject in one role into
+/// the reputation summary row.
+pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
+    let cypher = format!(
+        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
+        WHERE r.role = $role
+        {REPUTATION_RETURN}"
+    );
+    Query::new("subject_reputation", &cypher)
+        .param("subject_id", subject_id.to_string())
+        .param("role", role.to_string())
+}
+
+/// Aggregates the buyer reviews of one listing into the reputation summary
+/// row. For `buyer_reviewing_seller` reviews the subject is the listing
+/// owner, which anchors the scan.
+pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
+    let cypher = format!(
+        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
+        WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id
+        {REPUTATION_RETURN}"
+    );
+    Query::new("listing_reputation", &cypher)
+        .param("listing_owner_id", listing_owner_id.to_string())
+        .param("listing_id", listing_id.to_string())
+}
