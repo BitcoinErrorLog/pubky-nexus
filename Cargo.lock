@@ -4246,8 +4246,8 @@ dependencies = [
 
 [[package]]
 name = "pubky-app-specs"
-version = "0.6.2-marketplace.3"
-source = "git+https://github.com/BitcoinErrorLog/pubky-app-specs.git?rev=3cc4c175c77212148ecc0b423f8a5df0469c7bb5#3cc4c175c77212148ecc0b423f8a5df0469c7bb5"
+version = "0.6.2-marketplace.5"
+source = "git+https://github.com/BitcoinErrorLog/pubky-app-specs.git?rev=31afc396845da630f621cf4c018c155a3ba8711d#31afc396845da630f621cf4c018c155a3ba8711d"
 dependencies = [
  "base32",
  "blake3",
@@ -5900,7 +5900,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6887,7 +6887,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
