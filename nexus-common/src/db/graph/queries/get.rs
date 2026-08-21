@@ -251,6 +251,55 @@ pub fn user_tags(user_id: &str) -> Query {
     .param("user_id", user_id)
 }
 
+// Retrieve all the tags of a marketplace listing
+pub fn listing_tags(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "listing_tags",
+        "
+        MATCH (l:Listing {id: $listing_id, owner_id: $owner_id})
+        CALL {
+            WITH l
+            MATCH (tagger:User)-[tag:TAGGED]->(l)
+            WITH tag.label AS name, collect(DISTINCT tagger.id) AS tagger_ids
+            RETURN collect({
+                label: name,
+                taggers: tagger_ids,
+                taggers_count: SIZE(tagger_ids)
+            }) AS tags
+        }
+        RETURN
+            l IS NOT NULL AS exists,
+            tags
+    ",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
+// Retrieve all the tags of a marketplace shop
+pub fn shop_tags(owner_id: &str) -> Query {
+    Query::new(
+        "shop_tags",
+        "
+        MATCH (:User {id: $owner_id})-[:HAS_SHOP]->(s:Shop {owner_id: $owner_id})
+        CALL {
+            WITH s
+            MATCH (tagger:User)-[tag:TAGGED]->(s)
+            WITH tag.label AS name, collect(DISTINCT tagger.id) AS tagger_ids
+            RETURN collect({
+                label: name,
+                taggers: tagger_ids,
+                taggers_count: SIZE(tagger_ids)
+            }) AS tags
+        }
+        RETURN
+            s IS NOT NULL AS exists,
+            tags
+    ",
+    )
+    .param("owner_id", owner_id)
+}
+
 /// Retrieve a homeserver by ID
 pub fn get_homeserver_by_id(id: &str) -> Query {
     Query::new(
@@ -970,6 +1019,15 @@ pub fn listing_stream(
             &mut where_clause_applied,
         );
     }
+    if filters.tags.is_some() {
+        // Community tags: a listing matches when any user has tagged it with
+        // one of the requested labels.
+        append_condition(
+            &mut cypher,
+            "EXISTS { MATCH (listing)<-[listing_tag:TAGGED]-(:User) WHERE listing_tag.label IN $tags }",
+            &mut where_clause_applied,
+        );
+    }
     if pagination.start.is_some() {
         append_condition(
             &mut cypher,
@@ -1027,6 +1085,9 @@ pub fn listing_stream(
     }
     if let Some(max_price) = filters.max_price {
         query = query.param("max_price", max_price);
+    }
+    if let Some(tags) = &filters.tags {
+        query = query.param("tags", tags.clone());
     }
     if let Some(start) = pagination.start {
         query = query.param("start", start);

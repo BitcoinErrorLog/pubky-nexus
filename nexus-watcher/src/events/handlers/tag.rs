@@ -5,11 +5,14 @@ use chrono::Utc;
 use nexus_common::db::kv::ScoreAction;
 use nexus_common::db::OperationOutcome;
 use nexus_common::models::homeserver::Homeserver;
+use nexus_common::models::marketplace::ListingsByTagSearch;
 use nexus_common::models::notification::Notification;
 use nexus_common::models::post::search::PostsByTagSearch;
 use nexus_common::models::post::{PostCounts, PostStream};
+use nexus_common::models::tag::listing::TagListing;
 use nexus_common::models::tag::post::TagPost;
 use nexus_common::models::tag::search::TagSearch;
+use nexus_common::models::tag::shop::TagShop;
 use nexus_common::models::tag::traits::{TagCollection, TaggersCollection};
 use nexus_common::models::tag::user::TagUser;
 use nexus_common::models::user::UserCounts;
@@ -28,7 +31,10 @@ pub async fn sync_put(
 
     // Parse the embeded URI to extract author_id and post_id using parse_tagged_post_uri
     let parsed_uri = ParsedUri::try_from(tag.uri.as_str()).map_err(EventProcessorError::generic)?;
-    let user_id = parsed_uri.user_id;
+    let user_id = parsed_uri.user_id.clone();
+    // Retry-manager key of the tagged target, used as the missing-dependency
+    // key for marketplace targets (matches how their PUT events are keyed).
+    let target_dependency_key = RetryEvent::generate_index_key_from_uri(&parsed_uri);
     let indexed_at = Utc::now().timestamp_millis();
 
     match parsed_uri.resource {
@@ -42,8 +48,32 @@ pub async fn sync_put(
         }
         // If no post_id in the tagged URI, we place tag to a user.
         Resource::User => put_sync_user(tagger_id, user_id, &tag_id, &tag.label, indexed_at).await,
+        // Marketplace targets: tags on listings and shops (community layer).
+        Resource::Listing(listing_id) => {
+            put_sync_listing(
+                tagger_id,
+                user_id,
+                &listing_id,
+                &tag_id,
+                &tag.label,
+                target_dependency_key,
+                indexed_at,
+            )
+            .await
+        }
+        Resource::Shop => {
+            put_sync_shop(
+                tagger_id,
+                user_id,
+                &tag_id,
+                &tag.label,
+                target_dependency_key,
+                indexed_at,
+            )
+            .await
+        }
         other => Err(EventProcessorError::generic(format!(
-            "The tagged resource is not Post or User, instead is: {other:?}"
+            "The tagged resource is not Post, User, Listing or Shop, instead is: {other:?}"
         ))),
     }
 }
@@ -243,19 +273,173 @@ async fn put_sync_user(
     }
 }
 
+/// Handles the synchronization of a tagged marketplace listing by updating the
+/// graph and Redis indexes. Mirrors [`put_sync_post`] minus the pieces that do
+/// not exist for listings: there are no per-listing counts models, listings
+/// carry no engagement score, and tag notifications for marketplace targets
+/// are deliberately not emitted (out of scope of the social layer).
+///
+/// # Arguments
+/// - `tagger_user_id` - The `PubkyId` of the user tagging the listing.
+/// - `seller_id` - The `PubkyId` of the listing owner.
+/// - `listing_id` - The unique identifier of the listing being tagged.
+/// - `tag_id` - The unique identifier of the tag.
+/// - `tag_label` - The label of the tag.
+/// - `dependency_key` - Retry-manager key of the listing, used when the
+///   listing is not indexed yet.
+/// - `indexed_at` - Timestamp (ms) when the tag was indexed.
+async fn put_sync_listing(
+    tagger_user_id: PubkyId,
+    seller_id: PubkyId,
+    listing_id: &str,
+    tag_id: &str,
+    tag_label: &str,
+    dependency_key: String,
+    indexed_at: i64,
+) -> Result<(), EventProcessorError> {
+    match TagListing::put_to_graph(
+        &tagger_user_id,
+        &seller_id,
+        Some(listing_id),
+        tag_id,
+        tag_label,
+        indexed_at,
+    )
+    .await?
+    {
+        OperationOutcome::Updated => Ok(()),
+        OperationOutcome::MissingDependency => Err(EventProcessorError::MissingDependency {
+            dependency: vec![dependency_key],
+        }),
+        OperationOutcome::CreatedOrDeleted => {
+            let tag_label_slice = &[tag_label.to_string()];
+
+            let indexing_results = tokio::join!(
+                // Update user counts for tagger
+                UserCounts::increment(&tagger_user_id, "tagged", None),
+                // Increment the label count on the listing
+                TagListing::update_index_score(
+                    &seller_id,
+                    Some(listing_id),
+                    tag_label,
+                    ScoreAction::Increment(1.0),
+                ),
+                // Add user tag in listing
+                TagListing::add_tagger_to_index(
+                    &seller_id,
+                    Some(listing_id),
+                    &tagger_user_id,
+                    tag_label
+                ),
+                // Add listing to the global label timeline
+                ListingsByTagSearch::put_to_index(&seller_id, listing_id, tag_label),
+                // Add tag to search index
+                TagSearch::put_to_index(tag_label_slice)
+            );
+
+            indexing_results.0?;
+            indexing_results.1?;
+            indexing_results.2?;
+            indexing_results.3?;
+            indexing_results.4?;
+
+            Ok(())
+        }
+    }
+}
+
+/// Handles the synchronization of a tagged marketplace shop by updating the
+/// graph and Redis indexes. Mirrors [`put_sync_user`] minus per-target counts
+/// (shops have no counts model) and notifications (deliberately not emitted).
+///
+/// # Arguments
+/// - `tagger_user_id` - The `PubkyId` of the user tagging the shop.
+/// - `owner_id` - The `PubkyId` of the shop owner.
+/// - `tag_id` - The unique identifier of the tag.
+/// - `tag_label` - The label of the tag.
+/// - `dependency_key` - Retry-manager key of the shop, used when the shop is
+///   not indexed yet.
+/// - `indexed_at` - Timestamp (ms) when the tag was indexed.
+async fn put_sync_shop(
+    tagger_user_id: PubkyId,
+    owner_id: PubkyId,
+    tag_id: &str,
+    tag_label: &str,
+    dependency_key: String,
+    indexed_at: i64,
+) -> Result<(), EventProcessorError> {
+    match TagShop::put_to_graph(
+        &tagger_user_id,
+        &owner_id,
+        None,
+        tag_id,
+        tag_label,
+        indexed_at,
+    )
+    .await?
+    {
+        OperationOutcome::Updated => Ok(()),
+        OperationOutcome::MissingDependency => Err(EventProcessorError::MissingDependency {
+            dependency: vec![dependency_key],
+        }),
+        OperationOutcome::CreatedOrDeleted => {
+            let tag_label_slice = &[tag_label.to_string()];
+
+            let indexing_results = tokio::join!(
+                // Update user counts for tagger
+                UserCounts::increment(&tagger_user_id, "tagged", None),
+                // Increment the label count on the shop
+                TagShop::update_index_score(
+                    &owner_id,
+                    None,
+                    tag_label,
+                    ScoreAction::Increment(1.0)
+                ),
+                // Add tagger to the shop taggers list
+                TagShop::add_tagger_to_index(&owner_id, None, &tagger_user_id, tag_label),
+                // Add tag to search index
+                TagSearch::put_to_index(tag_label_slice)
+            );
+
+            indexing_results.0?;
+            indexing_results.1?;
+            indexing_results.2?;
+            indexing_results.3?;
+
+            Ok(())
+        }
+    }
+}
+
 pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorError> {
     debug!("Deleting tag: {} -> {}", user_id, tag_id);
     let tag_details = TagUser::del_from_graph(&user_id, &tag_id).await?;
     // CHOOSE THE EVENT TYPE
-    if let Some((tagged_user_id, post_id, author_id, label)) = tag_details {
-        match (tagged_user_id, post_id, author_id) {
+    if let Some(target) = tag_details {
+        let label = target.label.clone();
+        match (
+            target.user_id,
+            target.post_id,
+            target.author_id,
+            target.listing_id,
+            target.listing_owner_id,
+            target.shop_owner_id,
+        ) {
             // Delete user related indexes
-            (Some(tagged_id), None, None) => {
+            (Some(tagged_id), None, None, None, None, None) => {
                 del_sync_user(user_id, &tagged_id, &label).await?;
             }
             // Delete post related indexes
-            (None, Some(post_id), Some(author_id)) => {
+            (None, Some(post_id), Some(author_id), None, None, None) => {
                 del_sync_post(user_id, &post_id, &author_id, &label).await?;
+            }
+            // Delete marketplace listing related indexes
+            (None, None, None, Some(listing_id), Some(listing_owner_id), None) => {
+                del_sync_listing(user_id, &listing_id, &listing_owner_id, &label).await?;
+            }
+            // Delete marketplace shop related indexes
+            (None, None, None, None, None, Some(shop_owner_id)) => {
+                del_sync_shop(user_id, &shop_owner_id, &label).await?;
             }
             // Handle other unexpected cases
             _ => {
@@ -303,6 +487,86 @@ async fn del_sync_user(
     indexing_results.2?;
     indexing_results.3?;
     indexing_results.4?;
+
+    Ok(())
+}
+
+/// Removes a deleted listing tag from the Redis indexes: the tagger's global
+/// "tagged" count, the listing's label score and taggers set, the global
+/// label timeline, and — when the label's last listing is gone — the tag
+/// search suggestions. Mirrors [`del_sync_post`] minus per-listing counts,
+/// engagement scoring, and notifications.
+async fn del_sync_listing(
+    tagger_id: PubkyId,
+    listing_id: &str,
+    owner_id: &str,
+    tag_label: &str,
+) -> Result<(), EventProcessorError> {
+    let indexing_results = tokio::join!(
+        // Update user counts for tagger
+        UserCounts::decrement(&tagger_id, "tagged", None),
+        // Decrement label score in the listing
+        TagListing::update_index_score(
+            owner_id,
+            Some(listing_id),
+            tag_label,
+            ScoreAction::Decrement(1.0),
+        ),
+        async {
+            // Delete the tagger from the tag list
+            TagListing(vec![tagger_id.to_string()])
+                .del_from_index(owner_id, Some(listing_id), tag_label)
+                .await?;
+            // NOTE: The by-tag timeline depends on the listing taggers collection to delete
+            // Delete listing from the global label timeline
+            ListingsByTagSearch::del_from_index(owner_id, listing_id, tag_label).await?;
+
+            let listings_by_tag =
+                ListingsByTagSearch::get_by_label(tag_label, Pagination::default()).await?;
+            let listings_by_tag_found = listings_by_tag.is_some_and(|x| !x.is_empty());
+            let posts_by_tag =
+                PostsByTagSearch::get_by_label(tag_label, None, Pagination::default()).await?;
+            let posts_by_tag_found = posts_by_tag.is_some_and(|x| !x.is_empty());
+            if !listings_by_tag_found && !posts_by_tag_found {
+                // If we just removed the last target using this tag, remove tag from autocomplete suggestion list
+                TagSearch::del_from_index(tag_label).await?;
+            }
+
+            Ok::<(), EventProcessorError>(())
+        }
+    );
+
+    indexing_results.0?;
+    indexing_results.1?;
+    indexing_results.2?;
+
+    Ok(())
+}
+
+/// Removes a deleted shop tag from the Redis indexes. Mirrors
+/// [`del_sync_user`] minus per-target counts and notifications.
+async fn del_sync_shop(
+    tagger_id: PubkyId,
+    owner_id: &str,
+    tag_label: &str,
+) -> Result<(), EventProcessorError> {
+    let indexing_results = tokio::join!(
+        // Update user counts for tagger
+        UserCounts::decrement(&tagger_id, "tagged", None),
+        // Decrement label score on the shop
+        TagShop::update_index_score(owner_id, None, tag_label, ScoreAction::Decrement(1.0)),
+        async {
+            // Remove tagger from the shop taggers list
+            TagShop(vec![tagger_id.to_string()])
+                .del_from_index(owner_id, None, tag_label)
+                .await?;
+            Ok::<(), EventProcessorError>(())
+        }
+    );
+
+    indexing_results.0?;
+    indexing_results.1?;
+    indexing_results.2?;
 
     Ok(())
 }

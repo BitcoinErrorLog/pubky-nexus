@@ -1,4 +1,4 @@
-use super::{ListingDetails, ListingSaleFormat};
+use super::{ListingDetails, ListingSaleFormat, ListingsByTagSearch};
 use crate::db::kv::{RedisResult, SortOrder};
 use crate::db::{get_neo4j_graph, queries, GraphError, GraphResult, RedisOps};
 use crate::models::error::{ModelError, ModelResult};
@@ -28,7 +28,7 @@ pub enum ListingStreamSorting {
 }
 
 /// Filters supported by the listing stream. Any filter besides `seller_id`
-/// requires falling back to a graph query.
+/// (or a single community tag on its own) requires falling back to a graph query.
 #[derive(Deserialize, ToSchema, Debug, Clone, Default)]
 pub struct ListingStreamFilters {
     pub seller_id: Option<String>,
@@ -41,6 +41,27 @@ pub struct ListingStreamFilters {
     #[serde(default, deserialize_with = "parse_string_to_f64")]
     pub max_price: Option<f64>,
     pub currency: Option<String>,
+    /// Community tag labels (comma-separated in the query string). A listing
+    /// matches when any user has tagged it with one of the labels. Mirrors
+    /// the post stream's `tags` filter: a single label with no other filters
+    /// is served from the by-tag index; anything else falls back to the graph.
+    #[serde(default, deserialize_with = "parse_comma_separated_tags")]
+    pub tags: Option<Vec<String>>,
+}
+
+// Parses a comma-separated tag list. Query string values always arrive as one
+// string when this struct is flattened into an axum Query extractor.
+fn parse_comma_separated_tags<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        Some(s) if !s.trim().is_empty() => Ok(Some(
+            s.split(',').map(|tag| tag.trim().to_string()).collect(),
+        )),
+        _ => Ok(None),
+    }
 }
 
 // Parses strings into f64. Needed because query string values always arrive as
@@ -65,6 +86,21 @@ impl ListingStreamFilters {
             || self.min_price.is_some()
             || self.max_price.is_some()
             || self.currency.is_some()
+    }
+
+    /// A single tag label with no other filters can be served from the
+    /// by-tag Redis sorted set (`Sorted:Tags:Global:Listing:Timeline:{label}`).
+    fn single_tag_index_label(&self) -> Option<&str> {
+        match &self.tags {
+            Some(tags)
+                if tags.len() == 1
+                    && self.seller_id.is_none()
+                    && !self.has_graph_only_filters() =>
+            {
+                Some(tags[0].as_str())
+            }
+            _ => None,
+        }
     }
 }
 
@@ -96,15 +132,24 @@ impl ListingStream {
         sorting: ListingStreamSorting,
     ) -> ModelResult<Vec<String>> {
         match sorting {
+            // A single community tag on its own is served by the by-tag index
+            ListingStreamSorting::Timeline if filters.single_tag_index_label().is_some() => {
+                Ok(Self::get_by_tag_from_index(&filters, pagination).await?)
+            }
             // Any filter besides the seller requires querying the graph
-            ListingStreamSorting::Timeline => match filters.has_graph_only_filters() {
-                false => Ok(Self::get_from_index(&filters, pagination, order).await?),
-                true => Ok(Self::get_from_graph(&filters, pagination, order, sorting).await?),
-            },
+            ListingStreamSorting::Timeline => {
+                match filters.has_graph_only_filters() || filters.tags.is_some() {
+                    false => Ok(Self::get_from_index(&filters, pagination, order).await?),
+                    true => Ok(Self::get_from_graph(&filters, pagination, order, sorting).await?),
+                }
+            }
             // The auction end-time sorted set is global, so any filter
             // (including the seller) requires querying the graph
             ListingStreamSorting::EndsAt => {
-                match filters.seller_id.is_none() && !filters.has_graph_only_filters() {
+                match filters.seller_id.is_none()
+                    && !filters.has_graph_only_filters()
+                    && filters.tags.is_none()
+                {
                     true => Ok(Self::get_auction_keys_from_index(pagination, order).await?),
                     false => Ok(Self::get_from_graph(&filters, pagination, order, sorting).await?),
                 }
@@ -153,6 +198,20 @@ impl ListingStream {
                 Ok(listing_keys.into_iter().map(|(key, _)| key).collect())
             }
         }
+    }
+
+    // Fetch listing keys from the by-tag Redis sorted set (single label, no other filters)
+    async fn get_by_tag_from_index(
+        filters: &ListingStreamFilters,
+        pagination: Pagination,
+    ) -> RedisResult<Vec<String>> {
+        let label = filters
+            .single_tag_index_label()
+            .expect("caller checked single_tag_index_label");
+        let results = ListingsByTagSearch::get_by_label(label, pagination)
+            .await?
+            .unwrap_or_default();
+        Ok(results.into_iter().map(|entry| entry.listing_key).collect())
     }
 
     // Fetch auction listing keys from the Redis sorted set scored by auction end time

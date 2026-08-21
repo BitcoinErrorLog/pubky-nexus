@@ -73,10 +73,13 @@ pub fn delete_tag(user_id: &str, tag_id: &str) -> Query {
          WITH CASE WHEN target:User THEN target.id ELSE null END AS user_id,
               CASE WHEN target:Post THEN target.id ELSE null END AS post_id,
               CASE WHEN target:Post THEN author.id ELSE null END AS author_id,
+              CASE WHEN target:Listing THEN target.id ELSE null END AS listing_id,
+              CASE WHEN target:Listing THEN target.owner_id ELSE null END AS listing_owner_id,
+              CASE WHEN target:Shop THEN target.owner_id ELSE null END AS shop_owner_id,
               tag.label AS label,
               tag
          DELETE tag
-         RETURN user_id, post_id, author_id, label",
+         RETURN user_id, post_id, author_id, listing_id, listing_owner_id, shop_owner_id, label",
     )
     .param("user_id", user_id)
     .param("tag_id", tag_id)

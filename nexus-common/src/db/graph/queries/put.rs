@@ -292,6 +292,79 @@ pub fn create_user_tag(
     .param("indexed_at", indexed_at)
 }
 
+/// Creates a `TAGGED` relationship between a user and a marketplace listing sold by another user.
+/// The tag is uniquely identified by a `label` and is associated with the listing
+/// # Arguments
+/// * `user_id` - The unique identifier of the user tagging the listing.
+/// * `seller_id` - The unique identifier of the user who owns the listing.
+/// * `listing_id` - The unique identifier of the listing being tagged.
+/// * `tag_id` - A unique identifier for the tagging relationship.
+/// * `label` - A string representing the label of the tag.
+/// * `indexed_at` - A timestamp representing when the tagging relationship was created or last updated.
+pub fn create_listing_tag(
+    user_id: &str,
+    seller_id: &str,
+    listing_id: &str,
+    tag_id: &str,
+    label: &str,
+    indexed_at: i64,
+) -> Query {
+    Query::new(
+        "create_listing_tag",
+        "MATCH (user:User {id: $user_id})
+        // We assume these nodes are already created. If not we would not be able to add a tag
+        MATCH (listing:Listing {id: $listing_id, owner_id: $seller_id})
+        // Check if tag already existed
+        OPTIONAL MATCH (user)-[existing:TAGGED {label: $label}]->(listing)
+        MERGE (user)-[t:TAGGED {label: $label}]->(listing)
+        ON CREATE SET t.indexed_at = $indexed_at,
+                      t.id = $tag_id
+        // Returns true if the listing tag relationship already existed
+        RETURN existing IS NOT NULL AS flag;",
+    )
+    .param("user_id", user_id)
+    .param("seller_id", seller_id)
+    .param("listing_id", listing_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("indexed_at", indexed_at)
+}
+
+/// Creates a `TAGGED` relationship between a user and a marketplace shop owned by another user.
+/// The tag is uniquely identified by a `label` and is associated with the shop
+/// # Arguments
+/// * `user_id` - The unique identifier of the user tagging the shop.
+/// * `owner_id` - The unique identifier of the user who owns the shop.
+/// * `tag_id` - A unique identifier for the tagging relationship.
+/// * `label` - A string representing the label of the tag.
+/// * `indexed_at` - A timestamp representing when the tagging relationship was created or last updated.
+pub fn create_shop_tag(
+    user_id: &str,
+    owner_id: &str,
+    tag_id: &str,
+    label: &str,
+    indexed_at: i64,
+) -> Query {
+    Query::new(
+        "create_shop_tag",
+        "MATCH (user:User {id: $user_id})
+        // We assume these nodes are already created. If not we would not be able to add a tag
+        MATCH (:User {id: $owner_id})-[:HAS_SHOP]->(shop:Shop {owner_id: $owner_id})
+        // Check if tag already existed
+        OPTIONAL MATCH (user)-[existing:TAGGED {label: $label}]->(shop)
+        MERGE (user)-[t:TAGGED {label: $label}]->(shop)
+        ON CREATE SET t.indexed_at = $indexed_at,
+                      t.id = $tag_id
+        // Returns true if the shop tag relationship already existed
+        RETURN existing IS NOT NULL AS flag;",
+    )
+    .param("user_id", user_id)
+    .param("owner_id", owner_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("indexed_at", indexed_at)
+}
+
 /// Create a file node
 pub fn create_file(file: &FileDetails) -> GraphResult<Query> {
     let urls = serde_json::to_string(&file.urls)

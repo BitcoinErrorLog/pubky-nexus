@@ -16,6 +16,24 @@ pub const CACHE_SET_PREFIX: &str = "Cache";
 // TTL, 3HR
 const CACHE_TTL: i64 = 3 * 60 * 60;
 
+/// Details of a deleted `TAGGED` relationship's target, as returned by the
+/// `delete_tag` graph query. Exactly one target shape is populated:
+///
+/// - user target: `user_id`
+/// - post target: `post_id` + `author_id`
+/// - marketplace listing target: `listing_id` + `listing_owner_id`
+/// - marketplace shop target: `shop_owner_id`
+#[derive(Debug, Clone)]
+pub struct DeletedTagTarget {
+    pub user_id: Option<String>,
+    pub post_id: Option<String>,
+    pub author_id: Option<String>,
+    pub listing_id: Option<String>,
+    pub listing_owner_id: Option<String>,
+    pub shop_owner_id: Option<String>,
+    pub label: String,
+}
+
 /// Trait for managing a collection of tags
 ///
 /// This trait provides methods for querying, indexing, and storing tag-related data
@@ -365,7 +383,8 @@ where
         Ok(())
     }
 
-    /// Deletes a tag relationship between a user and a tagged target (User or Post) in the graph database.
+    /// Deletes a tag relationship between a user and a tagged target
+    /// (User, Post, marketplace Listing, or marketplace Shop) in the graph database.
     /// # Arguments
     /// * `user_id` - The ID of the user who owns the tag relationship.
     /// * `tag_id` - The ID of the tag to be deleted.
@@ -373,20 +392,14 @@ where
     /// # Returns
     ///
     /// A `Result` containing:
-    /// * `Some((Option<String>, Option<String>, Option<String>, String))`: If the tag was found and deleted:
-    ///   - `Option<String>` for the `user_id` of the target (if the target is a user, otherwise `None`),
-    ///   - `Option<String>` for the `post_id` of the target (if the target is a post, otherwise `None`),
-    ///   - `Option<String>` for the `author_id` of the post (if applicable, otherwise `None`),
-    ///   - `String` for the tag label.
+    /// * `Some(DeletedTagTarget)` describing the deleted tag's target and label
+    ///   (see [`DeletedTagTarget`] for which fields identify each target kind).
     /// * `None` if no matching tag relationship is found.
     ///
     /// # Errors
     ///
     /// Returns a boxed `std::error::Error` if there is any issue querying or executing the delete operation in Neo4j.
-    async fn del_from_graph(
-        user_id: &str,
-        tag_id: &str,
-    ) -> GraphResult<Option<(Option<String>, Option<String>, Option<String>, String)>> {
+    async fn del_from_graph(user_id: &str, tag_id: &str) -> GraphResult<Option<DeletedTagTarget>> {
         let query = queries::del::delete_tag(user_id, tag_id);
         let maybe_row = fetch_row_from_graph(query).await?;
 
@@ -394,11 +407,16 @@ where
             return Ok(None);
         };
 
-        let user_id: Option<String> = row.get("user_id").unwrap_or(None);
-        let author_id: Option<String> = row.get("author_id").unwrap_or(None);
-        let post_id: Option<String> = row.get("post_id").unwrap_or(None);
         let label: String = row.get("label").expect("Query should return tag label");
-        Ok(Some((user_id, post_id, author_id, label)))
+        Ok(Some(DeletedTagTarget {
+            user_id: row.get("user_id").unwrap_or(None),
+            post_id: row.get("post_id").unwrap_or(None),
+            author_id: row.get("author_id").unwrap_or(None),
+            listing_id: row.get("listing_id").unwrap_or(None),
+            listing_owner_id: row.get("listing_owner_id").unwrap_or(None),
+            shop_owner_id: row.get("shop_owner_id").unwrap_or(None),
+            label,
+        }))
     }
 
     /// Returns the unique key parts used to identify a tag in the Redis database

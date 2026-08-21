@@ -31,8 +31,12 @@ pub const POST_TAGGERS_ROUTE: &str = concatcp!(POST_ROUTE, "/taggers/{label}");
 // -- MARKETPLACE endpoints --
 const SHOP_PREFIX: &str = concatcp!(VERSION_ROUTE, "/shop");
 pub const SHOP_ROUTE: &str = concatcp!(SHOP_PREFIX, "/{seller_id}");
+pub const SHOP_TAGS_ROUTE: &str = concatcp!(SHOP_ROUTE, "/tags");
+pub const SHOP_TAGGERS_ROUTE: &str = concatcp!(SHOP_ROUTE, "/taggers/{label}");
 const LISTING_PREFIX: &str = concatcp!(VERSION_ROUTE, "/listing");
 pub const LISTING_ROUTE: &str = concatcp!(LISTING_PREFIX, "/{seller_id}/{listing_id}");
+pub const LISTING_TAGS_ROUTE: &str = concatcp!(LISTING_ROUTE, "/tags");
+pub const LISTING_TAGGERS_ROUTE: &str = concatcp!(LISTING_ROUTE, "/taggers/{label}");
 
 // -- STREAM endpoints --
 const STREAM_PREFIX: &str = concatcp!(VERSION_ROUTE, "/stream");
