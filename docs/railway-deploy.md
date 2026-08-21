@@ -55,6 +55,16 @@ also depends on the seller's user profile being indexed first, so the full
 replay is what makes marketplace rows land correctly. The cursor is persisted
 in Redis, so restarts resume where they left off.
 
+Observed on first deploy (2026-08-21): the staging homeserver history was
+~115,000 events, and the watcher processed roughly 100–160 events/minute from
+Railway (each PUT costs at least one content fetch from the homeserver), i.e.
+a full cold replay takes on the order of half a day. Progress can be tracked
+with:
+
+```bash
+railway logs --service nexusd | grep "cursor for the next request"
+```
+
 ## How to redeploy
 
 The Railway account has no GitHub integration installed, so the service is
