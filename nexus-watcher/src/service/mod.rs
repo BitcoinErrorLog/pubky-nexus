@@ -5,7 +5,7 @@ mod stats;
 mod traits;
 
 /// Module exports
-pub use constants::{PROCESSING_TIMEOUT_SECS, WATCHER_CONFIG_FILE_NAME};
+pub use constants::{POLL_TIMEOUT_SECS, PROCESSING_TIMEOUT_SECS, WATCHER_CONFIG_FILE_NAME};
 use nexus_common::types::DynError;
 pub use processor::EventProcessor;
 pub use processor_runner::EventProcessorRunner;

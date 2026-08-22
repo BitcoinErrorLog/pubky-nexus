@@ -4,6 +4,7 @@ use crate::events::handle;
 use crate::events::retry::event::RetryEvent;
 use crate::events::Moderation;
 use crate::service::traits::TEventProcessor;
+use crate::service::POLL_TIMEOUT_SECS;
 use nexus_common::db::PubkyConnector;
 use nexus_common::models::homeserver::Homeserver;
 use opentelemetry::trace::{FutureExt, Span, TraceContextExt, Tracer};
@@ -71,17 +72,32 @@ impl EventProcessor {
                 self.homeserver.id, self.homeserver.cursor, self.limit
             );
 
-            let response = pubky
-                .client()
-                .request(Method::GET, &url)
-                .send()
-                .await
-                .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
+            // Hard deadline on the poll: pkarr resolution or a connection to a
+            // dead homeserver can otherwise hang until the processor-level
+            // timeout (an hour, sized for large batch processing), starving
+            // every other homeserver's processor in the meantime. Observed in
+            // production on 2026-08-21: the watcher went silent for 70 minutes
+            // on unreachable homeservers.
+            let fetch = async {
+                let response = pubky
+                    .client()
+                    .request(Method::GET, &url)
+                    .send()
+                    .await
+                    .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
 
-            response
-                .text()
+                response
+                    .text()
+                    .await
+                    .map_err(|e| EventProcessorError::client_error(e.to_string()))
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(POLL_TIMEOUT_SECS), fetch)
                 .await
-                .map_err(|e| EventProcessorError::client_error(e.to_string()))?
+                .map_err(|_| {
+                    EventProcessorError::client_error(format!(
+                        "events poll timed out after {POLL_TIMEOUT_SECS}s"
+                    ))
+                })??
         };
 
         let lines: Vec<String> = response_text.trim().lines().map(String::from).collect();
