@@ -1,6 +1,6 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
-use crate::models::marketplace::{ListingDetails, ReviewDetails, ShopDetails};
+use crate::models::marketplace::{DropDetails, ListingDetails, ReviewDetails, ShopDetails};
 use crate::models::post::PostRelationships;
 use crate::models::{file::FileDetails, post::PostDetails, user::UserDetails};
 use pubky_app_specs::{ParsedUri, Resource};
@@ -517,6 +517,63 @@ pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
     .param("created_at", listing.created_at.to_string())
     .param("updated_at", listing.updated_at.to_string())
     .param("revision", listing.revision);
+
+    Ok(query)
+}
+
+/// Creates or updates a marketplace drop node of a seller. The numeric
+/// `starts_at_ms`/`ends_at_ms` mirrors of the declared schedule are stored
+/// alongside the RFC 3339 strings for the time-window bucket filters and
+/// start-time sorting.
+/// The query returns no rows when the seller user is not yet indexed (missing dependency).
+pub fn create_drop(drop: &DropDetails) -> GraphResult<Query> {
+    let format = enum_to_graph_string(&drop.format)?;
+    let stock_display = enum_to_graph_string(&drop.stock_display)?;
+
+    let query = Query::new(
+        "create_drop",
+        "MATCH (owner:User {id: $owner_id})
+        OPTIONAL MATCH (owner)-[:OFFERS]->(existing_drop:Drop {id: $drop_id, owner_id: $owner_id})
+        MERGE (owner)-[:OFFERS]->(drop:Drop {id: $drop_id, owner_id: $owner_id})
+        ON CREATE SET drop.indexed_at = $indexed_at
+        SET drop.uri = $uri,
+            drop.title = $title,
+            drop.description = $description,
+            drop.media_urls = $media_urls,
+            drop.format = $format,
+            drop.starts_at = $starts_at,
+            drop.starts_at_ms = $starts_at_ms,
+            drop.ends_at = $ends_at,
+            drop.ends_at_ms = $ends_at_ms,
+            drop.listing_ids = $listing_ids,
+            drop.total_quantity = $total_quantity,
+            drop.per_buyer_limit = $per_buyer_limit,
+            drop.stock_display = $stock_display,
+            drop.created_at = $created_at,
+            drop.updated_at = $updated_at,
+            drop.revision = $revision
+        // Returns true if the drop node already existed
+        RETURN existing_drop IS NOT NULL AS flag;",
+    )
+    .param("owner_id", drop.owner_id.to_string())
+    .param("drop_id", drop.id.to_string())
+    .param("uri", drop.uri.to_string())
+    .param("indexed_at", drop.indexed_at)
+    .param("title", drop.title.to_string())
+    .param("description", drop.description.to_string())
+    .param("media_urls", drop.media_urls.clone())
+    .param("format", format)
+    .param("starts_at", drop.starts_at.to_string())
+    .param("starts_at_ms", drop.starts_at_ms())
+    .param("ends_at", drop.ends_at.clone())
+    .param("ends_at_ms", drop.ends_at_ms())
+    .param("listing_ids", drop.listing_ids.clone())
+    .param("total_quantity", drop.total_quantity)
+    .param("per_buyer_limit", drop.per_buyer_limit)
+    .param("stock_display", stock_display)
+    .param("created_at", drop.created_at.to_string())
+    .param("updated_at", drop.updated_at.to_string())
+    .param("revision", drop.revision);
 
     Ok(query)
 }

@@ -2,6 +2,40 @@
 
 # Pubky Nexus
 
+## This fork: Pubky Marketplace project
+
+This is `BitcoinErrorLog/pubky-nexus` (branch `feat/marketplace-indexing`),
+a fork of the official [`pubky/pubky-nexus`](https://github.com/pubky/pubky-nexus)
+that adds **marketplace indexing** for the Pubky Marketplace project. The
+official/shared Nexus has none of these endpoints; a dedicated instance of
+this fork runs on Railway beside the marketplace's transaction service. No
+upstream PRs are filed while the protocol shape settles.
+
+**Added over upstream:**
+
+- Ingest + streams for the marketplace records defined in the
+  `BitcoinErrorLog/pubky-app-specs` fork: **listings**
+  (`GET /v0/stream/listings` with auction terms and reputation snippets,
+  per-listing projection), **shops** (profile/policy details), and
+  **drops** (`GET /v0/stream/drops` with owner and time-window bucket
+  filters — documented as estimates; the transaction service stays the
+  authority for live state — plus `GET /v0/drop/{owner}/{drop_id}`).
+- **Review indexing with cryptographic verification at ingest**: purchase
+  attestations (compact JWS) are signature-verified before a review counts
+  as attested; reputation aggregates served per shop and per listing.
+  Attestor *legitimacy* remains the client's trust-list policy.
+- Marketplace tag aggregation endpoints for listings and shops.
+- The index stays deliberately **lossy**: variants, shipping options,
+  attributes, digital-lock details, and any live stock/order state are
+  never indexed — clients hydrate the canonical homeserver record and the
+  transaction service's projections.
+
+**Fixes:** `setup_graph` now tolerates Neo4j's `AlreadyExists` race when
+concurrent processes create the same new index (surfaced by parallel test
+boots).
+
+Deploy runbook for the dedicated instance: `docs/railway-deploy.md`.
+
 Pubky Nexus is the central bridge connecting Pubky homeservers with [Pubky-App’s](https://github.com/pubky/pubky-app) social clients. By aggregating events from homeservers into a rich social graph, Nexus transforms decentralized interactions into a high-performance, fully featured social-media-like API. It's designed to support Social-Semantic-Graph (SSG) inference, and more.
 
 ## 🌟 Key Features

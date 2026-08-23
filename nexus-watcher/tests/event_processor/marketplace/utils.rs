@@ -5,8 +5,9 @@ use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::{
     base64url_encode, listing_uri_builder, marketplace_review_uri_builder,
     traits::{HasIdPath, HashId, TimestampId},
-    PubkyAppFulfillmentMethod, PubkyAppListing, PubkyAppListingCondition, PubkyAppListingMedia,
-    PubkyAppListingMediaKind, PubkyAppListingSale, PubkyAppListingState, PubkyAppListingVariant,
+    PubkyAppDropFormat, PubkyAppDropStockDisplay, PubkyAppFulfillmentMethod, PubkyAppListing,
+    PubkyAppListingCondition, PubkyAppListingMedia, PubkyAppListingMediaKind, PubkyAppListingSale,
+    PubkyAppListingState, PubkyAppListingVariant, PubkyAppMarketplaceDrop,
     PubkyAppMarketplaceLocation, PubkyAppMarketplaceReview, PubkyAppMoney,
     PubkyAppPurchaseAttestationClaims, PubkyAppReturnPolicy, PubkyAppReviewRatings,
     PubkyAppReviewResponse, PubkyAppReviewRole, PubkyAppShop, PURCHASE_ATTESTATION_TYP,
@@ -32,6 +33,7 @@ pub fn test_shop(owner_id: &str) -> PubkyAppShop {
         "Ships within 3 business days.".to_string(),
         "Returns accepted within 30 days.".to_string(),
         false,
+        None,
     )
 }
 
@@ -53,7 +55,9 @@ pub fn test_listing(
         PubkyAppListingState::Active,
         title.to_string(),
         "Test listing for the marketplace watcher tests.".to_string(),
+        1,
         category_id.to_string(),
+        None,
         condition,
         None,
         vec!["watcher-test".to_string()],
@@ -140,7 +144,55 @@ pub fn test_auction_listing(
     listing
 }
 
+/// Builds a valid FCFS drop record owned by the given user with the given
+/// declared start time and optional end time (RFC 3339). The bundled listing
+/// ids are fixed; specs validation only checks their entity-id shape.
+pub fn test_drop(
+    owner_id: &str,
+    title: &str,
+    starts_at: &str,
+    ends_at: Option<&str>,
+) -> PubkyAppMarketplaceDrop {
+    PubkyAppMarketplaceDrop::new(
+        owner_id.to_string(),
+        1,
+        "2025-01-01T00:00:00Z".to_string(),
+        "2025-01-01T00:00:00Z".to_string(),
+        // The caller assigns the drop_id right before publishing
+        String::new(),
+        title.to_string(),
+        "Test drop for the marketplace watcher tests.".to_string(),
+        vec![format!(
+            "pubky://{owner_id}/pub/pubky.app/marketplace/v1/media/drop_banner"
+        )],
+        PubkyAppDropFormat::Fcfs,
+        starts_at.to_string(),
+        ends_at.map(str::to_string),
+        vec!["listing_01".to_string(), "listing_02".to_string()],
+        500,
+        2,
+        PubkyAppDropStockDisplay::Bands,
+    )
+}
+
 impl WatcherTest {
+    /// Publishes a drop with a freshly generated unique entity ID and returns
+    /// the assigned ID together with the homeserver path.
+    pub async fn create_drop(
+        &mut self,
+        user_kp: &Keypair,
+        drop: &PubkyAppMarketplaceDrop,
+    ) -> Result<(String, ResourcePath)> {
+        let mut drop = drop.clone();
+        drop.drop_id = format!("drop-{}", chrono::Utc::now().timestamp_micros());
+        let drop_id = drop.drop_id.clone();
+        let drop_path: ResourcePath = PubkyAppMarketplaceDrop::create_path(&drop_id).parse()?;
+
+        self.put(user_kp, &drop_path, &drop).await?;
+
+        Ok((drop_id, drop_path))
+    }
+
     /// Publishes a listing with a freshly generated timestamp ID and returns
     /// the assigned ID together with the homeserver path.
     pub async fn create_listing(

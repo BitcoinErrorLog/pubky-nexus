@@ -93,6 +93,9 @@ pub async fn handle_put_event(
         (PubkyAppObject::Listing(listing), Resource::Listing(listing_id)) => {
             handlers::listing::sync_put(*listing, user_id, listing_id).await?
         }
+        (PubkyAppObject::Drop(drop), Resource::Drop(drop_id)) => {
+            handlers::drop::sync_put(drop, user_id, drop_id).await?
+        }
         (PubkyAppObject::MarketplaceReview(review), Resource::MarketplaceReview(review_id)) => {
             handlers::review::sync_put(review, user_id, review_id).await?
         }
@@ -128,6 +131,7 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
         Resource::Listing(listing_id) => {
             handlers::listing::del(user_id, listing_id.clone()).await?
         }
+        Resource::Drop(drop_id) => handlers::drop::del(user_id, drop_id.clone()).await?,
         Resource::MarketplaceReview(review_id) => {
             handlers::review::del(user_id, review_id.clone()).await?
         }

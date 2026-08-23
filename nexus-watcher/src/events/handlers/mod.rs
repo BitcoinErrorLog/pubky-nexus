@@ -1,4 +1,5 @@
 pub mod bookmark;
+pub mod drop;
 pub mod file;
 pub mod follow;
 pub mod listing;

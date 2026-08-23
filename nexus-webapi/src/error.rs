@@ -36,6 +36,8 @@ pub enum Error {
         seller_id: String,
         listing_id: String,
     },
+    #[error("Drop not found: {owner_id} {drop_id}")]
+    DropNotFound { owner_id: String, drop_id: String },
     #[error("No indexed reviews for subject: {subject_id}")]
     ReputationNotFound { subject_id: String },
     // Add other custom errors here
@@ -109,6 +111,7 @@ impl IntoResponse for Error {
             Error::TagNotFound { .. } => StatusCode::NOT_FOUND,
             Error::ShopNotFound { .. } => StatusCode::NOT_FOUND,
             Error::ListingNotFound { .. } => StatusCode::NOT_FOUND,
+            Error::DropNotFound { .. } => StatusCode::NOT_FOUND,
             Error::ReputationNotFound { .. } => StatusCode::NOT_FOUND,
             // Map other errors to appropriate status codes
         };
@@ -140,6 +143,9 @@ impl IntoResponse for Error {
                 listing_id,
             } => {
                 error!("Listing not found: {} {}", seller_id, listing_id)
+            }
+            Error::DropNotFound { owner_id, drop_id } => {
+                error!("Drop not found: {} {}", owner_id, drop_id)
             }
             Error::ReputationNotFound { subject_id } => {
                 error!("No indexed reviews for subject: {}", subject_id)

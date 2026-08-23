@@ -111,6 +111,20 @@ pub fn delete_listing(owner_id: &str, listing_id: &str) -> Query {
     .param("listing_id", listing_id.to_string())
 }
 
+/// Deletes a drop node and all its relationships
+/// # Arguments
+/// * `owner_id` - The unique identifier of the user who owns the drop
+/// * `drop_id` - The unique identifier of the drop to be deleted
+pub fn delete_drop(owner_id: &str, drop_id: &str) -> Query {
+    Query::new(
+        "delete_drop",
+        "MATCH (drop:Drop {id: $drop_id, owner_id: $owner_id})
+         DETACH DELETE drop;",
+    )
+    .param("owner_id", owner_id.to_string())
+    .param("drop_id", drop_id.to_string())
+}
+
 /// Deletes a review edge between a reviewer and its subject
 /// # Arguments
 /// * `reviewer_id` - The unique identifier of the user who authored the review

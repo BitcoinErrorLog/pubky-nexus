@@ -1,7 +1,7 @@
 use crate::routes::v0::endpoints::{
-    STREAM_LISTINGS_ROUTE, STREAM_POSTS_BY_IDS_ROUTE, STREAM_POSTS_ROUTE, STREAM_POST_KEYS_ROUTE,
-    STREAM_USERS_BY_IDS_ROUTE, STREAM_USERS_ROUTE, STREAM_USERS_USERNAME_SEARCH_ROUTE,
-    STREAM_USER_IDS_ROUTE,
+    STREAM_DROPS_ROUTE, STREAM_LISTINGS_ROUTE, STREAM_POSTS_BY_IDS_ROUTE, STREAM_POSTS_ROUTE,
+    STREAM_POST_KEYS_ROUTE, STREAM_USERS_BY_IDS_ROUTE, STREAM_USERS_ROUTE,
+    STREAM_USERS_USERNAME_SEARCH_ROUTE, STREAM_USER_IDS_ROUTE,
 };
 use crate::routes::AppState;
 
@@ -9,6 +9,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use utoipa::OpenApi;
 
+mod drops;
 mod listings;
 mod posts;
 mod users;
@@ -21,6 +22,7 @@ pub fn routes() -> Router<AppState> {
             STREAM_LISTINGS_ROUTE,
             get(listings::stream_listings_handler),
         )
+        .route(STREAM_DROPS_ROUTE, get(drops::stream_drops_handler))
         .route(
             STREAM_USERS_USERNAME_SEARCH_ROUTE,
             get(users::stream_username_search_handler),
@@ -46,6 +48,7 @@ impl StreamApiDoc {
         let mut combined = users::StreamUsersApiDocs::openapi();
         combined.merge(posts::StreamPostsApiDocs::openapi());
         combined.merge(listings::StreamListingsApiDocs::openapi());
+        combined.merge(drops::StreamDropsApiDocs::openapi());
         combined
     }
 }

@@ -1,7 +1,9 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
 use crate::db::kv::SortOrder;
-use crate::models::marketplace::{ListingStreamFilters, ListingStreamSorting};
+use crate::models::marketplace::{
+    DropStreamBucket, DropStreamFilters, ListingStreamFilters, ListingStreamSorting,
+};
 use crate::models::post::StreamSource;
 use crate::types::routes::HotTagsInputDTO;
 use crate::types::Pagination;
@@ -926,6 +928,119 @@ pub fn get_listing_by_id(owner_id: &str, listing_id: &str) -> Query {
     )
     .param("owner_id", owner_id)
     .param("listing_id", listing_id)
+}
+
+// Retrieve a drop node by owner id and drop id
+pub fn get_drop_by_id(owner_id: &str, drop_id: &str) -> Query {
+    Query::new(
+        "get_drop_by_id",
+        "
+            MATCH (owner:User {id: $owner_id})-[:OFFERS]->(drop:Drop {id: $drop_id})
+            RETURN {
+                id: drop.id,
+                uri: drop.uri,
+                owner_id: owner.id,
+                indexed_at: drop.indexed_at,
+                revision: drop.revision,
+                title: drop.title,
+                description: drop.description,
+                media_urls: COALESCE(drop.media_urls, []),
+                format: drop.format,
+                starts_at: drop.starts_at,
+                ends_at: drop.ends_at,
+                listing_ids: COALESCE(drop.listing_ids, []),
+                total_quantity: drop.total_quantity,
+                per_buyer_limit: drop.per_buyer_limit,
+                stock_display: drop.stock_display,
+                created_at: drop.created_at,
+                updated_at: drop.updated_at
+            } AS details
+        ",
+    )
+    .param("owner_id", owner_id)
+    .param("drop_id", drop_id)
+}
+
+// Build the drop stream graph query based on the provided filters. The stream
+// is ordered by the declared start time (`starts_at_ms`) and the pagination
+// timeframe bounds apply to it. The bucket filter compares the declared
+// schedule against `now_ms`, so the buckets are time-window estimates
+// computed from the indexed record, never the transaction service's
+// authoritative drop state.
+pub fn drop_stream(
+    filters: &DropStreamFilters,
+    pagination: Pagination,
+    order: SortOrder,
+    now_ms: i64,
+) -> Query {
+    let mut cypher = String::new();
+    let mut where_clause_applied = false;
+
+    cypher.push_str("MATCH (owner:User)-[:OFFERS]->(drop:Drop)\n");
+
+    if filters.owner.is_some() {
+        append_condition(&mut cypher, "owner.id = $owner", &mut where_clause_applied);
+    }
+    if let Some(bucket) = &filters.bucket {
+        let condition = match bucket {
+            DropStreamBucket::Upcoming => "drop.starts_at_ms > $now",
+            DropStreamBucket::LiveWindow => {
+                "drop.starts_at_ms <= $now AND (drop.ends_at_ms IS NULL OR drop.ends_at_ms > $now)"
+            }
+            DropStreamBucket::EndedWindow => {
+                "drop.ends_at_ms IS NOT NULL AND drop.ends_at_ms <= $now"
+            }
+        };
+        append_condition(&mut cypher, condition, &mut where_clause_applied);
+    }
+    if pagination.start.is_some() {
+        append_condition(
+            &mut cypher,
+            "drop.starts_at_ms <= $start",
+            &mut where_clause_applied,
+        );
+    }
+    if pagination.end.is_some() {
+        append_condition(
+            &mut cypher,
+            "drop.starts_at_ms >= $end",
+            &mut where_clause_applied,
+        );
+    }
+
+    let sort_direction = match order {
+        SortOrder::Ascending => "ASC",
+        SortOrder::Descending => "DESC",
+    };
+    cypher.push_str(&format!(
+        "WITH DISTINCT drop, owner
+        RETURN owner.id AS owner_id, drop.id AS drop_id
+        ORDER BY drop.starts_at_ms {sort_direction}\n",
+    ));
+
+    if let Some(skip) = pagination.skip {
+        cypher.push_str(&format!("SKIP {skip}\n"));
+    }
+    if let Some(limit) = pagination.limit {
+        cypher.push_str(&format!("LIMIT {limit}\n"));
+    }
+
+    let mut query = Query::new("drop_stream", &cypher);
+
+    if let Some(owner) = &filters.owner {
+        query = query.param("owner", owner.to_string());
+    }
+    if filters.bucket.is_some() {
+        query = query.param("now", now_ms);
+    }
+    if let Some(start) = pagination.start {
+        query = query.param("start", start);
+    }
+    if let Some(end) = pagination.end {
+        query = query.param("end", end);
+    }
+
+    query
 }
 
 /// Serializes a unit enum variant into its snake_case string form for query parameters.

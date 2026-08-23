@@ -26,6 +26,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE CONSTRAINT uniqueHomeserverId IF NOT EXISTS FOR (hs:Homeserver) REQUIRE hs.id IS UNIQUE",
         "CREATE CONSTRAINT uniqueShopOwnerId IF NOT EXISTS FOR (s:Shop) REQUIRE s.owner_id IS UNIQUE",
         "CREATE CONSTRAINT uniqueListingId IF NOT EXISTS FOR (l:Listing) REQUIRE (l.owner_id, l.id) IS UNIQUE",
+        "CREATE CONSTRAINT uniqueDropId IF NOT EXISTS FOR (d:Drop) REQUIRE (d.owner_id, d.id) IS UNIQUE",
     ];
 
     // Create indexes
@@ -47,6 +48,9 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE INDEX listingStateIndex IF NOT EXISTS FOR (l:Listing) ON (l.state)",
         "CREATE INDEX listingPriceIndex IF NOT EXISTS FOR (l:Listing) ON (l.price_currency, l.price_major)",
         "CREATE INDEX listingAuctionEndsAtIndex IF NOT EXISTS FOR (l:Listing) ON (l.auction_ends_at_ms)",
+        "CREATE INDEX dropIdIndex IF NOT EXISTS FOR (d:Drop) ON (d.owner_id, d.id)",
+        "CREATE INDEX dropStartsAtIndex IF NOT EXISTS FOR (d:Drop) ON (d.starts_at_ms)",
+        "CREATE INDEX dropEndsAtIndex IF NOT EXISTS FOR (d:Drop) ON (d.ends_at_ms)",
     ];
 
     let queries = constraints.iter().chain(indexes.iter());
@@ -54,11 +58,21 @@ async fn setup_graph_inner() -> GraphResult<()> {
     let graph = get_neo4j_graph()?;
 
     for &ddl in queries {
-        graph.run(Query::new("setup_ddl", ddl)).await.map_err(|e| {
-            GraphError::Generic(format!(
+        if let Err(e) = graph.run(Query::new("setup_ddl", ddl)).await {
+            // `IF NOT EXISTS` does not protect against a concurrent process
+            // creating the same rule between our existence check and create
+            // (e.g. API + watcher, or parallel test binaries, booting at
+            // once). Neo4j reports that race as an AlreadyExists schema
+            // error, which means the rule is in place — the desired state.
+            let message = e.to_string();
+            if message.contains("AlreadyExists") {
+                info!("Graph constraint/index already exists, skipping: {ddl}");
+                continue;
+            }
+            return Err(GraphError::Generic(format!(
                 "Failed to apply graph constraint/index '{ddl}': {e}"
-            ))
-        })?;
+            )));
+        }
     }
 
     info!("Neo4j graph constraints and indexes have been applied successfully");

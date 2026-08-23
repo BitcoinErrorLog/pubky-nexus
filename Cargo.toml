@@ -20,7 +20,7 @@ redis = "1.0.4"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 pubky = "0.7.0"
-pubky-app-specs = { git = "https://github.com/BitcoinErrorLog/pubky-app-specs.git", rev = "31afc396845da630f621cf4c018c155a3ba8711d", features = ["openapi"] }
+pubky-app-specs = { git = "https://github.com/BitcoinErrorLog/pubky-app-specs.git", rev = "7d79e5e8fc61fd75a503268cdedba75038c9b4d4", features = ["openapi"] }
 pubky-testnet = "0.7.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.149"

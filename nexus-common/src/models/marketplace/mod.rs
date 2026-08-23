@@ -1,3 +1,4 @@
+mod drop;
 mod listing;
 mod reputation;
 mod review;
@@ -7,6 +8,10 @@ mod shop;
 mod stream;
 mod view;
 
+pub use drop::{
+    DropDetails, DropStream, DropStreamBucket, DropStreamFilters, DROP_PER_OWNER_KEY_PARTS,
+    DROP_STARTS_KEY_PARTS,
+};
 pub use listing::{ListingDetails, ListingSaleFormat};
 pub use reputation::{
     ReputationSnippet, ReputationSummary, REPUTATION_LISTING_KEY, REPUTATION_SUBJECT_KEY,
