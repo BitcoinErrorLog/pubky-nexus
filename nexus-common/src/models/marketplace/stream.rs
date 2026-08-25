@@ -92,6 +92,7 @@ impl ListingStreamFilters {
             || self.min_price.is_some()
             || self.max_price.is_some()
             || self.currency.is_some()
+            || self.country.is_some()
     }
 
     /// A single tag label with no other filters can be served from the

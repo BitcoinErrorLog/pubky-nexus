@@ -249,6 +249,15 @@ async fn test_stream_listings_filters() -> Result<()> {
     .await?;
     assert_eq!(body.as_array().expect("array").len(), 0);
 
+    // A country-ONLY query must also filter: it cannot be served from the
+    // unfiltered timeline index shortcut.
+    let body = get_request("/v0/stream/listings?country=HR").await?;
+    assert_eq!(body.as_array().expect("array").len(), 0);
+    let body = get_request("/v0/stream/listings?country=US&limit=3").await?;
+    for listing in body.as_array().expect("array") {
+        assert_eq!(listing["country_code"], "US");
+    }
+
     Ok(())
 }
 
