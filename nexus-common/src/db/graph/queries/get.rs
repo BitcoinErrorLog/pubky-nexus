@@ -1120,6 +1120,13 @@ pub fn listing_stream(
             &mut where_clause_applied,
         );
     }
+    if filters.country.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.country_code = $country",
+            &mut where_clause_applied,
+        );
+    }
     if filters.min_price.is_some() {
         append_condition(
             &mut cypher,
@@ -1194,6 +1201,9 @@ pub fn listing_stream(
     }
     if let Some(currency) = &filters.currency {
         query = query.param("currency", currency.to_string());
+    }
+    if let Some(country) = &filters.country {
+        query = query.param("country", country.to_uppercase());
     }
     if let Some(min_price) = filters.min_price {
         query = query.param("min_price", min_price);

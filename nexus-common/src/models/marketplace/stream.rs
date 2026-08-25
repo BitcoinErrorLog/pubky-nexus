@@ -44,6 +44,9 @@ pub struct ListingStreamFilters {
     #[serde(default, deserialize_with = "parse_string_to_f64")]
     pub max_price: Option<f64>,
     pub currency: Option<String>,
+    /// Seller-declared item location: the listing record's uppercase
+    /// ISO-3166-1 alpha-2 country code (e.g. `HR`).
+    pub country: Option<String>,
     /// Community tag labels (comma-separated in the query string). A listing
     /// matches when any user has tagged it with one of the labels. Mirrors
     /// the post stream's `tags` filter: a single label with no other filters

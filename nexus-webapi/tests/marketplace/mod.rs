@@ -231,6 +231,24 @@ async fn test_stream_listings_filters() -> Result<()> {
     // Price filters without a currency are rejected
     invalid_get_request("/v0/stream/listings?min_price=100", StatusCode::BAD_REQUEST).await?;
 
+    // Country filter: the seller-declared item location, case-insensitive.
+    // The fixtures all declare US, so US matches everything in the category
+    // and HR matches nothing.
+    let body = get_request(&format!(
+        "/v0/stream/listings?category={category}&country=us"
+    ))
+    .await?;
+    let listings = body.as_array().expect("Listing stream should be an array");
+    assert_eq!(listings.len(), 3);
+    for listing in listings {
+        assert_eq!(listing["country_code"], "US");
+    }
+    let body = get_request(&format!(
+        "/v0/stream/listings?category={category}&country=HR"
+    ))
+    .await?;
+    assert_eq!(body.as_array().expect("array").len(), 0);
+
     Ok(())
 }
 
