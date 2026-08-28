@@ -140,21 +140,50 @@ pub struct ReviewBackfill {
 /// retries them (indexed reviews drop out via the already-indexed skip).
 pub async fn backfill_unindexed_reviews() -> Result<ReviewBackfill, DynError> {
     let user_ids = get_all_user_ids().await?;
+    let total = user_ids.len();
     info!(
         "Review backfill: scanning the reviews directory of {} indexed user(s)",
-        user_ids.len()
+        total
     );
 
+    // Bounded concurrency: the scan is network-bound (one homeserver LIST
+    // per user, pkarr resolution included), and a sequential pass over
+    // thousands of users outlives operator sessions. Sixteen in flight
+    // keeps the staging homeserver comfortable and the wall time in
+    // minutes.
+    const CONCURRENCY: usize = 16;
     let mut summary = ReviewBackfill::default();
-    for user_id in user_ids {
-        match backfill_reviews_for_user(&user_id).await {
-            Ok(user_summary) => {
+    let mut scanned = 0usize;
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut queue = user_ids.into_iter();
+
+    loop {
+        while tasks.len() < CONCURRENCY {
+            let Some(user_id) = queue.next() else { break };
+            tasks.spawn(async move {
+                let result = backfill_reviews_for_user(&user_id).await;
+                (user_id, result)
+            });
+        }
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        scanned += 1;
+        if scanned % 250 == 0 {
+            info!("Review backfill: scanned {}/{} user(s)", scanned, total);
+        }
+        match joined {
+            Ok((_, Ok(user_summary))) => {
                 summary.indexed += user_summary.indexed;
                 summary.already_indexed += user_summary.already_indexed;
                 summary.failed += user_summary.failed;
             }
-            Err(e) => {
+            Ok((user_id, Err(e))) => {
                 warn!("Review backfill for user {} failed: {:?}", user_id, e);
+                summary.failed += 1;
+            }
+            Err(e) => {
+                warn!("Review backfill task panicked: {:?}", e);
                 summary.failed += 1;
             }
         }
