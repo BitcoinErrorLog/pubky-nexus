@@ -11,6 +11,7 @@ pub use manager::MigrationManager;
 
 use crate::migrations::migrations_list::listing_auction_terms_reindex_1787256279::ListingAuctionTermsReindex1787256279;
 use crate::migrations::migrations_list::remove_muted_1771718400::RemoveMuted1771718400;
+use crate::migrations::migrations_list::review_backfill_1787905961::ReviewBackfill1787905961;
 use crate::migrations::migrations_list::users_by_pk_reindex_1751635096::UsersByPkReindex1751635096;
 /// Registers migrations with the `MigrationManager`
 ///
@@ -43,6 +44,7 @@ pub fn import_migrations(migration_manager: &mut MigrationManager) {
         Box::new(UsersByPkReindex1751635096),
         Box::new(RemoveMuted1771718400),
         Box::new(ListingAuctionTermsReindex1787256279),
+        Box::new(ReviewBackfill1787905961),
     ];
     for migration in migrations {
         migration_manager.register(migration);

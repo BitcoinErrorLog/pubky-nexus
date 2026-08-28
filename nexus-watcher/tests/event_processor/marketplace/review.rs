@@ -414,3 +414,115 @@ async fn test_homeserver_review_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn test_review_backfill_indexes_pre_cursor_reviews() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+
+    // Cast indexed through the normal pipeline: seller, listing, buyer.
+    let seller_kp = Keypair::random();
+    let seller_id = test
+        .create_user(&seller_kp, &test_user("Watcher:ReviewBackfill:Seller"))
+        .await?;
+    let listing = test_listing(
+        &seller_id,
+        "Backfilled reviewed radio",
+        "electronics",
+        PubkyAppListingCondition::Good,
+        20_000,
+    );
+    let (listing_id, _listing_path) = test.create_listing(&seller_kp, &listing).await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &test_user("Watcher:ReviewBackfill:Buyer"))
+        .await?;
+
+    // Publish a VALID attested review with event processing DISABLED: the
+    // record exists on the homeserver but the watcher never saw its event —
+    // exactly the shape of a review published before the deployed replay
+    // cursor.
+    let attestor = test_attestor_key();
+    let attestor_id = attestor_pubky(&attestor);
+    let claims = test_attestation_claims(
+        &attestor_id,
+        &buyer_id,
+        &seller_id,
+        &seller_id,
+        &listing_id,
+        'f',
+    );
+    let jws = sign_attestation(&claims, &attestor);
+    let review = test_review(
+        &buyer_id,
+        &seller_id,
+        &seller_id,
+        &listing_id,
+        4,
+        "Backfilled: solid radio, honest seller.",
+        &jws,
+    );
+    let mut test = test.remove_event_processing().await;
+    let (review_id, _review_path) = test.create_review(&buyer_kp, &review).await?;
+
+    assert!(
+        ReviewDetails::get_from_index(&buyer_id, &review_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "The pre-cursor review must start unindexed"
+    );
+
+    // The backfill discovers it from the buyer's homeserver directory and
+    // runs the normal ingest. (The per-user entry point: the global
+    // migration is this same pass looped over get_all_user_ids, and a
+    // global scan cannot run concurrently with the other watcher tests'
+    // deletions without racing them.)
+    let summary = nexus_watcher::events::handlers::review::backfill_reviews_for_user(&buyer_id)
+        .await
+        .unwrap();
+    assert!(
+        summary.indexed >= 1,
+        "The backfill should have indexed the pre-cursor review, got {summary:?}"
+    );
+
+    let indexed = ReviewDetails::get_from_index(&buyer_id, &review_id)
+        .await
+        .unwrap()
+        .expect("The backfilled review should be indexed");
+    assert!(
+        indexed.verified,
+        "The attestation must verify during the backfill ingest"
+    );
+    assert_eq!(indexed.rating_overall, 4);
+    assert_eq!(indexed.subject_id, seller_id);
+
+    // Reputation was recomputed from the backfilled review.
+    let summary_row =
+        ReputationSummary::get_by_subject(&seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await
+            .unwrap()
+            .expect("The subject reputation summary should exist after the backfill");
+    assert!(summary_row.count >= 1);
+
+    // A second pass skips it by id without refetching.
+    let second = nexus_watcher::events::handlers::review::backfill_reviews_for_user(&buyer_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        second.indexed, 0,
+        "The re-run must not re-ingest, got {second:?}"
+    );
+    assert!(
+        second.already_indexed >= 1,
+        "The re-run should count the review as already indexed, got {second:?}"
+    );
+    assert!(
+        ReviewDetails::get_from_index(&buyer_id, &review_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "The review must survive the idempotent re-run"
+    );
+
+    Ok(())
+}

@@ -99,6 +99,27 @@ pub async fn reindex_post(author_id: &str, post_id: &str) -> Result<(), DynError
     Ok(())
 }
 
+/// The review ids already indexed for one reviewer (the `REVIEWED` edge's
+/// `review_id`), so a homeserver-discovery backfill can skip records the
+/// events feed already ingested.
+pub async fn get_indexed_review_ids(reviewer_id: &str) -> Result<Vec<String>, DynError> {
+    let query = Query::new(
+        "get_indexed_review_ids",
+        "MATCH (u:User {id: $reviewer_id})-[r:REVIEWED]->() RETURN r.review_id AS review_id",
+    )
+    .param("reviewer_id", reviewer_id.to_string());
+    let rows = fetch_all_rows_from_graph(query).await?;
+
+    let mut review_ids = Vec::new();
+    for row in rows {
+        if let Some(review_id) = row.get("review_id")? {
+            review_ids.push(review_id);
+        }
+    }
+
+    Ok(review_ids)
+}
+
 pub async fn get_all_user_ids() -> Result<Vec<String>, DynError> {
     let query = Query::new("get_all_user_ids", "MATCH (u:User) RETURN u.id AS id");
     let rows = fetch_all_rows_from_graph(query).await?;

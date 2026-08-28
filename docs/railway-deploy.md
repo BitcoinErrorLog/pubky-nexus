@@ -91,11 +91,19 @@ curl "https://nexusd-production-7108.up.railway.app/v0/stream/listings"
 railway logs --service nexusd   # watcher: "Processing N event lines" / cursor updates
 ```
 
-## Running the auction-terms backfill migration on Railway
+## Running the backfill migrations on Railway
 
-The one-shot `ListingAuctionTermsReindex` migration (see the runbook in
-`README.md`) re-reads auction listings that predate the auction-term fields.
-On Railway, run it inside the `nexusd` container so it reaches the private
+Two one-shot migrations exist (see the runbook in `README.md`):
+
+- `ListingAuctionTermsReindex1787256279` re-reads auction listings that
+  predate the auction-term fields.
+- `ReviewBackfill1787905961` discovers and indexes marketplace reviews
+  published BEFORE the deployed watcher's replay cursor, by LISTing every
+  indexed user's reviews directory on their homeserver and running the
+  normal ingest (attestation verification and reputation recompute
+  included).
+
+On Railway, run them inside the `nexusd` container so they reach the private
 databases:
 
 ```bash
@@ -105,7 +113,7 @@ railway ssh --service nexusd
 mkdir -p ~/.pubky-nexus/migrations
 cat > ~/.pubky-nexus/migrations/config.toml <<EOF
 name = "nexusd.migration"
-backfill_ready = ["ListingAuctionTermsReindex1787256279"]
+backfill_ready = ["ListingAuctionTermsReindex1787256279", "ReviewBackfill1787905961"]
 testnet = false
 testnet_host = "localhost"
 
@@ -123,5 +131,6 @@ EOF
 nexusd db migration run
 ```
 
-The migration is idempotent; re-run it if some listings failed (e.g. a
-homeserver was briefly unreachable). The watcher does not need to be stopped.
+Both migrations are idempotent; re-run on partial failure (e.g. a homeserver
+was briefly unreachable) — already-processed rows are skipped, so a re-run
+only retries the failures. The watcher does not need to be stopped.
