@@ -83,6 +83,30 @@ service to `BitcoinErrorLog/pubky-nexus` @ `feat/marketplace-indexing` in the
 dashboard so pushes redeploy automatically; `railway.toml` already points the
 builder at `Dockerfile.railway`.
 
+**Set `RAILWAY_DOCKERFILE_PATH=Dockerfile.railway` on every new `nexusd`
+service.** Observed 2026-09-05 on the production instance: with only
+`railway.toml` (config-as-code, deprecated by Railway) the `railway up` build
+used the plain `Dockerfile` (`CMD ["nexusd"]`), so the container never ran
+`entrypoint-railway.sh`, never wrote `/data/config.toml`, and crash-looped on
+`Failed to PING to Redis at redis://127.0.0.1:6379` while the `NEXUS_*`
+variables were all correct. The tell in the logs is
+`nexusd loading config file /root/.pubky-nexus/config.toml` and no
+`=== Railway nexusd entrypoint ===` banner. Setting the variable and
+redeploying fixed it.
+
+## Production instance (2026-09-05)
+
+A second instance watches the **production** homeserver
+(`8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty`,
+https://homeserver.pubky.app): Railway project `pubky-marketplace-production`,
+services `neo4j`, `Redis`, `nexusd`, public API
+https://nexusd-production-95a0.up.railway.app. Same variables as above with
+`NEXUS_HOMESERVER=8um71…`. Production history measured at 213,006 events on
+2026-09-05 (paging the public `/events` cursor at `limit=1000`; the cursor is a
+plain sequence number), so the cold replay is on the order of one day at the
+throughput observed on staging. Start strategy and risks:
+[`production-cutover.md`](./production-cutover.md).
+
 ## Health checks
 
 ```bash
