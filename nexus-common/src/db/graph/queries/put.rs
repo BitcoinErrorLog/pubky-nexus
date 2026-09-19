@@ -468,7 +468,6 @@ pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
             listing.auction_starts_at = $auction_starts_at,
             listing.auction_ends_at = $auction_ends_at,
             listing.auction_ends_at_ms = $auction_ends_at_ms,
-            listing.auction_reserve_price_minor = $auction_reserve_price_minor,
             listing.auction_buy_now_price_minor = $auction_buy_now_price_minor,
             listing.auction_minimum_increment_minor = $auction_minimum_increment_minor,
             listing.fulfillment_methods = $fulfillment_methods,
@@ -476,6 +475,7 @@ pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
             listing.created_at = $created_at,
             listing.updated_at = $updated_at,
             listing.revision = $revision
+        REMOVE listing.auction_reserve_price_minor
         // Returns true if the listing node already existed
         RETURN existing_listing IS NOT NULL AS flag;",
     )
@@ -500,10 +500,6 @@ pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
     .param("auction_starts_at", listing.auction_starts_at.clone())
     .param("auction_ends_at", listing.auction_ends_at.clone())
     .param("auction_ends_at_ms", listing.auction_ends_at_ms())
-    .param(
-        "auction_reserve_price_minor",
-        listing.auction_reserve_price_minor,
-    )
     .param(
         "auction_buy_now_price_minor",
         listing.auction_buy_now_price_minor,

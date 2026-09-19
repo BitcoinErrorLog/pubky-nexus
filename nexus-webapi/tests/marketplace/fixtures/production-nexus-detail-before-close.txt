@@ -1,0 +1,12 @@
+HTTP/2 200 
+access-control-allow-origin: *
+content-type: application/json
+date: Sat, 19 Sep 2026 08:08:04 GMT
+server: railway-hikari
+vary: origin, access-control-request-method, access-control-request-headers
+vary: accept-encoding
+x-railway-request-id: vm3OnFCORWqsU4-tCYBc-A
+x-railway-edge: lhr1
+x-hikari-trace: lhr1.mryf
+
+{"id":"7dd7e4279c2745df8b174656b9ee0670","uri":"pubky://n3pfudgxncn8i1e6icuq7umoczemjuyi6xdfrfczk3o8ej3e55my/pub/pubky.app/marketplace/v1/listings/7dd7e4279c2745df8b174656b9ee0670","owner_id":"n3pfudgxncn8i1e6icuq7umoczemjuyi6xdfrfczk3o8ej3e55my","indexed_at":1789310081004,"state":"active","title":"V26 capture test — do not bid","description":"Diagnostic listing; do not buy.","category_id":"other","condition":"good","tags":["v26","capture","test","not","bid"],"country_code":"US","region":"NY","media_urls":["pubky://n3pfudgxncn8i1e6icuq7umoczemjuyi6xdfrfczk3o8ej3e55my/pub/pubky.app/marketplace/v1/media/f2d92018e66441cf8c3087a67b971206"],"sale_format":"auction","price_amount_minor":100,"price_currency":"USD","price_exponent":2,"auction_starts_at":"2026-09-13T14:34:39.384Z","auction_ends_at":"2026-09-20T14:34:39.384Z","auction_reserve_price_minor":null,"auction_buy_now_price_minor":null,"auction_minimum_increment_minor":100,"fulfillment_methods":["physical"],"adult_only":false,"created_at":"2026-09-13T14:34:39.384Z","updated_at":"2026-09-13T14:34:39.384Z","revision":1}

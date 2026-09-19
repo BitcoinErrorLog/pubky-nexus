@@ -1,19 +1,23 @@
 use super::utils::{test_auction_listing, test_listing};
 use crate::event_processor::utils::watcher::WatcherTest;
 use anyhow::Result;
+use nexus_common::db::graph::Query;
 use nexus_common::db::kv::SortOrder;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
-use nexus_common::db::RedisOps;
+use nexus_common::db::{exec_single_row, fetch_key_from_graph, RedisOps};
 use nexus_common::models::marketplace::{
     ListingDetails, ListingSaleFormat, ListingStream, ListingStreamFilters, ListingStreamSorting,
     LISTING_AUCTION_ENDS_KEY_PARTS,
 };
 use nexus_common::types::Pagination;
-use nexus_watcher::events::handlers::listing::backfill_missing_auction_terms;
+use nexus_watcher::events::handlers::listing::{
+    backfill_missing_auction_terms, scrub_legacy_listing_reserves, validate_public_listing_blob,
+};
 use pubky::Keypair;
 use pubky_app_specs::{
-    PubkyAppListingCondition, PubkyAppListingSale, PubkyAppListingState, PubkyAppMoney,
-    PubkyAppUser,
+    traits::{HasIdPath, TimestampId},
+    PubkyAppListing, PubkyAppListingCondition, PubkyAppListingSale, PubkyAppListingState,
+    PubkyAppMoney, PubkyAppUser,
 };
 
 fn seller_filters(seller_id: &str) -> ListingStreamFilters {
@@ -44,6 +48,64 @@ async fn auction_set_entries(min_ms: i64, max_ms: i64) -> Vec<(String, f64)> {
     .await
     .unwrap()
     .unwrap_or_default()
+}
+
+#[test]
+fn public_listing_blob_rejects_reserve_keys_recursively() {
+    let allowed = br#"{"sale":{"format":"auction"},"ext":[{"public":null}]}"#;
+    validate_public_listing_blob(allowed).expect("reserve-free public listing");
+
+    for key in [
+        "auction_reserve_price_minor",
+        "reservePrice",
+        "reserve_price",
+        "reserveMet",
+        "reserve_met",
+    ] {
+        let blob = format!(r#"{{"ext":[{{"{key}":null}}]}}"#);
+        assert!(
+            validate_public_listing_blob(blob.as_bytes()).is_err(),
+            "{key} must be rejected even when nested and null"
+        );
+    }
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn reserve_bearing_public_listing_is_not_indexed() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let user_kp = Keypair::random();
+    let user = PubkyAppUser {
+        bio: None,
+        image: None,
+        links: None,
+        name: "Watcher:ReserveReject:User".to_string(),
+        status: None,
+    };
+    let user_id = test.create_user(&user_kp, &user).await?;
+    let mut listing = test_auction_listing(
+        &user_id,
+        "Forbidden reserve listing",
+        "collectibles",
+        "2025-01-03T00:00:00Z",
+        "2025-01-10T00:00:00Z",
+    );
+    listing.listing_id = listing.create_id();
+    let listing_id = listing.listing_id.clone();
+    let listing_path: pubky::ResourcePath = PubkyAppListing::create_path(&listing_id).parse()?;
+    let mut blob = serde_json::to_value(&listing)?;
+    blob["sale"]["reservePrice"] = serde_json::Value::Null;
+
+    let _ = test.put(&user_kp, &listing_path, &blob).await;
+
+    assert!(ListingDetails::get_from_graph(&user_id, &listing_id)
+        .await?
+        .is_none());
+    assert!(ListingDetails::get_from_index(&user_id, &listing_id)
+        .await?
+        .is_none());
+    test.del(&user_kp, &listing_path).await?;
+    test.cleanup_user(&user_kp).await?;
+    Ok(())
 }
 
 #[tokio_shared_rt::test(shared)]
@@ -361,7 +423,6 @@ async fn test_homeserver_auction_listing_roundtrip() -> Result<()> {
     );
     assert_eq!(graph_listing.auction_starts_at.as_deref(), Some(starts_at));
     assert_eq!(graph_listing.auction_ends_at.as_deref(), Some(ends_at));
-    assert_eq!(graph_listing.auction_reserve_price_minor, Some(2_000));
     assert_eq!(graph_listing.auction_buy_now_price_minor, Some(10_000));
     assert_eq!(graph_listing.auction_minimum_increment_minor, Some(100));
 
@@ -434,7 +495,6 @@ async fn test_homeserver_auction_listing_roundtrip() -> Result<()> {
     assert_eq!(indexed_listing.sale_format, ListingSaleFormat::FixedPrice);
     assert!(indexed_listing.auction_starts_at.is_none());
     assert!(indexed_listing.auction_ends_at.is_none());
-    assert!(indexed_listing.auction_reserve_price_minor.is_none());
     assert!(indexed_listing.auction_buy_now_price_minor.is_none());
     assert!(indexed_listing.auction_minimum_increment_minor.is_none());
     assert!(indexed_listing.auction_ends_at_ms().is_none());
@@ -444,7 +504,6 @@ async fn test_homeserver_auction_listing_roundtrip() -> Result<()> {
     for field in [
         "auction_starts_at",
         "auction_ends_at",
-        "auction_reserve_price_minor",
         "auction_buy_now_price_minor",
         "auction_minimum_increment_minor",
     ] {
@@ -645,7 +704,6 @@ async fn test_auction_terms_backfill_reindexes_pre_term_rows() -> Result<()> {
     let legacy_details = ListingDetails {
         auction_starts_at: None,
         auction_ends_at: None,
-        auction_reserve_price_minor: None,
         auction_buy_now_price_minor: None,
         auction_minimum_increment_minor: None,
         ..indexed_listing
@@ -685,7 +743,6 @@ async fn test_auction_terms_backfill_reindexes_pre_term_rows() -> Result<()> {
         .expect("The backfilled listing should be in the graph");
     assert_eq!(graph_listing.auction_starts_at.as_deref(), Some(starts_at));
     assert_eq!(graph_listing.auction_ends_at.as_deref(), Some(ends_at));
-    assert_eq!(graph_listing.auction_reserve_price_minor, Some(2_000));
     assert_eq!(graph_listing.auction_buy_now_price_minor, Some(10_000));
     assert_eq!(graph_listing.auction_minimum_increment_minor, Some(100));
 
@@ -718,5 +775,87 @@ async fn test_auction_terms_backfill_reindexes_pre_term_rows() -> Result<()> {
     test.del(&user_kp, &listing_path).await?;
     test.cleanup_user(&user_kp).await?;
 
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn legacy_reserve_scrub_removes_graph_property_and_rewrites_redis() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let user_kp = Keypair::random();
+    let user = PubkyAppUser {
+        bio: None,
+        image: None,
+        links: None,
+        name: "Watcher:ReserveScrub:User".to_string(),
+        status: None,
+    };
+    let user_id = test.create_user(&user_kp, &user).await?;
+    let listing = test_auction_listing(
+        &user_id,
+        "Legacy reserve scrub",
+        "collectibles",
+        "2025-02-01T00:00:00Z",
+        "2025-02-08T00:00:00Z",
+    );
+    let (listing_id, listing_path) = test.create_listing(&user_kp, &listing).await?;
+
+    exec_single_row(
+        Query::new(
+            "seed_legacy_listing_reserve",
+            "MATCH (listing:Listing {owner_id: $owner_id, id: $listing_id})
+             SET listing.auction_reserve_price_minor = 2000",
+        )
+        .param("owner_id", user_id.clone())
+        .param("listing_id", listing_id.clone()),
+    )
+    .await?;
+    let before: Option<i64> = fetch_key_from_graph(
+        Query::new(
+            "read_legacy_listing_reserve",
+            "MATCH (listing:Listing {owner_id: $owner_id, id: $listing_id})
+             RETURN listing.auction_reserve_price_minor AS value",
+        )
+        .param("owner_id", user_id.clone())
+        .param("listing_id", listing_id.clone()),
+        "value",
+    )
+    .await?;
+    assert_eq!(before, Some(2_000));
+
+    assert!(
+        scrub_legacy_listing_reserves()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            >= 1
+    );
+
+    let removed: Option<bool> = fetch_key_from_graph(
+        Query::new(
+            "read_scrubbed_listing_reserve",
+            "MATCH (listing:Listing {owner_id: $owner_id, id: $listing_id})
+             RETURN listing.auction_reserve_price_minor IS NULL AS value",
+        )
+        .param("owner_id", user_id.clone())
+        .param("listing_id", listing_id.clone()),
+        "value",
+    )
+    .await?;
+    assert_eq!(removed, Some(true));
+
+    let cached = ListingDetails::get_from_index(&user_id, &listing_id)
+        .await?
+        .expect("scrubbed Redis listing");
+    let cached_json = serde_json::to_value(cached)?;
+    assert!(
+        cached_json.get("auction_reserve_price_minor").is_none(),
+        "Redis cache rewrite must omit the legacy field"
+    );
+
+    // A second pass is safe and leaves the field absent.
+    scrub_legacy_listing_reserves()
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    test.del(&user_kp, &listing_path).await?;
+    test.cleanup_user(&user_kp).await?;
     Ok(())
 }

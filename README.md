@@ -169,20 +169,13 @@ The manager will automatically handle migrations in the appropriate order, progr
 ### Runbook: backfilling auction terms on listing rows (`ListingAuctionTermsReindex1787256279`)
 
 Marketplace listings indexed before the index carried the auction term fields
-(`auction_starts_at`, `auction_ends_at`, and the reserve/buy-now/minimum-increment
-prices) serve `null` terms until re-indexed. This single-staged migration finds
+(`auction_starts_at`, `auction_ends_at`, and the buy-now/minimum-increment
+prices) serve `null` terms until re-indexed. Private reserve terms are never
+indexed. This single-staged migration finds
 every auction row without terms in the graph, re-reads each listing's canonical
 record from its seller's homeserver (`/pub/pubky.app/marketplace/v1/listings/…`),
 and re-runs the normal listing ingest — upserting the full details in Neo4j and
 Redis and rescoring the listing in the auction end-time sorted set.
-
-To run it, an operator executes on a host with access to the deployment's
-Neo4j and Redis (connection settings in `~/.pubky-nexus/migrations/config.toml`;
-the file is created with defaults on first run):
-
-```bash
-cargo run -p nexusd -- db migration run
-```
 
 Operational notes:
 
@@ -198,6 +191,28 @@ Operational notes:
 - The watcher does not need to be stopped: the backfill runs the same ingest
   as a PUT event, and a concurrent seller re-publish simply wins with newer
   data.
+
+### Runbook: scrubbing legacy listing reserves (`ListingReserveScrub1789805700`)
+
+Older Nexus versions stored a public listing's auction reserve in Neo4j and
+Redis. This single-staged, idempotent migration removes the legacy graph
+property from every listing and rewrites every listing details cache entry
+through the reserve-free model. Run it through the same migration command
+before serving the reserve-free release.
+
+To run it, an operator executes on a host with access to the deployment's
+Neo4j and Redis (connection settings in `~/.pubky-nexus/migrations/config.toml`;
+the file is created with defaults on first run):
+
+```bash
+cargo run -p nexusd -- db migration run
+```
+
+The scrub reads only Neo4j, removes `auction_reserve_price_minor` from each
+listing node, and rewrites the corresponding Redis details JSON; it does not
+read homeservers. It is safe to rerun. If either store operation fails, the
+migration manager leaves the migration in its pending backfill phase so the
+next run retries the scrub.
 
 ## 🧪 Running Tests
 

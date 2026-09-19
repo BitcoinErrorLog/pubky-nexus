@@ -48,6 +48,9 @@ pub async fn handle_put_event(
         .await
         .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
     let resource = event.parsed_uri.resource.clone();
+    if matches!(resource, Resource::Listing(_)) {
+        handlers::listing::validate_public_listing_blob(&blob)?;
+    }
 
     // Use the new importer from pubky-app-specs
     let pubky_object =

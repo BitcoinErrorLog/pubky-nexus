@@ -915,7 +915,6 @@ pub fn get_listing_by_id(owner_id: &str, listing_id: &str) -> Query {
                 price_exponent: listing.price_exponent,
                 auction_starts_at: listing.auction_starts_at,
                 auction_ends_at: listing.auction_ends_at,
-                auction_reserve_price_minor: listing.auction_reserve_price_minor,
                 auction_buy_now_price_minor: listing.auction_buy_now_price_minor,
                 auction_minimum_increment_minor: listing.auction_minimum_increment_minor,
                 fulfillment_methods: COALESCE(listing.fulfillment_methods, []),

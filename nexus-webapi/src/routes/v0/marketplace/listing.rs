@@ -64,3 +64,27 @@ pub async fn listing_details_handler(
     ))
 )]
 pub struct ListingDetailsApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::ListingDetailsApiDoc;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn listing_openapi_omits_reserve_fields() {
+        let openapi = serde_json::to_value(ListingDetailsApiDoc::openapi()).expect("OpenAPI JSON");
+        let schema = openapi.to_string();
+        for forbidden in [
+            "auction_reserve_price_minor",
+            "reservePrice",
+            "reserve_price",
+            "reserveMet",
+            "reserve_met",
+        ] {
+            assert!(
+                !schema.contains(forbidden),
+                "OpenAPI must not expose {forbidden}"
+            );
+        }
+    }
+}

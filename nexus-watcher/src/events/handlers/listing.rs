@@ -1,11 +1,53 @@
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
+use nexus_common::db::graph::Query;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
-use nexus_common::db::{OperationOutcome, PubkyConnector};
+use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome, PubkyConnector};
 use nexus_common::models::marketplace::ListingDetails;
 use nexus_common::types::DynError;
 use pubky_app_specs::{listing_uri_builder, PubkyAppListing, PubkyAppObject, PubkyId, Resource};
+use serde_json::Value;
 use tracing::{debug, info, warn};
+
+const FORBIDDEN_PUBLIC_RESERVE_KEYS: [&str; 5] = [
+    "auction_reserve_price_minor",
+    "reservePrice",
+    "reserve_price",
+    "reserveMet",
+    "reserve_met",
+];
+
+/// Rejects public listing documents that contain private reserve information.
+///
+/// The app-spec parser is intentionally open to older record shapes, so this
+/// check runs on the raw JSON before parsing and recursively covers extension
+/// objects and arrays. A rejected document never reaches graph or Redis writes.
+pub fn validate_public_listing_blob(blob: &[u8]) -> Result<(), EventProcessorError> {
+    let value: Value = serde_json::from_slice(blob).map_err(EventProcessorError::generic)?;
+    reject_public_reserve_keys(&value)
+}
+
+fn reject_public_reserve_keys(value: &Value) -> Result<(), EventProcessorError> {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                if FORBIDDEN_PUBLIC_RESERVE_KEYS.contains(&key.as_str()) {
+                    return Err(EventProcessorError::generic(format!(
+                        "Public marketplace listing contains forbidden field {key}"
+                    )));
+                }
+                reject_public_reserve_keys(child)?;
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                reject_public_reserve_keys(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 pub async fn sync_put(
     listing: PubkyAppListing,
@@ -92,6 +134,40 @@ pub async fn backfill_missing_auction_terms() -> Result<AuctionTermsBackfill, Dy
     Ok(summary)
 }
 
+/// Removes reserve data written by older Nexus versions from graph and Redis.
+///
+/// The graph mutation selects every listing so rerunning this scrub also
+/// rewrites every listing details cache entry with the reserve-free model.
+pub async fn scrub_legacy_listing_reserves() -> Result<usize, DynError> {
+    let rows = fetch_all_rows_from_graph(Query::new(
+        "scrub_legacy_listing_reserves",
+        "MATCH (listing:Listing)
+         REMOVE listing.auction_reserve_price_minor
+         RETURN listing.owner_id AS owner_id, listing.id AS listing_id",
+    ))
+    .await?;
+
+    let mut scrubbed = 0;
+    for row in rows {
+        let owner_id: Option<String> = row.get("owner_id")?;
+        let listing_id: Option<String> = row.get("listing_id")?;
+        let (Some(owner_id), Some(listing_id)) = (owner_id, listing_id) else {
+            return Err(
+                "Listing row is missing owner_id or listing_id during reserve scrub".into(),
+            );
+        };
+        let Some(details) = ListingDetails::get_from_graph(&owner_id, &listing_id).await? else {
+            return Err(format!(
+                "Listing {owner_id}/{listing_id} disappeared during reserve scrub"
+            )
+            .into());
+        };
+        details.put_to_index(true).await?;
+        scrubbed += 1;
+    }
+    Ok(scrubbed)
+}
+
 /// Re-reads the canonical listing record from the seller's homeserver
 /// (the homeserver stays canonical for marketplace records) and re-runs the
 /// normal ingest ([`sync_put`]), upserting the full [`ListingDetails`] —
@@ -126,6 +202,7 @@ pub async fn reindex_from_homeserver(
         .bytes()
         .await
         .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
+    validate_public_listing_blob(&blob)?;
     let resource = Resource::Listing(listing_id.to_string());
     let pubky_object =
         PubkyAppObject::from_resource(&resource, &blob).map_err(EventProcessorError::generic)?;

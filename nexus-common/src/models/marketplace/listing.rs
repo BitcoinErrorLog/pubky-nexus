@@ -32,10 +32,11 @@ impl From<&PubkyAppListingSale> for ListingSaleFormat {
 
 /// Represents the indexed details of a marketplace listing.
 ///
-/// The `auction_*` fields carry the auction sale terms and are `null` for
-/// fixed-price listings. The auction money terms are expressed in minor units
-/// of the listing's primary asset (`price_currency` / `price_exponent`); the
-/// specs validation guarantees all auction prices share that asset.
+/// The `auction_*` fields carry the public auction sale terms and are `null`
+/// for fixed-price listings. The auction money terms are expressed in minor
+/// units of the listing's primary asset (`price_currency` /
+/// `price_exponent`); the specs validation guarantees all auction prices
+/// share that asset. Private reserve terms are deliberately not indexed.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq)]
 pub struct ListingDetails {
     pub id: String,
@@ -57,7 +58,6 @@ pub struct ListingDetails {
     pub price_exponent: i64,
     pub auction_starts_at: Option<String>,
     pub auction_ends_at: Option<String>,
-    pub auction_reserve_price_minor: Option<i64>,
     pub auction_buy_now_price_minor: Option<i64>,
     pub auction_minimum_increment_minor: Option<i64>,
     pub fulfillment_methods: Vec<PubkyAppFulfillmentMethod>,
@@ -79,13 +79,11 @@ impl ListingDetails {
         let (
             auction_starts_at,
             auction_ends_at,
-            auction_reserve_price_minor,
             auction_buy_now_price_minor,
             auction_minimum_increment_minor,
         ) = match &homeserver_listing.sale {
-            PubkyAppListingSale::FixedPrice { .. } => (None, None, None, None, None),
+            PubkyAppListingSale::FixedPrice { .. } => (None, None, None, None),
             PubkyAppListingSale::Auction {
-                reserve_price,
                 buy_now_price,
                 minimum_increment,
                 starts_at,
@@ -94,7 +92,6 @@ impl ListingDetails {
             } => (
                 Some(starts_at.clone()),
                 Some(ends_at.clone()),
-                reserve_price.as_ref().map(|price| price.amount_minor),
                 buy_now_price.as_ref().map(|price| price.amount_minor),
                 Some(minimum_increment.amount_minor),
             ),
@@ -123,7 +120,6 @@ impl ListingDetails {
             price_exponent: primary_price.exponent,
             auction_starts_at,
             auction_ends_at,
-            auction_reserve_price_minor,
             auction_buy_now_price_minor,
             auction_minimum_increment_minor,
             fulfillment_methods: homeserver_listing.fulfillment_methods,
@@ -223,5 +219,74 @@ impl ListingDetails {
         ListingStream::remove_from_per_seller_sorted_set(owner_id, listing_id).await?;
         ListingStream::remove_from_auction_ends_sorted_set(owner_id, listing_id).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListingDetails;
+    use crate::models::marketplace::ListingStream;
+    use serde_json::Value;
+
+    const PRODUCTION_DETAIL_BEFORE_CLOSE: &str = include_str!(
+        "../../../../nexus-webapi/tests/marketplace/fixtures/production-nexus-detail-before-close.txt"
+    );
+    const PRODUCTION_STREAM_BEFORE_CLOSE: &str = include_str!(
+        "../../../../nexus-webapi/tests/marketplace/fixtures/production-nexus-stream-before-close.txt"
+    );
+
+    fn captured_response_body(capture: &str) -> Value {
+        serde_json::from_str(
+            capture
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .expect("captured response body"),
+        )
+        .expect("captured production JSON")
+    }
+
+    fn contains_forbidden_reserve_key(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => object.iter().any(|(key, child)| {
+                matches!(
+                    key.as_str(),
+                    "auction_reserve_price_minor"
+                        | "reservePrice"
+                        | "reserve_price"
+                        | "reserveMet"
+                        | "reserve_met"
+                ) || contains_forbidden_reserve_key(child)
+            }),
+            Value::Array(array) => array.iter().any(contains_forbidden_reserve_key),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn captured_detail_and_stream_serialize_without_reserve_keys() {
+        let detail_wire = captured_response_body(PRODUCTION_DETAIL_BEFORE_CLOSE);
+        assert!(detail_wire.get("auction_reserve_price_minor").is_some());
+        let detail: ListingDetails =
+            serde_json::from_value(detail_wire).expect("captured detail shape");
+        let serialized_detail = serde_json::to_value(detail).expect("serialized detail");
+        assert!(
+            !contains_forbidden_reserve_key(&serialized_detail),
+            "detail must omit reserve keys rather than serializing null"
+        );
+
+        let stream_wire = captured_response_body(PRODUCTION_STREAM_BEFORE_CLOSE);
+        assert!(stream_wire
+            .as_array()
+            .expect("captured stream")
+            .iter()
+            .any(|listing| listing.get("auction_reserve_price_minor").is_some()));
+        let stream: ListingStream =
+            serde_json::from_value(stream_wire).expect("captured stream shape");
+        let serialized_stream = serde_json::to_value(stream).expect("serialized stream");
+        assert!(
+            !contains_forbidden_reserve_key(&serialized_stream),
+            "stream must omit reserve keys rather than serializing null"
+        );
     }
 }

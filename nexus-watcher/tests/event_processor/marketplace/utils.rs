@@ -110,8 +110,8 @@ pub fn test_listing(
 
 /// Builds a valid auction listing record owned by the given user with the
 /// given start and end times (RFC 3339). The auction terms are fixed: a
-/// starting price of 10.00 USD, a reserve of 20.00 USD, a buy-now price of
-/// 100.00 USD and a minimum increment of 1.00 USD.
+/// starting price of 10.00 USD, a buy-now price of 100.00 USD and a minimum
+/// increment of 1.00 USD. Private reserve terms never enter this public record.
 pub fn test_auction_listing(
     owner_id: &str,
     title: &str,
@@ -133,7 +133,7 @@ pub fn test_auction_listing(
     );
     listing.sale = PubkyAppListingSale::Auction {
         starting_price: usd(1_000),
-        reserve_price: Some(usd(2_000)),
+        reserve_price: None,
         buy_now_price: Some(usd(10_000)),
         minimum_increment: usd(100),
         starts_at: starts_at.to_string(),

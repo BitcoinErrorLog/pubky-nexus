@@ -12,6 +12,22 @@ use pubky_app_specs::{
     PubkyAppListingState, PubkyId,
 };
 
+const PRODUCTION_DETAIL_BEFORE_CLOSE: &str =
+    include_str!("fixtures/production-nexus-detail-before-close.txt");
+const PRODUCTION_STREAM_BEFORE_CLOSE: &str =
+    include_str!("fixtures/production-nexus-stream-before-close.txt");
+
+fn captured_response_body(capture: &str) -> serde_json::Value {
+    serde_json::from_str(
+        capture
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("captured response body"),
+    )
+    .expect("captured production JSON")
+}
+
 /// Seeds a user node in the graph so shop and listing writes can attach to it.
 async fn seed_user(seller_id: &str) -> Result<()> {
     let user_details = UserDetails {
@@ -79,7 +95,6 @@ fn listing_details(
         price_exponent: 2,
         auction_starts_at: None,
         auction_ends_at: None,
-        auction_reserve_price_minor: None,
         auction_buy_now_price_minor: None,
         auction_minimum_increment_minor: None,
         fulfillment_methods: vec![PubkyAppFulfillmentMethod::Pickup],
@@ -100,7 +115,6 @@ fn with_auction_terms(
     listing.sale_format = ListingSaleFormat::Auction;
     listing.auction_starts_at = Some(starts_at.to_string());
     listing.auction_ends_at = Some(ends_at.to_string());
-    listing.auction_reserve_price_minor = Some(2_000);
     listing.auction_buy_now_price_minor = Some(10_000);
     listing.auction_minimum_increment_minor = Some(100);
     listing
@@ -365,8 +379,20 @@ async fn test_stream_listings_sorted_by_auction_end() -> Result<()> {
     assert_eq!(listings[2]["title"], "Latest");
 
     // The auction terms are carried by the stream payload
+    let captured = captured_response_body(PRODUCTION_STREAM_BEFORE_CLOSE);
+    assert!(
+        captured.as_array().expect("captured stream")[0]
+            .get("auction_reserve_price_minor")
+            .is_some(),
+        "Wave 3 production capture must retain the pre-fix wire shape"
+    );
     assert_eq!(listings[0]["sale_format"], "auction");
-    assert_eq!(listings[0]["auction_reserve_price_minor"], 2_000);
+    assert!(
+        listings
+            .iter()
+            .all(|listing| listing.get("auction_reserve_price_minor").is_none()),
+        "The forbidden key must be absent, not serialized as null"
+    );
     assert_eq!(listings[0]["auction_buy_now_price_minor"], 10_000);
     assert_eq!(listings[0]["auction_minimum_increment_minor"], 100);
     assert_eq!(listings[0]["auction_starts_at"], "2025-01-01T00:00:00Z");
@@ -415,10 +441,18 @@ async fn test_listing_details_auction_terms() -> Result<()> {
     auction_listing.put_to_index(false).await?;
 
     let body = get_request(&format!("/v0/listing/{seller_id}/H0AAAAAAAAAAA")).await?;
+    let captured = captured_response_body(PRODUCTION_DETAIL_BEFORE_CLOSE);
+    assert!(
+        captured.get("auction_reserve_price_minor").is_some(),
+        "Wave 3 production capture must retain the pre-fix wire shape"
+    );
     assert_eq!(body["sale_format"], "auction");
     assert_eq!(body["auction_starts_at"], starts_at);
     assert_eq!(body["auction_ends_at"], ends_at);
-    assert_eq!(body["auction_reserve_price_minor"], 2_000);
+    assert!(
+        body.get("auction_reserve_price_minor").is_none(),
+        "The forbidden key must be absent, not serialized as null"
+    );
     assert_eq!(body["auction_buy_now_price_minor"], 10_000);
     assert_eq!(body["auction_minimum_increment_minor"], 100);
 
@@ -440,7 +474,6 @@ async fn test_listing_details_auction_terms() -> Result<()> {
     for field in [
         "auction_starts_at",
         "auction_ends_at",
-        "auction_reserve_price_minor",
         "auction_buy_now_price_minor",
         "auction_minimum_increment_minor",
     ] {

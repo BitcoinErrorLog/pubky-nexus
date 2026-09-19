@@ -4,9 +4,10 @@ use crate::migrations::manager::Migration;
 use nexus_common::types::DynError;
 use nexus_watcher::events::handlers::listing::backfill_missing_auction_terms;
 
-/// Backfills the auction term fields (`auction_starts_at`, `auction_ends_at`,
-/// reserve/buy-now/minimum-increment prices) for marketplace listings indexed
-/// before the index carried them. The homeserver stays canonical for listing
+/// Backfills the public auction term fields (`auction_starts_at`,
+/// `auction_ends_at`, buy-now price, and minimum increment) for marketplace
+/// listings indexed before the index carried them. Private reserve terms are
+/// never indexed. The homeserver stays canonical for listing
 /// records, so the backfill re-reads each pre-term auction row's record from
 /// its seller's homeserver and re-runs the normal listing ingest, which also
 /// rescoring the listing in the auction end-time sorted set.
