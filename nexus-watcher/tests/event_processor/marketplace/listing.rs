@@ -1,6 +1,7 @@
 use super::utils::{test_auction_listing, test_listing};
 use crate::event_processor::utils::watcher::WatcherTest;
 use anyhow::Result;
+use async_trait::async_trait;
 use nexus_common::db::graph::Query;
 use nexus_common::db::kv::SortOrder;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
@@ -12,7 +13,9 @@ use nexus_common::models::marketplace::{
 };
 use nexus_common::types::Pagination;
 use nexus_watcher::events::handlers::listing::{
-    backfill_missing_auction_terms, scrub_legacy_listing_reserves, validate_public_listing_blob,
+    backfill_missing_auction_terms, scrub_legacy_listing_reserves,
+    scrub_legacy_listing_reserves_with_hook, validate_public_listing_blob, ListingReserveScrubHook,
+    ListingReserveScrubOps,
 };
 use nexus_watcher::events::retry::event::RetryEvent;
 use pubky::Keypair;
@@ -20,8 +23,65 @@ use pubky_app_specs::{
     listing_uri_builder,
     traits::{HasIdPath, TimestampId},
     PubkyAppListing, PubkyAppListingCondition, PubkyAppListingSale, PubkyAppListingState,
-    PubkyAppMoney, PubkyAppUser,
+    PubkyAppMoney, PubkyAppUser, PubkyId,
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, Serialize)]
+struct LegacyCachedListing {
+    #[serde(flatten)]
+    details: ListingDetails,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auction_reserve_price_minor: Option<u64>,
+}
+
+impl RedisOps for LegacyCachedListing {}
+
+struct RepublishAfterMissingHook {
+    owner_id: String,
+    listing_id: String,
+    listing: PubkyAppListing,
+}
+
+#[async_trait]
+impl ListingReserveScrubHook for RepublishAfterMissingHook {
+    async fn after_cache_eviction(
+        &self,
+        listing_ids: &[(String, String)],
+    ) -> Result<(), nexus_common::types::DynError> {
+        if !listing_ids.iter().any(|(owner_id, listing_id)| {
+            owner_id == &self.owner_id && listing_id == &self.listing_id
+        }) {
+            return Err("race-test listing was not captured by the scrub query".into());
+        }
+
+        exec_single_row(
+            Query::new(
+                "delete_listing_between_scrub_eviction_and_re_read",
+                "MATCH (listing:Listing {owner_id: $owner_id, id: $listing_id})
+                 DETACH DELETE listing",
+            )
+            .param("owner_id", self.owner_id.clone())
+            .param("listing_id", self.listing_id.clone()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn after_missing_re_read(
+        &self,
+        ops: &ListingReserveScrubOps,
+        owner_id: &str,
+        listing_id: &str,
+    ) -> Result<(), nexus_common::types::DynError> {
+        if owner_id == self.owner_id && listing_id == self.listing_id {
+            let user_id = PubkyId::try_from(owner_id)?;
+            ops.sync_put(self.listing.clone(), user_id, listing_id.to_string())
+                .await?;
+        }
+        Ok(())
+    }
+}
 
 fn seller_filters(seller_id: &str) -> ListingStreamFilters {
     ListingStreamFilters {
@@ -846,6 +906,31 @@ async fn legacy_reserve_scrub_removes_graph_property_and_rewrites_redis() -> Res
     .await?;
     assert_eq!(before, Some(2_000));
 
+    // Reproduce the legacy Redis shape at the production ListingDetails key.
+    // Reading through ListingDetails alone would discard the unknown field and
+    // could not prove that the scrub replaced the stored JSON.
+    let details_prefix = ListingDetails::prefix().await;
+    let legacy_cache = LegacyCachedListing {
+        details: ListingDetails::get_from_index(&user_id, &listing_id)
+            .await?
+            .expect("listing cache before reserve scrub"),
+        auction_reserve_price_minor: Some(2_000),
+    };
+    legacy_cache
+        .put_index_json(
+            &[user_id.as_str(), listing_id.as_str()],
+            Some(details_prefix.clone()),
+            None,
+        )
+        .await?;
+    let seeded_cache = LegacyCachedListing::try_from_index_json(
+        &[user_id.as_str(), listing_id.as_str()],
+        Some(details_prefix.clone()),
+    )
+    .await?
+    .expect("seeded legacy Redis listing");
+    assert_eq!(seeded_cache.auction_reserve_price_minor, Some(2_000));
+
     let summary = scrub_legacy_listing_reserves()
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -874,12 +959,89 @@ async fn legacy_reserve_scrub_removes_graph_property_and_rewrites_redis() -> Res
         cached_json.get("auction_reserve_price_minor").is_none(),
         "Redis cache rewrite must omit the legacy field"
     );
+    let rewritten_cache = LegacyCachedListing::try_from_index_json(
+        &[user_id.as_str(), listing_id.as_str()],
+        Some(details_prefix),
+    )
+    .await?
+    .expect("surviving listing cache rewritten after upfront eviction");
+    assert_eq!(
+        rewritten_cache.auction_reserve_price_minor, None,
+        "surviving listing must be rewritten without the legacy reserve field"
+    );
 
     // A second pass is safe and leaves the field absent.
     let rerun = scrub_legacy_listing_reserves()
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     assert_eq!(rerun.scanned, rerun.rewritten + rerun.disappeared);
+    test.del(&user_kp, &listing_path).await?;
+    test.cleanup_user(&user_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn reserve_scrub_does_not_delete_a_republish_after_missing_re_read() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let user_kp = Keypair::random();
+    let user = PubkyAppUser {
+        bio: None,
+        image: None,
+        links: None,
+        name: "Watcher:ReserveScrubRace:User".to_string(),
+        status: None,
+    };
+    let user_id = test.create_user(&user_kp, &user).await?;
+    let mut listing = test_auction_listing(
+        &user_id,
+        "Reserve-free concurrent republish",
+        "collectibles",
+        "2025-03-01T00:00:00Z",
+        "2025-03-08T00:00:00Z",
+    );
+    let (listing_id, listing_path) = test.create_listing(&user_kp, &listing).await?;
+    listing.listing_id.clone_from(&listing_id);
+
+    exec_single_row(
+        Query::new(
+            "seed_legacy_listing_reserve_for_scrub_race",
+            "MATCH (listing:Listing {owner_id: $owner_id, id: $listing_id})
+             SET listing.auction_reserve_price_minor = 2000",
+        )
+        .param("owner_id", user_id.clone())
+        .param("listing_id", listing_id.clone()),
+    )
+    .await?;
+
+    let hook = RepublishAfterMissingHook {
+        owner_id: user_id.clone(),
+        listing_id: listing_id.clone(),
+        listing,
+    };
+    let summary = scrub_legacy_listing_reserves_with_hook(&hook)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert!(
+        summary.disappeared >= 1,
+        "the scrub must observe the orchestrated graph-row disappearance"
+    );
+
+    let republished_graph = ListingDetails::get_from_graph(&user_id, &listing_id)
+        .await?
+        .expect("sync_put must recreate the graph row");
+    assert_eq!(republished_graph.id, listing_id);
+
+    let exact_cached_entry = LegacyCachedListing::try_from_index_json(
+        &[user_id.as_str(), listing_id.as_str()],
+        Some(ListingDetails::prefix().await),
+    )
+    .await?
+    .expect("scrub must not delete the exact cache entry written by sync_put");
+    assert_eq!(
+        exact_cached_entry.auction_reserve_price_minor, None,
+        "the newly republished cache entry must remain reserve-free"
+    );
+
     test.del(&user_kp, &listing_path).await?;
     test.cleanup_user(&user_kp).await?;
     Ok(())

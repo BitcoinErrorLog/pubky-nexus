@@ -1,5 +1,6 @@
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
+use async_trait::async_trait;
 use nexus_common::db::graph::Query;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
 use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome, PubkyConnector, RedisOps};
@@ -145,11 +146,63 @@ pub struct ListingReserveScrub {
     /// Listing details successfully rewritten in Redis.
     pub rewritten: usize,
     /// Listings deleted after the graph mutation returned their identifiers;
-    /// their stale Redis details JSON entries were removed.
+    /// their details keys were already removed by the upfront cache eviction.
     pub disappeared: usize,
 }
 
+/// Internal operation object exposed only to support deterministic integration
+/// tests of scrub/event-pipeline interleavings.
+#[doc(hidden)]
+pub struct ListingReserveScrubOps;
+
+impl ListingReserveScrubOps {
+    /// Re-publishes a listing through the production graph-then-cache path.
+    pub async fn sync_put(
+        &self,
+        listing: PubkyAppListing,
+        user_id: PubkyId,
+        listing_id: String,
+    ) -> Result<(), EventProcessorError> {
+        sync_put(listing, user_id, listing_id).await
+    }
+}
+
+/// Internal deterministic seam for integration-testing scrub interleavings.
+#[doc(hidden)]
+#[async_trait]
+pub trait ListingReserveScrubHook: Sync {
+    async fn after_cache_eviction(
+        &self,
+        _listing_ids: &[(String, String)],
+    ) -> Result<(), DynError> {
+        Ok(())
+    }
+
+    async fn after_missing_re_read(
+        &self,
+        _ops: &ListingReserveScrubOps,
+        _owner_id: &str,
+        _listing_id: &str,
+    ) -> Result<(), DynError> {
+        Ok(())
+    }
+}
+
+struct NoopListingReserveScrubHook;
+
+#[async_trait]
+impl ListingReserveScrubHook for NoopListingReserveScrubHook {}
+
 pub async fn scrub_legacy_listing_reserves() -> Result<ListingReserveScrub, DynError> {
+    scrub_legacy_listing_reserves_with_hook(&NoopListingReserveScrubHook).await
+}
+
+/// Runs the reserve scrub with deterministic integration-test interleaving
+/// points. Production callers use [`scrub_legacy_listing_reserves`].
+#[doc(hidden)]
+pub async fn scrub_legacy_listing_reserves_with_hook(
+    hook: &dyn ListingReserveScrubHook,
+) -> Result<ListingReserveScrub, DynError> {
     let rows = fetch_all_rows_from_graph(Query::new(
         "scrub_legacy_listing_reserves",
         "MATCH (listing:Listing)
@@ -158,10 +211,7 @@ pub async fn scrub_legacy_listing_reserves() -> Result<ListingReserveScrub, DynE
     ))
     .await?;
 
-    let mut summary = ListingReserveScrub {
-        scanned: rows.len(),
-        ..Default::default()
-    };
+    let mut listing_ids = Vec::with_capacity(rows.len());
     for row in rows {
         let owner_id: Option<String> = row.get("owner_id")?;
         let listing_id: Option<String> = row.get("listing_id")?;
@@ -170,14 +220,35 @@ pub async fn scrub_legacy_listing_reserves() -> Result<ListingReserveScrub, DynE
                 "Listing row is missing owner_id or listing_id during reserve scrub".into(),
             );
         };
+        listing_ids.push((owner_id, listing_id));
+    }
+
+    let mut summary = ListingReserveScrub {
+        scanned: listing_ids.len(),
+        ..Default::default()
+    };
+
+    // Evict every captured details key before any graph re-read. A concurrent
+    // reserve-free republish before this point may be evicted, but its surviving
+    // graph row is rewritten below. A republish after this point is never
+    // followed by a scrub delete.
+    if !listing_ids.is_empty() {
+        let key_parts: Vec<[&str; 2]> = listing_ids
+            .iter()
+            .map(|(owner_id, listing_id)| [owner_id.as_str(), listing_id.as_str()])
+            .collect();
+        let keys: Vec<&[&str]> = key_parts.iter().map(|parts| parts.as_slice()).collect();
+        ListingDetails::remove_from_index_multiple_json(&keys).await?;
+    }
+    hook.after_cache_eviction(&listing_ids).await?;
+
+    let ops = ListingReserveScrubOps;
+    for (owner_id, listing_id) in listing_ids {
         let Some(details) = ListingDetails::get_from_graph(&owner_id, &listing_id).await? else {
-            ListingDetails::remove_from_index_multiple_json(&[&[
-                owner_id.as_str(),
-                listing_id.as_str(),
-            ]])
-            .await?;
+            hook.after_missing_re_read(&ops, &owner_id, &listing_id)
+                .await?;
             warn!(
-                "Listing {}/{} disappeared during reserve scrub; removed stale Redis details JSON",
+                "Listing {}/{} disappeared after the reserve scrub cache eviction; no later cache delete will run",
                 owner_id, listing_id
             );
             summary.disappeared += 1;

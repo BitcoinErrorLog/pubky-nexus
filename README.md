@@ -211,12 +211,21 @@ cargo run -p nexusd -- db migration run
 The scrub reads only Neo4j, removes `auction_reserve_price_minor` from each
 listing node, and rewrites the corresponding Redis details JSON; it does not
 read homeservers. The graph query removes the property from all matched rows
-before Redis rewriting begins. If a listing disappears after that query,
-`ListingDetails::get_from_graph` returns `None`; the scrub logs and counts that
-race, deletes its exact stale Redis details JSON entry without changing stream
-sorted sets, and continues. Row decoding errors and Redis write or delete
-failures still abort the migration. It is safe to rerun, and an aborted run
-remains in the pending backfill phase for the next run.
+and captures their identifiers atomically. Before re-reading any row, the scrub
+batch-deletes the exact captured `ListingDetails` JSON keys; failure aborts the
+migration. It then rewrites reserve-free details for every row that still
+exists. A row that disappeared is logged and counted without any later delete.
+This ordering makes concurrent reserve-free re-publishes safe: one completed
+before eviction can lose its cache, but the surviving graph row restores it;
+one completed after eviction is never deleted by the scrub. Because Neo4j and
+Redis are separate stores, a re-publish or DEL between the scrub's graph read
+and cache write can still produce last-writer-wins stale details, but every
+scrub-written value is reserve-free and the scrub performs no post-read delete.
+The normal event pipeline or a scrub rerun reconciles that pre-existing
+cross-store race. Listing stream sorted sets are untouched. Row decoding errors
+and Redis write or delete failures still abort the migration. It is safe to
+rerun, and an aborted run remains in the pending backfill phase for the next
+run.
 
 ## 🧪 Running Tests
 
