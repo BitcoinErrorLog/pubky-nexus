@@ -5,6 +5,7 @@ use nexus_common::db::graph::Query;
 use nexus_common::db::kv::SortOrder;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
 use nexus_common::db::{exec_single_row, fetch_key_from_graph, RedisOps};
+use nexus_common::models::event::{EventProcessorError, EventType};
 use nexus_common::models::marketplace::{
     ListingDetails, ListingSaleFormat, ListingStream, ListingStreamFilters, ListingStreamSorting,
     LISTING_AUCTION_ENDS_KEY_PARTS,
@@ -13,8 +14,10 @@ use nexus_common::types::Pagination;
 use nexus_watcher::events::handlers::listing::{
     backfill_missing_auction_terms, scrub_legacy_listing_reserves, validate_public_listing_blob,
 };
+use nexus_watcher::events::retry::event::RetryEvent;
 use pubky::Keypair;
 use pubky_app_specs::{
+    listing_uri_builder,
     traits::{HasIdPath, TimestampId},
     PubkyAppListing, PubkyAppListingCondition, PubkyAppListingSale, PubkyAppListingState,
     PubkyAppMoney, PubkyAppUser,
@@ -54,6 +57,10 @@ async fn auction_set_entries(min_ms: i64, max_ms: i64) -> Vec<(String, f64)> {
 fn public_listing_blob_rejects_reserve_keys_recursively() {
     let allowed = br#"{"sale":{"format":"auction"},"ext":[{"public":null}]}"#;
     validate_public_listing_blob(allowed).expect("reserve-free public listing");
+    assert!(matches!(
+        validate_public_listing_blob(b"{"),
+        Err(EventProcessorError::Generic(_))
+    ));
 
     for key in [
         "auction_reserve_price_minor",
@@ -62,10 +69,13 @@ fn public_listing_blob_rejects_reserve_keys_recursively() {
         "reserveMet",
         "reserve_met",
     ] {
-        let blob = format!(r#"{{"ext":[{{"{key}":null}}]}}"#);
-        assert!(
-            validate_public_listing_blob(blob.as_bytes()).is_err(),
-            "{key} must be rejected even when nested and null"
+        let blob = format!(r#"{{"ext":[{{"{key}":"sensitive-value"}}]}}"#);
+        let error = validate_public_listing_blob(blob.as_bytes())
+            .expect_err("reserve key must be rejected even when nested");
+        assert!(matches!(error, EventProcessorError::InvalidEventLine(_)));
+        assert_eq!(
+            error.to_string(),
+            format!("InvalidEventLine: Public marketplace listing contains forbidden field {key}")
         );
     }
 }
@@ -92,10 +102,16 @@ async fn reserve_bearing_public_listing_is_not_indexed() -> Result<()> {
     listing.listing_id = listing.create_id();
     let listing_id = listing.listing_id.clone();
     let listing_path: pubky::ResourcePath = PubkyAppListing::create_path(&listing_id).parse()?;
+    let listing_uri = listing_uri_builder(user_id.clone(), listing_id.clone());
+    let retry_key = format!(
+        "{}:{}",
+        EventType::Put,
+        RetryEvent::generate_index_key(&listing_uri).expect("listing retry key")
+    );
     let mut blob = serde_json::to_value(&listing)?;
-    blob["sale"]["reservePrice"] = serde_json::Value::Null;
+    blob["sale"]["reservePrice"] = serde_json::Value::String("sensitive-value".to_string());
 
-    let _ = test.put(&user_kp, &listing_path, &blob).await;
+    test.put(&user_kp, &listing_path, &blob).await?;
 
     assert!(ListingDetails::get_from_graph(&user_id, &listing_id)
         .await?
@@ -103,6 +119,14 @@ async fn reserve_bearing_public_listing_is_not_indexed() -> Result<()> {
     assert!(ListingDetails::get_from_index(&user_id, &listing_id)
         .await?
         .is_none());
+    assert!(
+        RetryEvent::check_uri(&retry_key).await?.is_none(),
+        "deterministically forbidden listing must not enter retry Redis"
+    );
+    assert!(
+        RetryEvent::get_from_index(&retry_key).await?.is_none(),
+        "deterministically forbidden listing must not have retry state"
+    );
     test.del(&user_kp, &listing_path).await?;
     test.cleanup_user(&user_kp).await?;
     Ok(())
@@ -822,12 +846,12 @@ async fn legacy_reserve_scrub_removes_graph_property_and_rewrites_redis() -> Res
     .await?;
     assert_eq!(before, Some(2_000));
 
-    assert!(
-        scrub_legacy_listing_reserves()
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?
-            >= 1
-    );
+    let summary = scrub_legacy_listing_reserves()
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert!(summary.scanned >= 1);
+    assert!(summary.rewritten >= 1);
+    assert_eq!(summary.scanned, summary.rewritten + summary.disappeared);
 
     let removed: Option<bool> = fetch_key_from_graph(
         Query::new(
@@ -852,9 +876,10 @@ async fn legacy_reserve_scrub_removes_graph_property_and_rewrites_redis() -> Res
     );
 
     // A second pass is safe and leaves the field absent.
-    scrub_legacy_listing_reserves()
+    let rerun = scrub_legacy_listing_reserves()
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    assert_eq!(rerun.scanned, rerun.rewritten + rerun.disappeared);
     test.del(&user_kp, &listing_path).await?;
     test.cleanup_user(&user_kp).await?;
     Ok(())

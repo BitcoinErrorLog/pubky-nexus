@@ -210,9 +210,12 @@ cargo run -p nexusd -- db migration run
 
 The scrub reads only Neo4j, removes `auction_reserve_price_minor` from each
 listing node, and rewrites the corresponding Redis details JSON; it does not
-read homeservers. It is safe to rerun. If either store operation fails, the
-migration manager leaves the migration in its pending backfill phase so the
-next run retries the scrub.
+read homeservers. The graph query removes the property from all matched rows
+before Redis rewriting begins. If a listing disappears after that query,
+`ListingDetails::get_from_graph` returns `None`; the scrub logs and counts that
+race, skips its now-obsolete Redis rewrite, and continues. Row decoding errors
+and Redis write failures still abort the migration. It is safe to rerun, and an
+aborted run remains in the pending backfill phase for the next run.
 
 ## 🧪 Running Tests
 

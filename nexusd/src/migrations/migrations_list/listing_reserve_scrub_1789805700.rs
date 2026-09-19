@@ -25,8 +25,13 @@ impl Migration for ListingReserveScrub1789805700 {
     }
 
     async fn backfill(&self) -> Result<(), DynError> {
-        let scrubbed = scrub_legacy_listing_reserves().await?;
-        tracing::info!("Scrubbed reserve storage from {scrubbed} listing(s)");
+        let summary = scrub_legacy_listing_reserves().await?;
+        tracing::info!(
+            scanned = summary.scanned,
+            rewritten = summary.rewritten,
+            disappeared = summary.disappeared,
+            "Finished legacy listing reserve scrub"
+        );
         Ok(())
     }
 

@@ -32,7 +32,7 @@ fn reject_public_reserve_keys(value: &Value) -> Result<(), EventProcessorError> 
         Value::Object(object) => {
             for (key, child) in object {
                 if FORBIDDEN_PUBLIC_RESERVE_KEYS.contains(&key.as_str()) {
-                    return Err(EventProcessorError::generic(format!(
+                    return Err(EventProcessorError::InvalidEventLine(format!(
                         "Public marketplace listing contains forbidden field {key}"
                     )));
                 }
@@ -49,7 +49,7 @@ fn reject_public_reserve_keys(value: &Value) -> Result<(), EventProcessorError> 
     Ok(())
 }
 
-pub async fn sync_put(
+pub(crate) async fn sync_put(
     listing: PubkyAppListing,
     user_id: PubkyId,
     listing_id: String,
@@ -138,7 +138,17 @@ pub async fn backfill_missing_auction_terms() -> Result<AuctionTermsBackfill, Dy
 ///
 /// The graph mutation selects every listing so rerunning this scrub also
 /// rewrites every listing details cache entry with the reserve-free model.
-pub async fn scrub_legacy_listing_reserves() -> Result<usize, DynError> {
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ListingReserveScrub {
+    /// Listing rows returned after the graph-wide reserve-property removal.
+    pub scanned: usize,
+    /// Listing details successfully rewritten in Redis.
+    pub rewritten: usize,
+    /// Listings deleted after the graph mutation returned their identifiers.
+    pub disappeared: usize,
+}
+
+pub async fn scrub_legacy_listing_reserves() -> Result<ListingReserveScrub, DynError> {
     let rows = fetch_all_rows_from_graph(Query::new(
         "scrub_legacy_listing_reserves",
         "MATCH (listing:Listing)
@@ -147,7 +157,10 @@ pub async fn scrub_legacy_listing_reserves() -> Result<usize, DynError> {
     ))
     .await?;
 
-    let mut scrubbed = 0;
+    let mut summary = ListingReserveScrub {
+        scanned: rows.len(),
+        ..Default::default()
+    };
     for row in rows {
         let owner_id: Option<String> = row.get("owner_id")?;
         let listing_id: Option<String> = row.get("listing_id")?;
@@ -157,15 +170,17 @@ pub async fn scrub_legacy_listing_reserves() -> Result<usize, DynError> {
             );
         };
         let Some(details) = ListingDetails::get_from_graph(&owner_id, &listing_id).await? else {
-            return Err(format!(
-                "Listing {owner_id}/{listing_id} disappeared during reserve scrub"
-            )
-            .into());
+            warn!(
+                "Listing {}/{} disappeared during reserve scrub; skipping Redis rewrite",
+                owner_id, listing_id
+            );
+            summary.disappeared += 1;
+            continue;
         };
         details.put_to_index(true).await?;
-        scrubbed += 1;
+        summary.rewritten += 1;
     }
-    Ok(scrubbed)
+    Ok(summary)
 }
 
 /// Re-reads the canonical listing record from the seller's homeserver
