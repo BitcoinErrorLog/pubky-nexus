@@ -169,7 +169,7 @@ pub async fn backfill_unindexed_reviews() -> Result<ReviewBackfill, DynError> {
             break;
         };
         scanned += 1;
-        if scanned % 250 == 0 {
+        if scanned.is_multiple_of(250) {
             info!("Review backfill: scanned {}/{} user(s)", scanned, total);
         }
         match joined {

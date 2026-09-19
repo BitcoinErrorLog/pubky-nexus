@@ -213,9 +213,10 @@ listing node, and rewrites the corresponding Redis details JSON; it does not
 read homeservers. The graph query removes the property from all matched rows
 before Redis rewriting begins. If a listing disappears after that query,
 `ListingDetails::get_from_graph` returns `None`; the scrub logs and counts that
-race, skips its now-obsolete Redis rewrite, and continues. Row decoding errors
-and Redis write failures still abort the migration. It is safe to rerun, and an
-aborted run remains in the pending backfill phase for the next run.
+race, deletes its exact stale Redis details JSON entry without changing stream
+sorted sets, and continues. Row decoding errors and Redis write or delete
+failures still abort the migration. It is safe to rerun, and an aborted run
+remains in the pending backfill phase for the next run.
 
 ## 🧪 Running Tests
 

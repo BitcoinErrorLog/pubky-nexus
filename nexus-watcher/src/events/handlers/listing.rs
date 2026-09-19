@@ -2,7 +2,7 @@ use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use nexus_common::db::graph::Query;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
-use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome, PubkyConnector};
+use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome, PubkyConnector, RedisOps};
 use nexus_common::models::marketplace::ListingDetails;
 use nexus_common::types::DynError;
 use pubky_app_specs::{listing_uri_builder, PubkyAppListing, PubkyAppObject, PubkyId, Resource};
@@ -144,7 +144,8 @@ pub struct ListingReserveScrub {
     pub scanned: usize,
     /// Listing details successfully rewritten in Redis.
     pub rewritten: usize,
-    /// Listings deleted after the graph mutation returned their identifiers.
+    /// Listings deleted after the graph mutation returned their identifiers;
+    /// their stale Redis details JSON entries were removed.
     pub disappeared: usize,
 }
 
@@ -170,8 +171,13 @@ pub async fn scrub_legacy_listing_reserves() -> Result<ListingReserveScrub, DynE
             );
         };
         let Some(details) = ListingDetails::get_from_graph(&owner_id, &listing_id).await? else {
+            ListingDetails::remove_from_index_multiple_json(&[&[
+                owner_id.as_str(),
+                listing_id.as_str(),
+            ]])
+            .await?;
             warn!(
-                "Listing {}/{} disappeared during reserve scrub; skipping Redis rewrite",
+                "Listing {}/{} disappeared during reserve scrub; removed stale Redis details JSON",
                 owner_id, listing_id
             );
             summary.disappeared += 1;
