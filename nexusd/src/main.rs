@@ -1,4 +1,5 @@
 use clap::Parser;
+use nexus_common::db::redact_connection_url;
 use nexus_common::types::DynError;
 use nexus_watcher::service::NexusWatcher;
 use nexus_webapi::mock::MockDb;
@@ -8,7 +9,14 @@ use nexusd::migrations::{import_migrations, MigrationBuilder, MigrationManager};
 use nexusd::DaemonLauncher;
 
 #[tokio::main]
-async fn main() -> Result<(), DynError> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("Error: {}", redact_connection_url(&format!("{error:?}")));
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), DynError> {
     let cli = Cli::parse();
     let command = Cli::receive_command(cli);
     match command {

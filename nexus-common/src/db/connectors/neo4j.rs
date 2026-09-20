@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::{Graph, GraphOps, InstrumentedGraph};
 use crate::db::setup::setup_graph;
-use crate::db::Neo4JConfig;
+use crate::db::{redact_connection_url, ConnectionUrl, Neo4JConfig};
 use crate::types::DynError;
 
 pub struct Neo4jConnector {
@@ -17,7 +17,16 @@ pub struct Neo4jConnector {
 impl Neo4jConnector {
     /// Initialize and register the global Neo4j connector and verify connectivity
     pub async fn init(neo4j_config: &Neo4JConfig) -> Result<(), DynError> {
-        let neo4j_connector = Neo4jConnector::new_connection(neo4j_config).await?;
+        let neo4j_connector =
+            Neo4jConnector::new_connection(neo4j_config)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Failed to connect to Neo4j at {}: {}",
+                        neo4j_config.uri,
+                        redact_connection_url(&format!("{error:?}"))
+                    )
+                })?;
 
         neo4j_connector.ping(&neo4j_config.uri).await?;
 
@@ -33,7 +42,15 @@ impl Neo4jConnector {
 
     /// Create and return a new connector after defining a database connection
     async fn new_connection(config: &Neo4JConfig) -> GraphResult<Self> {
-        let neo4j_graph = neo4rs::Graph::new(&config.uri, &config.user, &config.password).await?;
+        let neo4j_graph = neo4rs::Graph::new(config.uri.as_str(), &config.user, &config.password)
+            .await
+            .map_err(|error| {
+                GraphError::Generic(format!(
+                    "Failed to connect to Neo4j at {}: {}",
+                    config.uri,
+                    redact_connection_url(&format!("{error:?}"))
+                ))
+            })?;
         let graph = Graph::new(neo4j_graph);
 
         // Always wrap with InstrumentedGraph to collect OpenTelemetry metrics.
@@ -57,9 +74,13 @@ impl Neo4jConnector {
     }
 
     /// Perform a health-check PING over the Bolt protocol to the Neo4j server
-    async fn ping(&self, neo4j_uri: &str) -> Result<(), DynError> {
+    async fn ping(&self, neo4j_uri: &ConnectionUrl) -> Result<(), DynError> {
         if let Err(neo4j_err) = self.graph.run(Query::new("ping", "RETURN 1")).await {
-            return Err(format!("Failed to PING to Neo4j at {neo4j_uri}, {neo4j_err}").into());
+            return Err(format!(
+                "Failed to PING to Neo4j at {neo4j_uri}, {}",
+                redact_connection_url(&format!("{neo4j_err:?}"))
+            )
+            .into());
         }
 
         info!("Bolt protocol health-check PING to Neo4j succeeded; server is responsive at {neo4j_uri}");
