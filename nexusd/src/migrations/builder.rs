@@ -90,3 +90,43 @@ impl MigrationBuilder {
 
 #[async_trait]
 impl<T> ConfigLoader<T> for MigrationConfig where T: DeserializeOwned + Send + Sync + Debug {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE_REDIS: &str = "redis://user:pass@host:6379/0";
+    const FIXTURE_BOLT: &str = "bolt://neo4j.railway.internal:7687";
+
+    const RESERVE_SCRUB_MIGRATION_CONFIG_TOML: &str = r#"
+name = "nexusd.migration"
+backfill_ready = ["ListingAuctionTermsReindex1787256279", "ReviewBackfill1787905961"]
+testnet = false
+testnet_host = "localhost"
+
+[stack]
+log_level = "info"
+files_path = "/data/static/files"
+
+[stack.db]
+redis = "redis://user:pass@host:6379/0"
+
+[stack.db.neo4j]
+uri = "bolt://neo4j.railway.internal:7687"
+password = "fixture-neo4j-password"
+"#;
+
+    #[test]
+    fn reserve_scrub_migration_config_parses_fixture_urls() {
+        let config: MigrationConfig =
+            MigrationConfig::try_from_str(RESERVE_SCRUB_MIGRATION_CONFIG_TOML)
+                .expect("reserve-scrub migrations/config.toml shape parses as MigrationConfig");
+        assert_eq!(config.stack.db.redis.as_str(), FIXTURE_REDIS);
+        assert_eq!(config.stack.db.neo4j.uri.as_str(), FIXTURE_BOLT);
+        assert!(!format!("{}", config.stack.db.redis).contains("user:pass"));
+        assert!(!format!("{:?}", config.stack.db.redis).contains("user:pass"));
+        assert!(!format!("{}", config.stack.db.redis).contains("pass"));
+        assert!(!format!("{config:?}").contains("user:pass"));
+        assert_eq!(format!("{}", config.stack.db.neo4j.uri), FIXTURE_BOLT);
+    }
+}

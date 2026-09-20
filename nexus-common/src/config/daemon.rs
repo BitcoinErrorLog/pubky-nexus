@@ -64,7 +64,7 @@ mod tests {
 
     use pubky_app_specs::PubkyId;
 
-    use crate::{file::validate_and_expand_path, DaemonConfig, Level};
+    use crate::{file::validate_and_expand_path, file::ConfigLoader, DaemonConfig, Level};
 
     #[tokio_shared_rt::test(shared)]
     async fn test_toml_parsing() {
@@ -109,5 +109,156 @@ mod tests {
         );
         assert_eq!(c.stack.db.redis, "redis://127.0.0.1:6379");
         assert_eq!(c.stack.db.neo4j.uri, "bolt://localhost:7687");
+    }
+
+    /// Railway `/data/config.toml` (entrypoint-railway.sh) and the reserve-scrub
+    /// `~/.pubky-nexus/migrations/config.toml` layout (docs/railway-deploy.md).
+    /// Redis userinfo is the fake fixture `redis://user:pass@host:6379/0`, never a
+    /// production URL.
+    const FIXTURE_REDIS: &str = "redis://user:pass@host:6379/0";
+    const FIXTURE_BOLT: &str = "bolt://neo4j.railway.internal:7687";
+
+    const RAILWAY_DATA_CONFIG_TOML: &str = r#"
+[api]
+name = "nexusd.api"
+public_ip = "0.0.0.0"
+public_addr = "0.0.0.0:8080"
+pubky_listen_socket = "0.0.0.0:8081"
+
+[watcher]
+name = "nexusd.watcher"
+testnet = false
+testnet_host = "localhost"
+homeserver = "ufibwbmed6jeq9k4p583go95wofakh9fwpp4k734trq79pd9u1uy"
+events_limit = 1000
+monitored_homeservers_limit = 50
+watcher_sleep = 500
+moderation_id = "51y9w1skwcryb3iq4sia3x49qwpgstc5feo5tqon65gid7o99khy"
+moderated_tags = []
+
+[stack]
+log_level = "info"
+files_path = "/data/static/files"
+
+[stack.db]
+redis = "redis://user:pass@host:6379/0"
+
+[stack.db.neo4j]
+uri = "bolt://neo4j.railway.internal:7687"
+password = "fixture-neo4j-password"
+"#;
+
+    const RESERVE_SCRUB_MIGRATION_CONFIG_TOML: &str = r#"
+name = "nexusd.migration"
+backfill_ready = ["ListingAuctionTermsReindex1787256279", "ReviewBackfill1787905961"]
+testnet = false
+testnet_host = "localhost"
+
+[stack]
+log_level = "info"
+files_path = "/data/static/files"
+
+[stack.db]
+redis = "redis://user:pass@host:6379/0"
+
+[stack.db.neo4j]
+uri = "bolt://neo4j.railway.internal:7687"
+password = "fixture-neo4j-password"
+"#;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ReserveScrubMigrationConfig {
+        name: String,
+        backfill_ready: Vec<String>,
+        testnet: bool,
+        testnet_host: String,
+        stack: crate::StackConfig,
+    }
+
+    fn assert_fixture_connection_urls(db: &crate::db::DatabaseConfig) {
+        assert_eq!(db.redis.as_str(), FIXTURE_REDIS);
+        assert_eq!(db.neo4j.uri.as_str(), FIXTURE_BOLT);
+
+        #[derive(serde::Serialize)]
+        struct UrlFields<'a> {
+            redis: &'a crate::db::ConnectionUrl,
+            uri: &'a crate::db::ConnectionUrl,
+        }
+
+        let fields_toml = toml::to_string(&UrlFields {
+            redis: &db.redis,
+            uri: &db.neo4j.uri,
+        })
+        .expect("redis/uri fields serialize to TOML");
+        let db_toml = toml::to_string(db).expect("DatabaseConfig serializes to TOML");
+        let redis_json = serde_json::to_string(&db.redis).expect("ConnectionUrl JSON");
+        let uri_json = serde_json::to_string(&db.neo4j.uri).expect("ConnectionUrl JSON");
+
+        for encoded in [&fields_toml, &db_toml, &redis_json] {
+            assert!(
+                encoded.contains(FIXTURE_REDIS),
+                "serde write-back lost redis userinfo: {encoded}"
+            );
+            assert!(
+                !encoded.contains("[redacted]"),
+                "serde write-back redacted redis: {encoded}"
+            );
+        }
+        for encoded in [&fields_toml, &db_toml, &uri_json] {
+            assert!(
+                encoded.contains(FIXTURE_BOLT),
+                "serde write-back lost bolt URI: {encoded}"
+            );
+        }
+
+        let redis_display = db.redis.to_string();
+        let redis_debug = format!("{:?}", db.redis);
+        let uri_display = db.neo4j.uri.to_string();
+        let uri_debug = format!("{:?}", db.neo4j.uri);
+        let db_debug = format!("{db:?}");
+
+        assert_eq!(redis_display, "redis://[redacted]@host:6379/0");
+        assert!(redis_debug.contains("[redacted]"));
+        assert!(!redis_display.contains("user:pass"));
+        assert!(!redis_debug.contains("user:pass"));
+        assert!(!db_debug.contains("user:pass"));
+        assert_eq!(uri_display, FIXTURE_BOLT);
+        assert!(uri_debug.contains(FIXTURE_BOLT));
+        assert!(!uri_debug.contains("user:pass"));
+    }
+
+    #[test]
+    fn production_toml_shapes_round_trip_raw_urls_and_redact_display() {
+        let daemon = DaemonConfig::try_from_str(RAILWAY_DATA_CONFIG_TOML)
+            .expect("Railway /data/config.toml shape parses");
+        assert_eq!(
+            daemon.api.public_addr,
+            SocketAddr::from(([0, 0, 0, 0], 8080))
+        );
+        assert_eq!(daemon.stack.files_path, PathBuf::from("/data/static/files"));
+        assert_fixture_connection_urls(&daemon.stack.db);
+        assert!(!format!("{daemon:?}").contains("user:pass"));
+        assert!(!format!("{}", daemon.stack.db.redis).contains("pass"));
+
+        let migration: ReserveScrubMigrationConfig =
+            toml::from_str(RESERVE_SCRUB_MIGRATION_CONFIG_TOML)
+                .expect("reserve-scrub migrations/config.toml shape parses");
+        assert_eq!(migration.name, "nexusd.migration");
+        assert_eq!(
+            migration.backfill_ready,
+            vec![
+                "ListingAuctionTermsReindex1787256279",
+                "ReviewBackfill1787905961"
+            ]
+        );
+        assert!(!migration.testnet);
+        assert_eq!(migration.testnet_host, "localhost");
+        assert_eq!(
+            migration.stack.files_path,
+            PathBuf::from("/data/static/files")
+        );
+        assert_fixture_connection_urls(&migration.stack.db);
+        assert!(!format!("{migration:?}").contains("user:pass"));
+        assert!(!format!("{}", migration.stack.db.redis).contains("pass"));
     }
 }
