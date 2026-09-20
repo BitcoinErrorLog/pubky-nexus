@@ -8,7 +8,7 @@ import {
 
 export const partial = "nexusd";
 
-const PRODUCTION_PROJECT_ID = "75faa4fe-466c-4277-977f-1d8e4e31df8c";
+const PRODUCTION_PROJECT_ID = "af82731f-a6d0-4c0e-84cd-56ce6fcc8818";
 
 const operationalEnv = {
   NEXUS_EVENTS_LIMIT: preserve(),
@@ -19,13 +19,12 @@ const operationalEnv = {
   NEXUS_TESTNET: preserve(),
   NEXUS_WATCHER_SLEEP: preserve(),
   PORT: preserve(),
-  RAILWAY_DOCKERFILE_PATH: preserve(),
 };
 
 export default defineRailway((ctx) => {
   if (ctx.projectId !== PRODUCTION_PROJECT_ID) {
     throw new Error(
-      `Unknown Railway project ${ctx.projectId ?? "(none)"}. This file covers pubky-marketplace-production (${PRODUCTION_PROJECT_ID}).`,
+      `Unknown Railway project ${ctx.projectId ?? "(none)"}. This file covers pubky-marketplace-nexus (${PRODUCTION_PROJECT_ID}).`,
     );
   }
 
@@ -45,7 +44,7 @@ export default defineRailway((ctx) => {
     },
   });
 
-  return project("pubky-marketplace-production", {
+  return project("pubky-marketplace-nexus", {
     resources: [nexusd, nexusdVolume],
   });
 });
