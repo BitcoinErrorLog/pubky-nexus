@@ -1,0 +1,10 @@
+target
+docker/.database*
+docker/.env
+.git
+._*
+**/._*
+**/.DS_Store
+/examples/static
+/nexus-webapi/static
+/nexus-watcher/static

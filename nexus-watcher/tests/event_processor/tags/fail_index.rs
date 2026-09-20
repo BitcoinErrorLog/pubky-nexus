@@ -86,6 +86,7 @@ async fn test_homeserver_tag_cannot_add_while_index() -> Result<()> {
 
     // => Create post tag
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:CannotTag:Post:unSync".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

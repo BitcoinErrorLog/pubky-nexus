@@ -37,6 +37,7 @@ async fn test_delete_post_that_reposted_notification() -> Result<()> {
 
     // Create a post without any relationships
     let post = PubkyAppPost {
+        lock: None,
         content: "User's post to be deleted".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -47,6 +48,7 @@ async fn test_delete_post_that_reposted_notification() -> Result<()> {
 
     // Create a repost
     let repost = PubkyAppPost {
+        lock: None,
         content: "User's post to be deleted".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

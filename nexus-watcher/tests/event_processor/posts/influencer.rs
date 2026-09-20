@@ -25,6 +25,7 @@ async fn test_homeserver_post_influencer() -> Result<()> {
 
     // Alice creates a new post
     let alice_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostInfluencer:Alice:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -65,6 +66,7 @@ async fn test_homeserver_post_influencer() -> Result<()> {
     let alice_post_uri = post_uri_builder(alice_id.clone(), alice_post_id.clone());
 
     let reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostInfluencer:Bob:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(alice_post_uri.clone()),
@@ -75,6 +77,7 @@ async fn test_homeserver_post_influencer() -> Result<()> {
 
     // Create repost of alice post
     let repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostInfluencer:Bob:Repost".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

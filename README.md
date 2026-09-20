@@ -2,6 +2,40 @@
 
 # Pubky Nexus
 
+## This fork: Pubky Marketplace project
+
+This is `BitcoinErrorLog/pubky-nexus` (branch `feat/marketplace-indexing`),
+a fork of the official [`pubky/pubky-nexus`](https://github.com/pubky/pubky-nexus)
+that adds **marketplace indexing** for the Pubky Marketplace project. The
+official/shared Nexus has none of these endpoints; a dedicated instance of
+this fork runs on Railway beside the marketplace's transaction service. No
+upstream PRs are filed while the protocol shape settles.
+
+**Added over upstream:**
+
+- Ingest + streams for the marketplace records defined in the
+  `BitcoinErrorLog/pubky-app-specs` fork: **listings**
+  (`GET /v0/stream/listings` with auction terms and reputation snippets,
+  per-listing projection), **shops** (profile/policy details), and
+  **drops** (`GET /v0/stream/drops` with owner and time-window bucket
+  filters — documented as estimates; the transaction service stays the
+  authority for live state — plus `GET /v0/drop/{owner}/{drop_id}`).
+- **Review indexing with cryptographic verification at ingest**: purchase
+  attestations (compact JWS) are signature-verified before a review counts
+  as attested; reputation aggregates served per shop and per listing.
+  Attestor *legitimacy* remains the client's trust-list policy.
+- Marketplace tag aggregation endpoints for listings and shops.
+- The index stays deliberately **lossy**: variants, shipping options,
+  attributes, digital-lock details, and any live stock/order state are
+  never indexed — clients hydrate the canonical homeserver record and the
+  transaction service's projections.
+
+**Fixes:** `setup_graph` now tolerates Neo4j's `AlreadyExists` race when
+concurrent processes create the same new index (surfaced by parallel test
+boots).
+
+Deploy runbook for the dedicated instance: `docs/railway-deploy.md`.
+
 Pubky Nexus is the central bridge connecting Pubky homeservers with [Pubky-App’s](https://github.com/pubky/pubky-app) social clients. By aggregating events from homeservers into a rich social graph, Nexus transforms decentralized interactions into a high-performance, fully featured social-media-like API. It's designed to support Social-Semantic-Graph (SSG) inference, and more.
 
 ## 🌟 Key Features
@@ -131,6 +165,67 @@ cargo run -p nexusd db migration run
 ```
 
 The manager will automatically handle migrations in the appropriate order, progressing through phases as needed.
+
+### Runbook: backfilling auction terms on listing rows (`ListingAuctionTermsReindex1787256279`)
+
+Marketplace listings indexed before the index carried the auction term fields
+(`auction_starts_at`, `auction_ends_at`, and the buy-now/minimum-increment
+prices) serve `null` terms until re-indexed. Private reserve terms are never
+indexed. This single-staged migration finds
+every auction row without terms in the graph, re-reads each listing's canonical
+record from its seller's homeserver (`/pub/pubky.app/marketplace/v1/listings/…`),
+and re-runs the normal listing ingest — upserting the full details in Neo4j and
+Redis and rescoring the listing in the auction end-time sorted set.
+
+Operational notes:
+
+- The migration needs outbound access to homeservers (it reads canonical
+  records over the Pubky client, mainnet by default). For a local testnet
+  deployment set `testnet = true` and `testnet_host` in the migration config.
+- It is **idempotent**: reindexed listings gain their terms and drop out of the
+  candidate query. If some listings fail (e.g. a homeserver was unreachable),
+  the migration reports the count, stays in the backfill phase, and a re-run
+  retries only the failed ones.
+- A listing whose canonical record no longer exists on its homeserver is
+  logged and left untouched; removals stay with the watcher's DEL pipeline.
+- The watcher does not need to be stopped: the backfill runs the same ingest
+  as a PUT event, and a concurrent seller re-publish simply wins with newer
+  data.
+
+### Runbook: scrubbing legacy listing reserves (`ListingReserveScrub1789805700`)
+
+Older Nexus versions stored a public listing's auction reserve in Neo4j and
+Redis. This single-staged, idempotent migration removes the legacy graph
+property from every listing and rewrites every listing details cache entry
+through the reserve-free model. Run it through the same migration command
+before serving the reserve-free release.
+
+To run it, an operator executes on a host with access to the deployment's
+Neo4j and Redis (connection settings in `~/.pubky-nexus/migrations/config.toml`;
+the file is created with defaults on first run):
+
+```bash
+cargo run -p nexusd -- db migration run
+```
+
+The scrub reads only Neo4j, removes `auction_reserve_price_minor` from each
+listing node, and rewrites the corresponding Redis details JSON; it does not
+read homeservers. The graph query removes the property from all matched rows
+and captures their identifiers atomically. Before re-reading any row, the scrub
+batch-deletes the exact captured `ListingDetails` JSON keys; failure aborts the
+migration. It then rewrites reserve-free details for every row that still
+exists. A row that disappeared is logged and counted without any later delete.
+This ordering makes concurrent reserve-free re-publishes safe: one completed
+before eviction can lose its cache, but the surviving graph row restores it;
+one completed after eviction is never deleted by the scrub. Because Neo4j and
+Redis are separate stores, a re-publish or DEL between the scrub's graph read
+and cache write can still produce last-writer-wins stale details, but every
+scrub-written value is reserve-free and the scrub performs no post-read delete.
+The normal event pipeline or a scrub rerun reconciles that pre-existing
+cross-store race. Listing stream sorted sets are untouched. Row decoding errors
+and Redis write or delete failures still abort the migration. It is safe to
+rerun, and an aborted run remains in the pending backfill phase for the next
+run.
 
 ## 🧪 Running Tests
 

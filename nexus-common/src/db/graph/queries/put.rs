@@ -1,8 +1,16 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
+use crate::models::marketplace::{DropDetails, ListingDetails, ReviewDetails, ShopDetails};
 use crate::models::post::PostRelationships;
 use crate::models::{file::FileDetails, post::PostDetails, user::UserDetails};
 use pubky_app_specs::{ParsedUri, Resource};
+
+/// Serializes a unit enum variant into its snake_case string form for graph storage.
+fn enum_to_graph_string<T: serde::Serialize>(value: &T) -> GraphResult<String> {
+    let json =
+        serde_json::to_string(value).map_err(|e| GraphError::SerializationFailed(Box::new(e)))?;
+    Ok(json.trim_matches('"').to_string())
+}
 
 /// Create a user node
 pub fn create_user(user: &UserDetails) -> GraphResult<Query> {
@@ -128,7 +136,7 @@ fn add_relationship_params(
         };
 
         return Ok(cypher_query
-            .param(author_param, parent_author_id.as_str())
+            .param(author_param, parent_author_id.as_ref() as &str)
             .param(post_param, parent_post_id.as_str()));
     }
     Ok(cypher_query)
@@ -284,6 +292,79 @@ pub fn create_user_tag(
     .param("indexed_at", indexed_at)
 }
 
+/// Creates a `TAGGED` relationship between a user and a marketplace listing sold by another user.
+/// The tag is uniquely identified by a `label` and is associated with the listing
+/// # Arguments
+/// * `user_id` - The unique identifier of the user tagging the listing.
+/// * `seller_id` - The unique identifier of the user who owns the listing.
+/// * `listing_id` - The unique identifier of the listing being tagged.
+/// * `tag_id` - A unique identifier for the tagging relationship.
+/// * `label` - A string representing the label of the tag.
+/// * `indexed_at` - A timestamp representing when the tagging relationship was created or last updated.
+pub fn create_listing_tag(
+    user_id: &str,
+    seller_id: &str,
+    listing_id: &str,
+    tag_id: &str,
+    label: &str,
+    indexed_at: i64,
+) -> Query {
+    Query::new(
+        "create_listing_tag",
+        "MATCH (user:User {id: $user_id})
+        // We assume these nodes are already created. If not we would not be able to add a tag
+        MATCH (listing:Listing {id: $listing_id, owner_id: $seller_id})
+        // Check if tag already existed
+        OPTIONAL MATCH (user)-[existing:TAGGED {label: $label}]->(listing)
+        MERGE (user)-[t:TAGGED {label: $label}]->(listing)
+        ON CREATE SET t.indexed_at = $indexed_at,
+                      t.id = $tag_id
+        // Returns true if the listing tag relationship already existed
+        RETURN existing IS NOT NULL AS flag;",
+    )
+    .param("user_id", user_id)
+    .param("seller_id", seller_id)
+    .param("listing_id", listing_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("indexed_at", indexed_at)
+}
+
+/// Creates a `TAGGED` relationship between a user and a marketplace shop owned by another user.
+/// The tag is uniquely identified by a `label` and is associated with the shop
+/// # Arguments
+/// * `user_id` - The unique identifier of the user tagging the shop.
+/// * `owner_id` - The unique identifier of the user who owns the shop.
+/// * `tag_id` - A unique identifier for the tagging relationship.
+/// * `label` - A string representing the label of the tag.
+/// * `indexed_at` - A timestamp representing when the tagging relationship was created or last updated.
+pub fn create_shop_tag(
+    user_id: &str,
+    owner_id: &str,
+    tag_id: &str,
+    label: &str,
+    indexed_at: i64,
+) -> Query {
+    Query::new(
+        "create_shop_tag",
+        "MATCH (user:User {id: $user_id})
+        // We assume these nodes are already created. If not we would not be able to add a tag
+        MATCH (:User {id: $owner_id})-[:HAS_SHOP]->(shop:Shop {owner_id: $owner_id})
+        // Check if tag already existed
+        OPTIONAL MATCH (user)-[existing:TAGGED {label: $label}]->(shop)
+        MERGE (user)-[t:TAGGED {label: $label}]->(shop)
+        ON CREATE SET t.indexed_at = $indexed_at,
+                      t.id = $tag_id
+        // Returns true if the shop tag relationship already existed
+        RETURN existing IS NOT NULL AS flag;",
+    )
+    .param("user_id", user_id)
+    .param("owner_id", owner_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("indexed_at", indexed_at)
+}
+
 /// Create a file node
 pub fn create_file(file: &FileDetails) -> GraphResult<Query> {
     let urls = serde_json::to_string(&file.urls)
@@ -307,6 +388,258 @@ pub fn create_file(file: &FileDetails) -> GraphResult<Query> {
     .param("urls", urls);
 
     Ok(query)
+}
+
+/// Creates or updates the marketplace shop node of a seller.
+/// The query returns no rows when the owner user is not yet indexed (missing dependency).
+pub fn create_shop(shop: &ShopDetails) -> Query {
+    Query::new(
+        "create_shop",
+        "MATCH (owner:User {id: $owner_id})
+        OPTIONAL MATCH (owner)-[:HAS_SHOP]->(existing_shop:Shop)
+        MERGE (owner)-[:HAS_SHOP]->(shop:Shop {owner_id: $owner_id})
+        ON CREATE SET shop.indexed_at = $indexed_at
+        SET shop.uri = $uri,
+            shop.name = $name,
+            shop.bio = $bio,
+            shop.country_code = $country_code,
+            shop.region = $region,
+            shop.avatar_url = $avatar_url,
+            shop.banner_url = $banner_url,
+            shop.shipping_policy = $shipping_policy,
+            shop.return_policy = $return_policy,
+            shop.vacation_mode = $vacation_mode,
+            shop.created_at = $created_at,
+            shop.updated_at = $updated_at,
+            shop.revision = $revision
+        // Returns true if the shop node already existed
+        RETURN existing_shop IS NOT NULL AS flag;",
+    )
+    .param("owner_id", shop.owner_id.to_string())
+    .param("uri", shop.uri.to_string())
+    .param("indexed_at", shop.indexed_at)
+    .param("name", shop.name.to_string())
+    .param("bio", shop.bio.to_string())
+    .param("country_code", shop.country_code.to_string())
+    .param("region", shop.region.clone())
+    .param("avatar_url", shop.avatar_url.clone())
+    .param("banner_url", shop.banner_url.clone())
+    .param("shipping_policy", shop.shipping_policy.to_string())
+    .param("return_policy", shop.return_policy.to_string())
+    .param("vacation_mode", shop.vacation_mode)
+    .param("created_at", shop.created_at.to_string())
+    .param("updated_at", shop.updated_at.to_string())
+    .param("revision", shop.revision)
+}
+
+/// Creates or updates a marketplace listing node of a seller.
+/// The query returns no rows when the seller user is not yet indexed (missing dependency).
+pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
+    let state = enum_to_graph_string(&listing.state)?;
+    let condition = enum_to_graph_string(&listing.condition)?;
+    let sale_format = enum_to_graph_string(&listing.sale_format)?;
+    let fulfillment_methods = listing
+        .fulfillment_methods
+        .iter()
+        .map(enum_to_graph_string)
+        .collect::<GraphResult<Vec<String>>>()?;
+
+    let query = Query::new(
+        "create_listing",
+        "MATCH (seller:User {id: $owner_id})
+        OPTIONAL MATCH (seller)-[:SELLS]->(existing_listing:Listing {id: $listing_id, owner_id: $owner_id})
+        MERGE (seller)-[:SELLS]->(listing:Listing {id: $listing_id, owner_id: $owner_id})
+        ON CREATE SET listing.indexed_at = $indexed_at
+        SET listing.uri = $uri,
+            listing.state = $state,
+            listing.title = $title,
+            listing.description = $description,
+            listing.category_id = $category_id,
+            listing.condition = $condition,
+            listing.tags = $tags,
+            listing.country_code = $country_code,
+            listing.region = $region,
+            listing.media_urls = $media_urls,
+            listing.sale_format = $sale_format,
+            listing.price_amount_minor = $price_amount_minor,
+            listing.price_currency = $price_currency,
+            listing.price_exponent = $price_exponent,
+            listing.price_major = $price_major,
+            listing.auction_starts_at = $auction_starts_at,
+            listing.auction_ends_at = $auction_ends_at,
+            listing.auction_ends_at_ms = $auction_ends_at_ms,
+            listing.auction_buy_now_price_minor = $auction_buy_now_price_minor,
+            listing.auction_minimum_increment_minor = $auction_minimum_increment_minor,
+            listing.fulfillment_methods = $fulfillment_methods,
+            listing.adult_only = $adult_only,
+            listing.created_at = $created_at,
+            listing.updated_at = $updated_at,
+            listing.revision = $revision
+        REMOVE listing.auction_reserve_price_minor
+        // Returns true if the listing node already existed
+        RETURN existing_listing IS NOT NULL AS flag;",
+    )
+    .param("owner_id", listing.owner_id.to_string())
+    .param("listing_id", listing.id.to_string())
+    .param("uri", listing.uri.to_string())
+    .param("indexed_at", listing.indexed_at)
+    .param("state", state)
+    .param("title", listing.title.to_string())
+    .param("description", listing.description.to_string())
+    .param("category_id", listing.category_id.to_string())
+    .param("condition", condition)
+    .param("tags", listing.tags.clone())
+    .param("country_code", listing.country_code.to_string())
+    .param("region", listing.region.clone())
+    .param("media_urls", listing.media_urls.clone())
+    .param("sale_format", sale_format)
+    .param("price_amount_minor", listing.price_amount_minor)
+    .param("price_currency", listing.price_currency.to_string())
+    .param("price_exponent", listing.price_exponent)
+    .param("price_major", listing.price_major())
+    .param("auction_starts_at", listing.auction_starts_at.clone())
+    .param("auction_ends_at", listing.auction_ends_at.clone())
+    .param("auction_ends_at_ms", listing.auction_ends_at_ms())
+    .param(
+        "auction_buy_now_price_minor",
+        listing.auction_buy_now_price_minor,
+    )
+    .param(
+        "auction_minimum_increment_minor",
+        listing.auction_minimum_increment_minor,
+    )
+    .param("fulfillment_methods", fulfillment_methods)
+    .param("adult_only", listing.adult_only)
+    .param("created_at", listing.created_at.to_string())
+    .param("updated_at", listing.updated_at.to_string())
+    .param("revision", listing.revision);
+
+    Ok(query)
+}
+
+/// Creates or updates a marketplace drop node of a seller. The numeric
+/// `starts_at_ms`/`ends_at_ms` mirrors of the declared schedule are stored
+/// alongside the RFC 3339 strings for the time-window bucket filters and
+/// start-time sorting.
+/// The query returns no rows when the seller user is not yet indexed (missing dependency).
+pub fn create_drop(drop: &DropDetails) -> GraphResult<Query> {
+    let format = enum_to_graph_string(&drop.format)?;
+    let stock_display = enum_to_graph_string(&drop.stock_display)?;
+
+    let query = Query::new(
+        "create_drop",
+        "MATCH (owner:User {id: $owner_id})
+        OPTIONAL MATCH (owner)-[:OFFERS]->(existing_drop:Drop {id: $drop_id, owner_id: $owner_id})
+        MERGE (owner)-[:OFFERS]->(drop:Drop {id: $drop_id, owner_id: $owner_id})
+        ON CREATE SET drop.indexed_at = $indexed_at
+        SET drop.uri = $uri,
+            drop.title = $title,
+            drop.description = $description,
+            drop.media_urls = $media_urls,
+            drop.format = $format,
+            drop.starts_at = $starts_at,
+            drop.starts_at_ms = $starts_at_ms,
+            drop.ends_at = $ends_at,
+            drop.ends_at_ms = $ends_at_ms,
+            drop.listing_ids = $listing_ids,
+            drop.total_quantity = $total_quantity,
+            drop.per_buyer_limit = $per_buyer_limit,
+            drop.stock_display = $stock_display,
+            drop.created_at = $created_at,
+            drop.updated_at = $updated_at,
+            drop.revision = $revision
+        // Returns true if the drop node already existed
+        RETURN existing_drop IS NOT NULL AS flag;",
+    )
+    .param("owner_id", drop.owner_id.to_string())
+    .param("drop_id", drop.id.to_string())
+    .param("uri", drop.uri.to_string())
+    .param("indexed_at", drop.indexed_at)
+    .param("title", drop.title.to_string())
+    .param("description", drop.description.to_string())
+    .param("media_urls", drop.media_urls.clone())
+    .param("format", format)
+    .param("starts_at", drop.starts_at.to_string())
+    .param("starts_at_ms", drop.starts_at_ms())
+    .param("ends_at", drop.ends_at.clone())
+    .param("ends_at_ms", drop.ends_at_ms())
+    .param("listing_ids", drop.listing_ids.clone())
+    .param("total_quantity", drop.total_quantity)
+    .param("per_buyer_limit", drop.per_buyer_limit)
+    .param("stock_display", stock_display)
+    .param("created_at", drop.created_at.to_string())
+    .param("updated_at", drop.updated_at.to_string())
+    .param("revision", drop.revision);
+
+    Ok(query)
+}
+
+/// Creates or updates the `REVIEWED` edge between a reviewer and the review
+/// subject. The edge is uniquely identified by the deterministic review ID.
+/// The query returns no rows when either user is not yet indexed (missing
+/// dependency). `has_response` is only initialised on creation so a review
+/// edit never clobbers an indexed response flag.
+pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
+    let query = Query::new(
+        "create_review",
+        "MATCH (reviewer:User {id: $reviewer_id})
+        MATCH (subject:User {id: $subject_id})
+        OPTIONAL MATCH (reviewer)-[existing:REVIEWED {review_id: $review_id}]->(subject)
+        MERGE (reviewer)-[r:REVIEWED {review_id: $review_id}]->(subject)
+        ON CREATE SET r.indexed_at = $indexed_at,
+                      r.has_response = false
+        SET r.role = $role,
+            r.listing_owner_id = $listing_owner_id,
+            r.listing_id = $listing_id,
+            r.rating_overall = $rating_overall,
+            r.rating_item_accuracy = $rating_item_accuracy,
+            r.rating_shipping = $rating_shipping,
+            r.rating_communication = $rating_communication,
+            r.verified = $verified,
+            r.attestor_id = $attestor_id,
+            r.order_ref = $order_ref,
+            r.edited_late = $edited_late,
+            r.created_at = $created_at,
+            r.updated_at = $updated_at,
+            r.revision = $revision
+        // Returns true if the review edge already existed
+        RETURN existing IS NOT NULL AS flag;",
+    )
+    .param("reviewer_id", review.reviewer_id.to_string())
+    .param("subject_id", review.subject_id.to_string())
+    .param("review_id", review.review_id.to_string())
+    .param("indexed_at", review.indexed_at)
+    .param("role", review.role.as_str())
+    .param("listing_owner_id", review.listing_owner_id.to_string())
+    .param("listing_id", review.listing_id.to_string())
+    .param("rating_overall", review.rating_overall)
+    .param("rating_item_accuracy", review.rating_item_accuracy)
+    .param("rating_shipping", review.rating_shipping)
+    .param("rating_communication", review.rating_communication)
+    .param("verified", review.verified)
+    .param("attestor_id", review.attestor_id.clone())
+    .param("order_ref", review.order_ref.clone())
+    .param("edited_late", review.edited_late)
+    .param("created_at", review.created_at.to_string())
+    .param("updated_at", review.updated_at.to_string())
+    .param("revision", review.revision);
+
+    Ok(query)
+}
+
+/// Sets or clears the `has_response` flag on a review edge (maintained by
+/// the review-response ingest pipeline; feeds the aggregate response count).
+/// The query returns no rows when the review edge is not indexed.
+pub fn set_review_response_flag(reviewer_id: &str, review_id: &str, has_response: bool) -> Query {
+    Query::new(
+        "set_review_response_flag",
+        "MATCH (reviewer:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+        SET r.has_response = $has_response
+        RETURN true AS flag;",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
+    .param("has_response", has_response)
 }
 
 /// Create a homeserver

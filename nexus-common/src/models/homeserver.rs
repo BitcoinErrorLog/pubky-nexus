@@ -131,7 +131,7 @@ impl Homeserver {
     ///
     /// - `referenced_post_uri`: The parent post (if current post is a reply to it), or a reposted post (if current post is a Repost)
     pub async fn maybe_ingest_for_post(referenced_post_uri: &ParsedUri) -> ModelResult<()> {
-        let ref_post_author_id = referenced_post_uri.user_id.as_str();
+        let ref_post_author_id = referenced_post_uri.user_id.as_ref();
 
         Self::maybe_ingest_for_user(ref_post_author_id).await
     }
@@ -159,7 +159,12 @@ impl Homeserver {
             return Ok(());
         };
 
-        let hs_pk = PubkyId::from(ref_post_author_hs);
+        // The specs crate's `From<pubky::PublicKey>` impl targets a newer
+        // pubky crate than the one this workspace pins; convert through the
+        // bare z-base-32 form, which is version-independent. (`to_string()`
+        // would render the `pubky`-prefixed form, which PubkyId rejects.)
+        let hs_pk = PubkyId::try_from(ref_post_author_hs.z32().as_str())
+            .map_err(ModelError::from_generic)?;
         Self::persist_if_unknown(hs_pk.clone())
             .await
             .inspect(|_| tracing::info!("Ingested homeserver {hs_pk}"))

@@ -1,7 +1,12 @@
 pub mod bookmark;
+pub mod drop;
 pub mod file;
 pub mod follow;
+pub mod listing;
 pub mod post;
+pub mod review;
+pub mod review_response;
+pub mod shop;
 pub mod tag;
 pub mod user;
 pub mod utils;

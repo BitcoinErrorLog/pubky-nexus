@@ -24,6 +24,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 base32 = "0.5"
+ed25519-dalek = "2"
 httpc-test = "0.1.10"
 pubky-testnet = { workspace = true }
 rand = "0.10.0"

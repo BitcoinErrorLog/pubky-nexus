@@ -1,6 +1,7 @@
 pub mod endpoints;
 pub mod events;
 pub mod files;
+pub mod marketplace;
 pub mod post;
 pub mod stream;
 pub mod tags;

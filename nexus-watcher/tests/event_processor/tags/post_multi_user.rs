@@ -47,6 +47,7 @@ async fn test_homeserver_multi_user_posts_tags() -> Result<()> {
     let (author_kp, author_id) = &user_kps_and_ids[0];
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:MultiUserPost:User:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

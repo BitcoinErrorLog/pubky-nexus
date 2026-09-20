@@ -37,6 +37,7 @@ async fn test_delete_reposted_post_notification() -> Result<()> {
 
     // User A creates a post
     let post = PubkyAppPost {
+        lock: None,
         content: "Original post by User A".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -47,6 +48,7 @@ async fn test_delete_reposted_post_notification() -> Result<()> {
 
     // User B reposts User A's post
     let repost = PubkyAppPost {
+        lock: None,
         content: "".to_string(), // Reposts usually have empty content
         kind: PubkyAppPostKind::Short,
         parent: None,

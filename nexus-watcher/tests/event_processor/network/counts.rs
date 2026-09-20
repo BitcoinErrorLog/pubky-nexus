@@ -77,6 +77,7 @@ async fn test_large_network_scenario_counts() -> Result<()> {
         let num_posts = rng.random_range(1..=max_posts_per_user);
         for _ in 0..num_posts {
             let post = PubkyAppPost {
+                lock: None,
                 content: format!("{}'s post content", user_names[i]),
                 kind: PubkyAppPostKind::Short,
                 parent: None,

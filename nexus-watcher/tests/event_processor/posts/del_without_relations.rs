@@ -36,6 +36,7 @@ async fn test_delete_post_without_relationships() -> Result<()> {
 
     // Create a post without any relationships
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostDelete:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -141,6 +142,7 @@ async fn test_delete_post_that_reposted() -> Result<()> {
 
     // Create a post without any relationships
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostDeleteReposted:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -151,6 +153,7 @@ async fn test_delete_post_that_reposted() -> Result<()> {
 
     // Create a repost
     let repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostDeleteReposted:User:RePost".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -272,6 +275,7 @@ async fn test_delete_post_that_replied() -> Result<()> {
 
     // Create a post without any relationships
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostDeleteReplied:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -282,6 +286,7 @@ async fn test_delete_post_that_replied() -> Result<()> {
 
     // Create a reply
     let reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostDeleteReplied:User:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(post_uri_builder(user_id.clone(), post_id.clone())),

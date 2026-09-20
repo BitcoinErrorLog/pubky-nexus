@@ -30,6 +30,7 @@ async fn test_homeserver_post_reply() -> Result<()> {
     let user_id = test.create_user(&user_kp, &user).await?;
 
     let parent_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostReply:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -43,6 +44,7 @@ async fn test_homeserver_post_reply() -> Result<()> {
     let parent_absolute_uri = post_uri_builder(user_id.clone(), parent_post_id.clone());
 
     let reply_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostReply:User:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(parent_absolute_uri.clone()),

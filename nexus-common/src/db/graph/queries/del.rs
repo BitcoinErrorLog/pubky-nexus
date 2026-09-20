@@ -73,13 +73,70 @@ pub fn delete_tag(user_id: &str, tag_id: &str) -> Query {
          WITH CASE WHEN target:User THEN target.id ELSE null END AS user_id,
               CASE WHEN target:Post THEN target.id ELSE null END AS post_id,
               CASE WHEN target:Post THEN author.id ELSE null END AS author_id,
+              CASE WHEN target:Listing THEN target.id ELSE null END AS listing_id,
+              CASE WHEN target:Listing THEN target.owner_id ELSE null END AS listing_owner_id,
+              CASE WHEN target:Shop THEN target.owner_id ELSE null END AS shop_owner_id,
               tag.label AS label,
               tag
          DELETE tag
-         RETURN user_id, post_id, author_id, label",
+         RETURN user_id, post_id, author_id, listing_id, listing_owner_id, shop_owner_id, label",
     )
     .param("user_id", user_id)
     .param("tag_id", tag_id)
+}
+
+/// Deletes the shop node of a seller and all its relationships
+/// # Arguments
+/// * `owner_id` - The unique identifier of the user who owns the shop
+pub fn delete_shop(owner_id: &str) -> Query {
+    Query::new(
+        "delete_shop",
+        "MATCH (u:User {id: $owner_id})-[:HAS_SHOP]->(shop:Shop)
+         DETACH DELETE shop;",
+    )
+    .param("owner_id", owner_id.to_string())
+}
+
+/// Deletes a listing node and all its relationships
+/// # Arguments
+/// * `owner_id` - The unique identifier of the user who owns the listing
+/// * `listing_id` - The unique identifier of the listing to be deleted
+pub fn delete_listing(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "delete_listing",
+        "MATCH (listing:Listing {id: $listing_id, owner_id: $owner_id})
+         DETACH DELETE listing;",
+    )
+    .param("owner_id", owner_id.to_string())
+    .param("listing_id", listing_id.to_string())
+}
+
+/// Deletes a drop node and all its relationships
+/// # Arguments
+/// * `owner_id` - The unique identifier of the user who owns the drop
+/// * `drop_id` - The unique identifier of the drop to be deleted
+pub fn delete_drop(owner_id: &str, drop_id: &str) -> Query {
+    Query::new(
+        "delete_drop",
+        "MATCH (drop:Drop {id: $drop_id, owner_id: $owner_id})
+         DETACH DELETE drop;",
+    )
+    .param("owner_id", owner_id.to_string())
+    .param("drop_id", drop_id.to_string())
+}
+
+/// Deletes a review edge between a reviewer and its subject
+/// # Arguments
+/// * `reviewer_id` - The unique identifier of the user who authored the review
+/// * `review_id` - The deterministic identifier of the review to be deleted
+pub fn delete_review(reviewer_id: &str, review_id: &str) -> Query {
+    Query::new(
+        "delete_review",
+        "MATCH (reviewer:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+         DELETE r;",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
 }
 
 /// Deletes a file node and all its relationships

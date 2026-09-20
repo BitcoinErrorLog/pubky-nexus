@@ -24,6 +24,7 @@ async fn test_homeserver_viewer_bookmark() -> Result<()> {
 
     // Step 2: Create a post under that user
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:ViewerBookmark:User:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

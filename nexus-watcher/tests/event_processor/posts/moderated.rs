@@ -26,6 +26,7 @@ async fn test_moderated_post_lifecycle() -> Result<()> {
     let user_id = test.create_user(&user_kp, &user).await?;
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostModerate:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

@@ -38,6 +38,7 @@ async fn test_edit_bookmarked_post_notification() -> Result<()> {
 
     // User A creates a post
     let mut post = PubkyAppPost {
+        lock: None,
         content: "Original post by User A".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

@@ -16,6 +16,7 @@ async fn test_homeserver_post_without_user() -> Result<()> {
     test.register_user(&user_kp).await?;
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostEvent:PostWithoutUser".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

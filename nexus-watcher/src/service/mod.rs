@@ -5,7 +5,7 @@ mod stats;
 mod traits;
 
 /// Module exports
-pub use constants::{PROCESSING_TIMEOUT_SECS, WATCHER_CONFIG_FILE_NAME};
+pub use constants::{POLL_TIMEOUT_SECS, PROCESSING_TIMEOUT_SECS, WATCHER_CONFIG_FILE_NAME};
 use nexus_common::types::DynError;
 pub use processor::EventProcessor;
 pub use processor_runner::EventProcessorRunner;
@@ -73,7 +73,7 @@ impl NexusWatcher {
     ) -> Result<(), DynError> {
         debug!(?config, "Running NexusWatcher with ");
 
-        let config_hs = PubkyId::try_from(config.homeserver.as_str())?;
+        let config_hs = PubkyId::try_from(config.homeserver.as_ref())?;
         Homeserver::persist_if_unknown(config_hs).await?;
 
         let mut interval = tokio::time::interval(Duration::from_millis(config.watcher_sleep));

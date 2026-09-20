@@ -32,6 +32,7 @@ async fn test_homeserver_post_repost() -> Result<()> {
     let user_id = test.create_user(&user_kp, &user).await?;
 
     let parent_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostRepost:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -45,6 +46,7 @@ async fn test_homeserver_post_repost() -> Result<()> {
     let parent_absolute_uri = post_uri_builder(user_id.clone(), parent_post_id.clone());
 
     let repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostReply:User:Repost".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

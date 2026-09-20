@@ -40,6 +40,7 @@ async fn test_homeserver_tag_post_notification() -> Result<()> {
 
     // Author creates a post
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:TagPostNotification:Author:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

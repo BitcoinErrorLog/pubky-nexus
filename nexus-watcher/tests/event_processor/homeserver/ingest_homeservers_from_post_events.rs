@@ -29,6 +29,7 @@ async fn test_reply_to_post_on_unknown_homeserver() -> Result<()> {
     // Create parent Post
     // We only need its ID, not necessarily to upload it on the new HS
     let parent_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyHomeserverIngest:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -51,6 +52,7 @@ async fn test_reply_to_post_on_unknown_homeserver() -> Result<()> {
     let _reply_author_id = test.create_user(&reply_author_kp, &reply_author).await?;
 
     let reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyRepost:User:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(parent_post_absolute_uri),
@@ -90,6 +92,7 @@ async fn test_repost_of_post_on_unknown_homeserver() -> Result<()> {
     // Create original Post
     // We only need its ID, not necessarily to upload it on the new HS
     let original_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:RepostHomeserverIngest:Original:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -111,6 +114,7 @@ async fn test_repost_of_post_on_unknown_homeserver() -> Result<()> {
     let _repost_author_id = test.create_user(&repost_author_kp, &repost_author).await?;
 
     let repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:Repost".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -172,6 +176,7 @@ async fn test_post_and_mention_users_on_unknown_homeserver() -> Result<()> {
     let _post_author_id = test.create_user(&post_author_kp, &post_author).await?;
 
     let post = PubkyAppPost {
+        lock: None,
         // The post content references the PKs of the external users
         content: format!("Hey pubky{user_1_id}, pubky{user_2_id} and pubky{user_3_id}!"),
         kind: PubkyAppPostKind::Short,

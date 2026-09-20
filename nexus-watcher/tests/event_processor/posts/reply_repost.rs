@@ -25,6 +25,7 @@ async fn test_homeserver_reply_repost() -> Result<()> {
 
     // Create root Post
     let parent_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyRepost:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -38,6 +39,7 @@ async fn test_homeserver_reply_repost() -> Result<()> {
     let parent_absolute_uri = post_uri_builder(user_id.clone(), parent_post_id.clone());
 
     let reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyRepost:User:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(parent_absolute_uri.clone()),
@@ -49,6 +51,7 @@ async fn test_homeserver_reply_repost() -> Result<()> {
 
     // Create repost
     let repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyRepost:User:Repost".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

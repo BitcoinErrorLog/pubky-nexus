@@ -1,4 +1,9 @@
+use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
+use crate::db::kv::SortOrder;
+use crate::models::marketplace::{
+    DropStreamBucket, DropStreamFilters, ListingStreamFilters, ListingStreamSorting,
+};
 use crate::models::post::StreamSource;
 use crate::types::routes::HotTagsInputDTO;
 use crate::types::Pagination;
@@ -246,6 +251,55 @@ pub fn user_tags(user_id: &str) -> Query {
     ",
     )
     .param("user_id", user_id)
+}
+
+// Retrieve all the tags of a marketplace listing
+pub fn listing_tags(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "listing_tags",
+        "
+        MATCH (l:Listing {id: $listing_id, owner_id: $owner_id})
+        CALL {
+            WITH l
+            MATCH (tagger:User)-[tag:TAGGED]->(l)
+            WITH tag.label AS name, collect(DISTINCT tagger.id) AS tagger_ids
+            RETURN collect({
+                label: name,
+                taggers: tagger_ids,
+                taggers_count: SIZE(tagger_ids)
+            }) AS tags
+        }
+        RETURN
+            l IS NOT NULL AS exists,
+            tags
+    ",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
+// Retrieve all the tags of a marketplace shop
+pub fn shop_tags(owner_id: &str) -> Query {
+    Query::new(
+        "shop_tags",
+        "
+        MATCH (:User {id: $owner_id})-[:HAS_SHOP]->(s:Shop {owner_id: $owner_id})
+        CALL {
+            WITH s
+            MATCH (tagger:User)-[tag:TAGGED]->(s)
+            WITH tag.label AS name, collect(DISTINCT tagger.id) AS tagger_ids
+            RETURN collect({
+                label: name,
+                taggers: tagger_ids,
+                taggers_count: SIZE(tagger_ids)
+            }) AS tags
+        }
+        RETURN
+            s IS NOT NULL AS exists,
+            tags
+    ",
+    )
+    .param("owner_id", owner_id)
 }
 
 /// Retrieve a homeserver by ID
@@ -807,6 +861,368 @@ pub fn post_stream(
     build_query_with_params(query, &source, tags, kind, &pagination)
 }
 
+// Retrieve the shop node of a seller
+pub fn get_shop_by_owner(owner_id: &str) -> Query {
+    Query::new(
+        "get_shop_by_owner",
+        "
+            MATCH (owner:User {id: $owner_id})-[:HAS_SHOP]->(shop:Shop)
+            RETURN {
+                owner_id: owner.id,
+                uri: shop.uri,
+                indexed_at: shop.indexed_at,
+                name: shop.name,
+                bio: shop.bio,
+                country_code: shop.country_code,
+                region: shop.region,
+                avatar_url: shop.avatar_url,
+                banner_url: shop.banner_url,
+                shipping_policy: shop.shipping_policy,
+                return_policy: shop.return_policy,
+                vacation_mode: shop.vacation_mode,
+                created_at: shop.created_at,
+                updated_at: shop.updated_at,
+                revision: shop.revision
+            } AS details
+        ",
+    )
+    .param("owner_id", owner_id)
+}
+
+// Retrieve a listing node by seller id and listing id
+pub fn get_listing_by_id(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "get_listing_by_id",
+        "
+            MATCH (seller:User {id: $owner_id})-[:SELLS]->(listing:Listing {id: $listing_id})
+            RETURN {
+                id: listing.id,
+                uri: listing.uri,
+                owner_id: seller.id,
+                indexed_at: listing.indexed_at,
+                state: listing.state,
+                title: listing.title,
+                description: listing.description,
+                category_id: listing.category_id,
+                condition: listing.condition,
+                tags: COALESCE(listing.tags, []),
+                country_code: listing.country_code,
+                region: listing.region,
+                media_urls: COALESCE(listing.media_urls, []),
+                sale_format: listing.sale_format,
+                price_amount_minor: listing.price_amount_minor,
+                price_currency: listing.price_currency,
+                price_exponent: listing.price_exponent,
+                auction_starts_at: listing.auction_starts_at,
+                auction_ends_at: listing.auction_ends_at,
+                auction_buy_now_price_minor: listing.auction_buy_now_price_minor,
+                auction_minimum_increment_minor: listing.auction_minimum_increment_minor,
+                fulfillment_methods: COALESCE(listing.fulfillment_methods, []),
+                adult_only: listing.adult_only,
+                created_at: listing.created_at,
+                updated_at: listing.updated_at,
+                revision: listing.revision
+            } AS details
+        ",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
+// Retrieve a drop node by owner id and drop id
+pub fn get_drop_by_id(owner_id: &str, drop_id: &str) -> Query {
+    Query::new(
+        "get_drop_by_id",
+        "
+            MATCH (owner:User {id: $owner_id})-[:OFFERS]->(drop:Drop {id: $drop_id})
+            RETURN {
+                id: drop.id,
+                uri: drop.uri,
+                owner_id: owner.id,
+                indexed_at: drop.indexed_at,
+                revision: drop.revision,
+                title: drop.title,
+                description: drop.description,
+                media_urls: COALESCE(drop.media_urls, []),
+                format: drop.format,
+                starts_at: drop.starts_at,
+                ends_at: drop.ends_at,
+                listing_ids: COALESCE(drop.listing_ids, []),
+                total_quantity: drop.total_quantity,
+                per_buyer_limit: drop.per_buyer_limit,
+                stock_display: drop.stock_display,
+                created_at: drop.created_at,
+                updated_at: drop.updated_at
+            } AS details
+        ",
+    )
+    .param("owner_id", owner_id)
+    .param("drop_id", drop_id)
+}
+
+// Build the drop stream graph query based on the provided filters. The stream
+// is ordered by the declared start time (`starts_at_ms`) and the pagination
+// timeframe bounds apply to it. The bucket filter compares the declared
+// schedule against `now_ms`, so the buckets are time-window estimates
+// computed from the indexed record, never the transaction service's
+// authoritative drop state.
+pub fn drop_stream(
+    filters: &DropStreamFilters,
+    pagination: Pagination,
+    order: SortOrder,
+    now_ms: i64,
+) -> Query {
+    let mut cypher = String::new();
+    let mut where_clause_applied = false;
+
+    cypher.push_str("MATCH (owner:User)-[:OFFERS]->(drop:Drop)\n");
+
+    if filters.owner.is_some() {
+        append_condition(&mut cypher, "owner.id = $owner", &mut where_clause_applied);
+    }
+    if let Some(bucket) = &filters.bucket {
+        let condition = match bucket {
+            DropStreamBucket::Upcoming => "drop.starts_at_ms > $now",
+            DropStreamBucket::LiveWindow => {
+                "drop.starts_at_ms <= $now AND (drop.ends_at_ms IS NULL OR drop.ends_at_ms > $now)"
+            }
+            DropStreamBucket::EndedWindow => {
+                "drop.ends_at_ms IS NOT NULL AND drop.ends_at_ms <= $now"
+            }
+        };
+        append_condition(&mut cypher, condition, &mut where_clause_applied);
+    }
+    if pagination.start.is_some() {
+        append_condition(
+            &mut cypher,
+            "drop.starts_at_ms <= $start",
+            &mut where_clause_applied,
+        );
+    }
+    if pagination.end.is_some() {
+        append_condition(
+            &mut cypher,
+            "drop.starts_at_ms >= $end",
+            &mut where_clause_applied,
+        );
+    }
+
+    let sort_direction = match order {
+        SortOrder::Ascending => "ASC",
+        SortOrder::Descending => "DESC",
+    };
+    cypher.push_str(&format!(
+        "WITH DISTINCT drop, owner
+        RETURN owner.id AS owner_id, drop.id AS drop_id
+        ORDER BY drop.starts_at_ms {sort_direction}\n",
+    ));
+
+    if let Some(skip) = pagination.skip {
+        cypher.push_str(&format!("SKIP {skip}\n"));
+    }
+    if let Some(limit) = pagination.limit {
+        cypher.push_str(&format!("LIMIT {limit}\n"));
+    }
+
+    let mut query = Query::new("drop_stream", &cypher);
+
+    if let Some(owner) = &filters.owner {
+        query = query.param("owner", owner.to_string());
+    }
+    if filters.bucket.is_some() {
+        query = query.param("now", now_ms);
+    }
+    if let Some(start) = pagination.start {
+        query = query.param("start", start);
+    }
+    if let Some(end) = pagination.end {
+        query = query.param("end", end);
+    }
+
+    query
+}
+
+/// Serializes a unit enum variant into its snake_case string form for query parameters.
+fn enum_query_param<T: serde::Serialize>(value: &T) -> GraphResult<String> {
+    let json =
+        serde_json::to_string(value).map_err(|e| GraphError::SerializationFailed(Box::new(e)))?;
+    Ok(json.trim_matches('"').to_string())
+}
+
+// Build the listing stream graph query based on the provided filters. The
+// stream is ordered by the property matching `sorting`; when sorting by the
+// auction end time, listings without one (fixed-price listings) are excluded
+// and the pagination timeframe bounds apply to the auction end time.
+pub fn listing_stream(
+    filters: &ListingStreamFilters,
+    pagination: Pagination,
+    order: SortOrder,
+    sorting: ListingStreamSorting,
+) -> GraphResult<Query> {
+    let mut cypher = String::new();
+    let mut where_clause_applied = false;
+
+    let sort_property = match sorting {
+        ListingStreamSorting::Timeline => "listing.indexed_at",
+        ListingStreamSorting::EndsAt => "listing.auction_ends_at_ms",
+    };
+
+    cypher.push_str("MATCH (seller:User)-[:SELLS]->(listing:Listing)\n");
+
+    if sorting == ListingStreamSorting::EndsAt {
+        append_condition(
+            &mut cypher,
+            "listing.auction_ends_at_ms IS NOT NULL",
+            &mut where_clause_applied,
+        );
+    }
+
+    if filters.seller_id.is_some() {
+        append_condition(
+            &mut cypher,
+            "seller.id = $seller_id",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.category.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.category_id = $category",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.condition.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.condition = $condition",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.sale_format.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.sale_format = $sale_format",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.state.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.state = $state",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.currency.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.price_currency = $currency",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.country.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.country_code = $country",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.min_price.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.price_major >= $min_price",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.max_price.is_some() {
+        append_condition(
+            &mut cypher,
+            "listing.price_major <= $max_price",
+            &mut where_clause_applied,
+        );
+    }
+    if filters.tags.is_some() {
+        // Community tags: a listing matches when any user has tagged it with
+        // one of the requested labels.
+        append_condition(
+            &mut cypher,
+            "EXISTS { MATCH (listing)<-[listing_tag:TAGGED]-(:User) WHERE listing_tag.label IN $tags }",
+            &mut where_clause_applied,
+        );
+    }
+    if pagination.start.is_some() {
+        append_condition(
+            &mut cypher,
+            &format!("{sort_property} <= $start"),
+            &mut where_clause_applied,
+        );
+    }
+    if pagination.end.is_some() {
+        append_condition(
+            &mut cypher,
+            &format!("{sort_property} >= $end"),
+            &mut where_clause_applied,
+        );
+    }
+
+    let sort_direction = match order {
+        SortOrder::Ascending => "ASC",
+        SortOrder::Descending => "DESC",
+    };
+    cypher.push_str(&format!(
+        "WITH DISTINCT listing, seller
+        RETURN seller.id AS owner_id, listing.id AS listing_id
+        ORDER BY {sort_property} {sort_direction}\n",
+    ));
+
+    if let Some(skip) = pagination.skip {
+        cypher.push_str(&format!("SKIP {skip}\n"));
+    }
+    if let Some(limit) = pagination.limit {
+        cypher.push_str(&format!("LIMIT {limit}\n"));
+    }
+
+    let mut query = Query::new("listing_stream", &cypher);
+
+    if let Some(seller_id) = &filters.seller_id {
+        query = query.param("seller_id", seller_id.to_string());
+    }
+    if let Some(category) = &filters.category {
+        query = query.param("category", category.to_string());
+    }
+    if let Some(condition) = &filters.condition {
+        query = query.param("condition", enum_query_param(condition)?);
+    }
+    if let Some(sale_format) = &filters.sale_format {
+        query = query.param("sale_format", enum_query_param(sale_format)?);
+    }
+    if let Some(state) = &filters.state {
+        query = query.param("state", enum_query_param(state)?);
+    }
+    if let Some(currency) = &filters.currency {
+        query = query.param("currency", currency.to_string());
+    }
+    if let Some(country) = &filters.country {
+        query = query.param("country", country.to_uppercase());
+    }
+    if let Some(min_price) = filters.min_price {
+        query = query.param("min_price", min_price);
+    }
+    if let Some(max_price) = filters.max_price {
+        query = query.param("max_price", max_price);
+    }
+    if let Some(tags) = &filters.tags {
+        query = query.param("tags", tags.clone());
+    }
+    if let Some(start) = pagination.start {
+        query = query.param("start", start);
+    }
+    if let Some(end) = pagination.end {
+        query = query.param("end", end);
+    }
+
+    Ok(query)
+}
+
 /// Appends a condition to the Cypher query, using `WHERE` if no `WHERE` clause
 /// has been applied yet, or `AND` if a `WHERE` clause is already present.
 ///
@@ -955,4 +1371,52 @@ pub fn get_tag_by_tagger_and_id(tagger_id: &str, tag_id: &str) -> Query {
     )
     .param("tagger_id", tagger_id)
     .param("tag_id", tag_id)
+}
+
+/// The aggregate projection shared by the reputation queries. Averages skip
+/// null sub-ratings (Cypher `avg` ignores nulls); the attestor list carries
+/// one entry per verified review for per-attestor counting in Rust.
+const REPUTATION_RETURN: &str = "
+        RETURN count(r) AS total,
+            sum(CASE WHEN r.verified THEN 1 ELSE 0 END) AS verified_count,
+            avg(toFloat(r.rating_overall)) AS average,
+            sum(CASE WHEN r.rating_overall = 1 THEN 1 ELSE 0 END) AS stars_1,
+            sum(CASE WHEN r.rating_overall = 2 THEN 1 ELSE 0 END) AS stars_2,
+            sum(CASE WHEN r.rating_overall = 3 THEN 1 ELSE 0 END) AS stars_3,
+            sum(CASE WHEN r.rating_overall = 4 THEN 1 ELSE 0 END) AS stars_4,
+            sum(CASE WHEN r.rating_overall = 5 THEN 1 ELSE 0 END) AS stars_5,
+            avg(toFloat(r.rating_item_accuracy)) AS avg_item_accuracy,
+            avg(toFloat(r.rating_shipping)) AS avg_shipping,
+            avg(toFloat(r.rating_communication)) AS avg_communication,
+            sum(CASE WHEN r.has_response THEN 1 ELSE 0 END) AS response_count,
+            sum(CASE WHEN r.edited_late THEN 1 ELSE 0 END) AS edited_late_count,
+            [x IN collect(CASE WHEN r.verified THEN r.attestor_id ELSE null END) WHERE x IS NOT NULL] AS attestors,
+            max(r.created_at) AS last_reviewed_at
+        ";
+
+/// Aggregates every `REVIEWED` edge pointing at a subject in one role into
+/// the reputation summary row.
+pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
+    let cypher = format!(
+        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
+        WHERE r.role = $role
+        {REPUTATION_RETURN}"
+    );
+    Query::new("subject_reputation", &cypher)
+        .param("subject_id", subject_id.to_string())
+        .param("role", role.to_string())
+}
+
+/// Aggregates the buyer reviews of one listing into the reputation summary
+/// row. For `buyer_reviewing_seller` reviews the subject is the listing
+/// owner, which anchors the scan.
+pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
+    let cypher = format!(
+        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
+        WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id
+        {REPUTATION_RETURN}"
+    );
+    Query::new("listing_reputation", &cypher)
+        .param("listing_owner_id", listing_owner_id.to_string())
+        .param("listing_id", listing_id.to_string())
 }

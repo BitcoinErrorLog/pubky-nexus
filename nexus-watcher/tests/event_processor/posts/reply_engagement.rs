@@ -27,6 +27,7 @@ async fn test_homeserver_reply_engagement_control() -> Result<()> {
 
     // Create root Post
     let parent_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyEngagement:User:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -40,6 +41,7 @@ async fn test_homeserver_reply_engagement_control() -> Result<()> {
     let parent_absolute_uri = post_uri_builder(author_id.clone(), parent_post_id);
 
     let reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyEngagement:User:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(parent_absolute_uri.clone()),
@@ -62,6 +64,7 @@ async fn test_homeserver_reply_engagement_control() -> Result<()> {
     let reply_absolute_uri = post_uri_builder(author_id.clone(), reply_id.clone());
 
     let reply_of_reply = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyEngagement:User:ReplyOfReply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: Some(reply_absolute_uri.clone()),
@@ -90,6 +93,7 @@ async fn test_homeserver_reply_engagement_control() -> Result<()> {
 
     // Create a repost of a reply
     let reply_repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:ReplyEngagement:User:Repost".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

@@ -35,7 +35,7 @@ impl Collection<&str> for UserDetails {
 }
 
 /// Represents user data with name, bio, image, links, and status.
-#[derive(Serialize, Deserialize, ToSchema, Default, Clone, Debug)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct UserDetails {
     pub name: String,
     pub bio: Option<String>,
@@ -124,7 +124,10 @@ mod tests {
     fn deserialize_from_node_without_links() {
         let mut props = BoltMap::new();
         props.put(BoltString::from("name"), BoltType::from("Dave"));
-        props.put(BoltString::from("id"), BoltType::from("rz6oe4yda9em"));
+        props.put(
+            BoltString::from("id"),
+            BoltType::from("rz6oe4yda9em9b4m7ymttgym3r9g5gfa51su3rgdj9oszyz787ny"),
+        );
         props.put(
             BoltString::from("indexed_at"),
             BoltType::from(1724134095000_i64),

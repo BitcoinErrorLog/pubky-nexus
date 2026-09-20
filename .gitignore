@@ -10,3 +10,6 @@ docker/.database*
 /target
 # System-specific files
 **/.DS_Store
+# macOS AppleDouble resource forks (appear on exFAT volumes)
+._*
+**/._*

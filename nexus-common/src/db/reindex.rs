@@ -99,6 +99,27 @@ pub async fn reindex_post(author_id: &str, post_id: &str) -> Result<(), DynError
     Ok(())
 }
 
+/// The review ids already indexed for one reviewer (the `REVIEWED` edge's
+/// `review_id`), so a homeserver-discovery backfill can skip records the
+/// events feed already ingested.
+pub async fn get_indexed_review_ids(reviewer_id: &str) -> Result<Vec<String>, DynError> {
+    let query = Query::new(
+        "get_indexed_review_ids",
+        "MATCH (u:User {id: $reviewer_id})-[r:REVIEWED]->() RETURN r.review_id AS review_id",
+    )
+    .param("reviewer_id", reviewer_id.to_string());
+    let rows = fetch_all_rows_from_graph(query).await?;
+
+    let mut review_ids = Vec::new();
+    for row in rows {
+        if let Some(review_id) = row.get("review_id")? {
+            review_ids.push(review_id);
+        }
+    }
+
+    Ok(review_ids)
+}
+
 pub async fn get_all_user_ids() -> Result<Vec<String>, DynError> {
     let query = Query::new("get_all_user_ids", "MATCH (u:User) RETURN u.id AS id");
     let rows = fetch_all_rows_from_graph(query).await?;
@@ -128,4 +149,28 @@ async fn get_all_post_ids() -> Result<Vec<(String, String)>, DynError> {
     }
 
     Ok(post_ids)
+}
+
+/// Returns the `(owner_id, listing_id)` pairs of every auction listing whose
+/// graph row lacks the auction term fields — rows indexed before the index
+/// carried `auction_starts_at`/`auction_ends_at` and the related prices.
+/// Every valid auction record has an end time, so a missing `auction_ends_at`
+/// on an auction row can only mean the row predates the term fields.
+pub async fn get_auction_listings_missing_terms() -> Result<Vec<(String, String)>, DynError> {
+    let query = Query::new(
+        "get_auction_listings_missing_terms",
+        "MATCH (l:Listing)
+         WHERE l.sale_format = 'auction' AND l.auction_ends_at IS NULL
+         RETURN l.owner_id AS owner_id, l.id AS listing_id",
+    );
+    let rows = fetch_all_rows_from_graph(query).await?;
+
+    let mut listing_ids = Vec::new();
+    for row in rows {
+        if let (Some(owner_id), Some(listing_id)) = (row.get("owner_id")?, row.get("listing_id")?) {
+            listing_ids.push((owner_id, listing_id));
+        }
+    }
+
+    Ok(listing_ids)
 }

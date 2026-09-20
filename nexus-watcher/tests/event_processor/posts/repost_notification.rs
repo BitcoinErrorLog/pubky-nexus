@@ -25,6 +25,7 @@ async fn test_homeserver_post_repost_notification() -> Result<()> {
     let alice_id = test.create_user(&alice_kp, &alice).await?;
 
     let parent_post = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostRepostNotification:Alice:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -37,6 +38,7 @@ async fn test_homeserver_post_repost_notification() -> Result<()> {
     let parent_absolute_uri = post_uri_builder(alice_id.clone(), alice_post_id.clone());
 
     let alice_repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostRepostNotification:Alice:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
@@ -73,6 +75,7 @@ async fn test_homeserver_post_repost_notification() -> Result<()> {
     let bob_id = test.create_user(&bob_kp, &bob).await?;
 
     let bob_repost = PubkyAppPost {
+        lock: None,
         content: "Watcher:PostRepostNotification:Bob:Reply".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,

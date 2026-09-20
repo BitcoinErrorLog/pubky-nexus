@@ -43,6 +43,7 @@ async fn test_homeserver_del_tag_post() -> Result<()> {
     let author_user_id = test.create_user(&author_kp, &author).await?;
 
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:DelTagPost:User:Post".to_string(),
         kind: PubkyAppPost::default().kind,
         parent: None,

@@ -1,7 +1,9 @@
 pub mod details;
 pub mod global;
+pub mod listing;
 pub mod post;
 pub mod search;
+pub mod shop;
 pub mod stream;
 pub mod traits;
 pub mod user;

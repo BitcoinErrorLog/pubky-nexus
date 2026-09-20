@@ -58,6 +58,7 @@ async fn test_homeserver_del_post_with_attachments() -> Result<()> {
         .map(|id| file_uri_builder(user_id.clone(), id.clone()))
         .collect();
     let post = PubkyAppPost {
+        lock: None,
         content: "Watcher:DelWithAttachmentEvent:Post".to_string(),
         kind: PubkyAppPostKind::Short,
         parent: None,
