@@ -5,10 +5,21 @@ use nexus_webapi::mock::MockDb;
 use nexus_webapi::NexusApi;
 use nexusd::cli::{ApiArgs, Cli, DbCommands, MigrationCommands, NexusCommands, WatcherArgs};
 use nexusd::migrations::{import_migrations, MigrationBuilder, MigrationManager};
+use nexusd::redaction::redact_connection_url_userinfo;
 use nexusd::DaemonLauncher;
 
 #[tokio::main]
-async fn main() -> Result<(), DynError> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!(
+            "Error: {}",
+            redact_connection_url_userinfo(&format!("{error:?}"))
+        );
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), DynError> {
     let cli = Cli::parse();
     let command = Cli::receive_command(cli);
     match command {
