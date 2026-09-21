@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::http::StatusCode;
-use tokio::time::sleep;
 use tracing::debug;
 
 use crate::{
@@ -60,9 +59,9 @@ async fn test_global_influencers_preview() -> Result<()> {
         .map(|f| f["details"]["id"].as_str().unwrap())
         .collect();
 
-    // Sleep to ensure the second request gets a different timestamp_subsec_micros() value,
-    // which determines the random skip offset for preview mode (see Influencers::get_influencers()).
-    sleep(Duration::from_millis(5)).await;
+    // Preview skip is Utc::now().timestamp_subsec_micros() % 98. tokio::time::sleep
+    // can be virtual on the shared test runtime, so wait on the wall clock.
+    std::thread::sleep(Duration::from_millis(20));
 
     // Make a second request to verify preview returns different results
     let body = get_request("/v0/stream/users?source=influencers&preview=true").await?;
@@ -80,7 +79,10 @@ async fn test_global_influencers_preview() -> Result<()> {
         .map(|f| f["details"]["id"].as_str().unwrap())
         .collect();
 
-    assert!(first_influencer_ids != second_influencer_ids);
+    assert!(
+        first_influencer_ids != second_influencer_ids,
+        "preview windows should differ; first={first_influencer_ids:?} second={second_influencer_ids:?}"
+    );
 
     Ok(())
 }
@@ -129,7 +131,9 @@ async fn test_global_influencers_with_today_timeframe() -> Result<()> {
         .map(|f| f["details"]["id"].as_str().unwrap())
         .collect::<Vec<&str>>();
 
-    // List of expected user IDs
+    // These four have in-window AUTHORED+FOLLOWS in hot-tags.cypher. Timeframe::Today
+    // is a rolling 24h window; fixture timestamps from 2024 score 0 and lose to
+    // any extra User nodes in the shared graph unless those edges exist.
     let expected_user_ids = vec![
         "phh5aqdfwkmydr1d6b48xa3tcbiipy8wpcmougyed7otitx69kco",
         "pcckx7sercfy1u8rrr8cc4gkdnce93f6jarngcdsfu5enty51aiy",
@@ -137,10 +141,12 @@ async fn test_global_influencers_with_today_timeframe() -> Result<()> {
         "omynbjw4ksjc4at5gretyoatw1g5h53tkee5z55fh69sng1d3jpy",
     ];
 
-    // Verify that each expected user ID is present in the response
     for id in &expected_user_ids {
-        let exists = influencer_ids.clone().into_iter().any(|item| item == *id);
-        assert!(exists, "Expected user ID not found: {id}");
+        let exists = influencer_ids.iter().any(|item| item == id);
+        assert!(
+            exists,
+            "Expected user ID not found: {id}. Got: {influencer_ids:?}"
+        );
     }
 
     Ok(())
@@ -171,10 +177,12 @@ async fn test_global_influencers_with_this_month_timeframe() -> Result<()> {
         "oh8ku6csenwcyec6oaacz6xumydqjdaagh4ekr8jsm44rrdssjqo",
     ];
 
-    // Verify that each expected user ID is present in the response
     for id in &expected_user_ids {
-        let exists = influencer_ids.clone().into_iter().any(|item| item == *id);
-        assert!(exists, "Expected user ID not found: {id}");
+        let exists = influencer_ids.iter().any(|item| item == id);
+        assert!(
+            exists,
+            "Expected user ID not found: {id}. Got: {influencer_ids:?}"
+        );
     }
 
     Ok(())
