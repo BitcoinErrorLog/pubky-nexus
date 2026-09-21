@@ -5,6 +5,7 @@ use anyhow::Result;
 use axum::http::StatusCode;
 use nexus_common::db::{exec_single_row, queries, OperationOutcome};
 use nexus_common::models::marketplace::{ListingDetails, ListingSaleFormat, ShopDetails};
+use nexus_common::models::traits::Collection;
 use nexus_common::models::user::UserDetails;
 use pubky::Keypair;
 use pubky_app_specs::{
@@ -40,6 +41,9 @@ async fn seed_user(seller_id: &str) -> Result<()> {
         indexed_at: chrono::Utc::now().timestamp_millis(),
     };
     exec_single_row(queries::put::create_user(&user_details)?).await?;
+    // Index Redis details so influencer cache cleanup does not treat these
+    // graph-only seeds as deleted users when they appear in a Today page.
+    UserDetails::put_to_index(&[seller_id], vec![Some(user_details)]).await?;
     Ok(())
 }
 

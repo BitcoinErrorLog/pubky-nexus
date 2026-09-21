@@ -129,7 +129,9 @@ async fn test_global_influencers_with_today_timeframe() -> Result<()> {
         .map(|f| f["details"]["id"].as_str().unwrap())
         .collect::<Vec<&str>>();
 
-    // List of expected user IDs
+    // These four have in-window TAGGED+FOLLOWS in hot-tags.cypher. Timeframe::Today
+    // is a rolling 24h window; fixture timestamps from 2024 score 0 and lose to
+    // any extra User nodes in the shared graph unless those edges exist.
     let expected_user_ids = vec![
         "phh5aqdfwkmydr1d6b48xa3tcbiipy8wpcmougyed7otitx69kco",
         "pcckx7sercfy1u8rrr8cc4gkdnce93f6jarngcdsfu5enty51aiy",
@@ -137,10 +139,12 @@ async fn test_global_influencers_with_today_timeframe() -> Result<()> {
         "omynbjw4ksjc4at5gretyoatw1g5h53tkee5z55fh69sng1d3jpy",
     ];
 
-    // Verify that each expected user ID is present in the response
     for id in &expected_user_ids {
-        let exists = influencer_ids.clone().into_iter().any(|item| item == *id);
-        assert!(exists, "Expected user ID not found: {id}");
+        let exists = influencer_ids.iter().any(|item| item == id);
+        assert!(
+            exists,
+            "Expected user ID not found: {id}. Got: {influencer_ids:?}"
+        );
     }
 
     Ok(())
@@ -171,10 +175,12 @@ async fn test_global_influencers_with_this_month_timeframe() -> Result<()> {
         "oh8ku6csenwcyec6oaacz6xumydqjdaagh4ekr8jsm44rrdssjqo",
     ];
 
-    // Verify that each expected user ID is present in the response
     for id in &expected_user_ids {
-        let exists = influencer_ids.clone().into_iter().any(|item| item == *id);
-        assert!(exists, "Expected user ID not found: {id}");
+        let exists = influencer_ids.iter().any(|item| item == id);
+        assert!(
+            exists,
+            "Expected user ID not found: {id}. Got: {influencer_ids:?}"
+        );
     }
 
     Ok(())

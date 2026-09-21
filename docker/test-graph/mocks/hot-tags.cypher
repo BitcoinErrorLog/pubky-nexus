@@ -272,3 +272,51 @@ MATCH (p1:Post {id: $post3}), (p2:Post {id: $reply_5}) MERGE (p2)-[:REPLIED]->(p
 MERGE (p:Post { id: $reply_6 }) SET p.content = "This is a 6 reply", p.kind = "short", p.indexed_at = 1737441201104340;
 MATCH (u:User { id: $user5 }), (p:Post {id: $reply_6}) MERGE (u)-[:AUTHORED]->(p);
 MATCH (p1:Post {id: $post3}), (p2:Post {id: $reply_6}) MERGE (p2)-[:REPLIED]->(p1);
+
+// Timeframe::Today is a rolling 24h window. Skunk FOLLOWS/TAGGED timestamps are
+// from 2024, so without in-window edges every User scores 0 and the global
+// influencer top-N is a lexicographic slice of the shared graph. Extra User
+// nodes written by other tests then displace the fixture IDs.
+// Unique per-user labels keep tagged_count at 1 so they cannot outrank the
+// existing `today` hot-tag (tagged_count 3). Follower is user6, not USER_1,
+// so reach=following streams scoped to USER_1 stay unchanged.
+:param inf_today_1 => 'phh5aqdfwkmydr1d6b48xa3tcbiipy8wpcmougyed7otitx69kco';
+:param inf_today_2 => 'pcckx7sercfy1u8rrr8cc4gkdnce93f6jarngcdsfu5enty51aiy';
+:param inf_today_3 => 'otn147ixg3i4sorqupuzptnx9gtiku4y77i8fdo35m7yug1d8zio';
+:param inf_today_4 => 'omynbjw4ksjc4at5gretyoatw1g5h53tkee5z55fh69sng1d3jpy';
+:param inf_month_5 => 'oh8ku6csenwcyec6oaacz6xumydqjdaagh4ekr8jsm44rrdssjqo';
+
+WITH datetime().epochMillis AS today_millis
+MATCH (u:User { id: $inf_today_1 }), (p:Post {id: $post1})
+MERGE (u)-[:TAGGED { label: 'infl_phh', id: 'INFLTODAYTAG0001', indexed_at: today_millis }]->(p);
+WITH datetime().epochMillis AS today_millis
+MATCH (f:User { id: $user6 }), (u:User { id: $inf_today_1 })
+MERGE (f)-[:FOLLOWS { indexed_at: today_millis, id: 'INFLTODAYFLW0001' }]->(u);
+
+WITH datetime().epochMillis AS today_millis
+MATCH (u:User { id: $inf_today_2 }), (p:Post {id: $post1})
+MERGE (u)-[:TAGGED { label: 'infl_pcc', id: 'INFLTODAYTAG0002', indexed_at: today_millis }]->(p);
+WITH datetime().epochMillis AS today_millis
+MATCH (f:User { id: $user6 }), (u:User { id: $inf_today_2 })
+MERGE (f)-[:FOLLOWS { indexed_at: today_millis, id: 'INFLTODAYFLW0002' }]->(u);
+
+WITH datetime().epochMillis AS today_millis
+MATCH (u:User { id: $inf_today_3 }), (p:Post {id: $post1})
+MERGE (u)-[:TAGGED { label: 'infl_otn', id: 'INFLTODAYTAG0003', indexed_at: today_millis }]->(p);
+WITH datetime().epochMillis AS today_millis
+MATCH (f:User { id: $user6 }), (u:User { id: $inf_today_3 })
+MERGE (f)-[:FOLLOWS { indexed_at: today_millis, id: 'INFLTODAYFLW0003' }]->(u);
+
+WITH datetime().epochMillis AS today_millis
+MATCH (u:User { id: $inf_today_4 }), (p:Post {id: $post1})
+MERGE (u)-[:TAGGED { label: 'infl_omy', id: 'INFLTODAYTAG0004', indexed_at: today_millis }]->(p);
+WITH datetime().epochMillis AS today_millis
+MATCH (f:User { id: $user6 }), (u:User { id: $inf_today_4 })
+MERGE (f)-[:FOLLOWS { indexed_at: today_millis, id: 'INFLTODAYFLW0004' }]->(u);
+
+WITH (datetime() - duration({ days: 10 })).epochMillis AS month_millis
+MATCH (u:User { id: $inf_month_5 }), (p:Post {id: $post1})
+MERGE (u)-[:TAGGED { label: 'infl_oh8', id: 'INFLMONTHTAG0001', indexed_at: month_millis }]->(p);
+WITH (datetime() - duration({ days: 10 })).epochMillis AS month_millis
+MATCH (f:User { id: $user6 }), (u:User { id: $inf_month_5 })
+MERGE (f)-[:FOLLOWS { indexed_at: month_millis, id: 'INFLMONTHFLW0001' }]->(u);
