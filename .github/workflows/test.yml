@@ -13,6 +13,16 @@ on:
       - dev
 
 jobs:
+  entrypoint-redact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Entrypoint must not echo URL userinfo
+        run: sh scripts/check-entrypoint-redact.sh
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20

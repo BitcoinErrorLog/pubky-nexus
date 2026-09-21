@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
+# Config dir is the Railway volume in production; tests override NEXUS_CONFIG_DIR.
+CONFIG_DIR="${NEXUS_CONFIG_DIR:-/data}"
+
 NEO4J_URI="${NEXUS_NEO4J_URI:-bolt://localhost:7687}"
 NEO4J_PASS="${NEXUS_NEO4J_PASSWORD:-pubkywebindex}"
 REDIS_URL="${NEXUS_REDIS_URL:-redis://127.0.0.1:6379}"
@@ -15,12 +18,38 @@ TESTNET_HOST="${NEXUS_TESTNET_HOST:-localhost}"
 EVENTS_LIMIT="${NEXUS_EVENTS_LIMIT:-1000}"
 WATCHER_SLEEP="${NEXUS_WATCHER_SLEEP:-500}"
 
+# Echoed config must never contain URL userinfo (`://user:pass@`) or secret
+# assignment values. The file written for nexusd keeps the real values.
+redact_generated_config() {
+	awk '
+		{
+			line = $0
+			low = tolower(line)
+			if (low ~ /^[[:space:]]*password[[:space:]]*=/) {
+				print "password = \"<redacted>\""
+				next
+			}
+			if (low ~ /^[[:space:]]*[a-z0-9_]*(_url|_password|_pass|_secret|_token|_auth)[[:space:]]*=/) {
+				sub(/=.*/, "= \"<redacted>\"")
+				print
+				next
+			}
+			while (match(line, /:\/\/[^\/]*:[^@]*@/)) {
+				line = substr(line, 1, RSTART - 1) "://[redacted]@" substr(line, RSTART + RLENGTH)
+			}
+			print line
+		}
+	'
+}
+
+mkdir -p "$CONFIG_DIR/static/files"
+
 echo "=== Railway nexusd entrypoint ==="
 echo "TESTNET=${TESTNET}"
 echo "TESTNET_HOST=${TESTNET_HOST}"
 echo "HOMESERVER=${HOMESERVER}"
 
-cat > /data/config.toml <<EOF
+cat > "$CONFIG_DIR/config.toml" <<EOF
 [api]
 name = "nexusd.api"
 public_ip = "0.0.0.0"
@@ -50,6 +79,6 @@ uri = "${NEO4J_URI}"
 password = "${NEO4J_PASS}"
 EOF
 
-echo "Generated config (password redacted):"
-sed 's/^password = .*/password = "<redacted>"/' /data/config.toml
-exec nexusd --config-dir /data
+echo "Generated config (credentials redacted):"
+redact_generated_config < "$CONFIG_DIR/config.toml"
+exec nexusd --config-dir "$CONFIG_DIR"
