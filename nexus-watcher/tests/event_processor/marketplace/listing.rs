@@ -18,12 +18,12 @@ use nexus_watcher::events::handlers::listing::{
     ListingReserveScrubOps,
 };
 use nexus_watcher::events::retry::event::RetryEvent;
-use pubky::Keypair;
+use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::{
     listing_uri_builder,
     traits::{HasIdPath, TimestampId},
-    PubkyAppListing, PubkyAppListingCondition, PubkyAppListingSale, PubkyAppListingState,
-    PubkyAppMoney, PubkyAppUser, PubkyId,
+    PubkyAppFulfillmentMethod, PubkyAppListing, PubkyAppListingCondition, PubkyAppListingSale,
+    PubkyAppListingState, PubkyAppMoney, PubkyAppObject, PubkyAppUser, PubkyId, Resource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1040,6 +1040,72 @@ async fn reserve_scrub_does_not_delete_a_republish_after_missing_re_read() -> Re
     assert_eq!(
         exact_cached_entry.auction_reserve_price_minor, None,
         "the newly republished cache entry must remain reserve-free"
+    );
+
+    test.del(&user_kp, &listing_path).await?;
+    test.cleanup_user(&user_kp).await?;
+    Ok(())
+}
+
+/// Homeserver bytes for seller n3pfudgx… listing 2577a25c412e44a7bc56118c91d98623,
+/// the file production nexusd rejected with `unknown variant shipping`.
+const LIVE_SHIPPING_LISTING: &str = r#"{"schemaVersion":1,"recordType":"listing","ownerPubky":"n3pfudgxncn8i1e6icuq7umoczemjuyi6xdfrfczk3o8ej3e55my","listingId":"2577a25c412e44a7bc56118c91d98623","revision":1,"createdAt":"2026-09-18T08:51:57.956Z","updatedAt":"2026-09-18T08:51:57.956Z","state":"active","title":"Issue 12 staging proof - do not buy","description":"Authorized staging-only proof.","taxonomyVersion":1,"categoryId":"other","condition":"new","tags":["proof"],"location":{"countryCode":"US"},"media":[{"id":"proof","type":"image","url":"pubky://n3pfudgxncn8i1e6icuq7umoczemjuyi6xdfrfczk3o8ej3e55my/pub/pubky.app/marketplace/v1/media/proof","contentHash":"0000000000000000000000000000000000000000000000000000000000000000","mimeType":"image/png","byteSize":1,"width":1,"height":1,"altText":"Proof image"}],"variants":[{"id":"proof","options":{},"quantity":1,"mediaIds":["proof"],"enabled":true}],"sale":{"format":"fixed_price","unitPrice":{"amountMinor":100,"currency":"USD","exponent":2},"acceptsOffers":false},"fulfillmentMethods":["shipping"],"shippingOptions":[],"returnPolicy":{"acceptsReturns":false,"buyerPaysReturnShipping":false},"adultOnly":false}"#;
+
+#[tokio_shared_rt::test(shared)]
+async fn test_shipping_only_listing_parses_and_indexes() -> Result<()> {
+    let listing_id = "2577a25c412e44a7bc56118c91d98623";
+    let parsed = PubkyAppObject::from_resource(
+        &Resource::Listing(listing_id.to_string()),
+        LIVE_SHIPPING_LISTING.as_bytes(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let PubkyAppObject::Listing(parsed_listing) = parsed else {
+        anyhow::bail!("expected a listing object");
+    };
+    assert_eq!(parsed_listing.listing_id, listing_id);
+    assert_eq!(
+        parsed_listing.fulfillment_methods,
+        vec![PubkyAppFulfillmentMethod::Shipping]
+    );
+
+    let mut test = WatcherTest::setup().await?;
+    let user_kp = Keypair::random();
+    let user = PubkyAppUser {
+        bio: Some("test_shipping_only_listing_parses_and_indexes".to_string()),
+        image: None,
+        links: None,
+        name: "Watcher:ShippingListing:User".to_string(),
+        status: None,
+    };
+    let user_id = test.create_user(&user_kp, &user).await?;
+
+    let document: serde_json::Value = serde_json::from_str(LIVE_SHIPPING_LISTING)?;
+    let listing_path: ResourcePath = PubkyAppListing::create_path(listing_id).parse()?;
+    test.put(&user_kp, &listing_path, &document).await?;
+
+    let indexed = ListingDetails::get_from_index(&user_id, listing_id)
+        .await?
+        .expect("the shipping listing was indexed");
+    assert_eq!(indexed.id, listing_id);
+    assert_eq!(indexed.title, "Issue 12 staging proof - do not buy");
+    assert_eq!(
+        indexed.fulfillment_methods,
+        vec![PubkyAppFulfillmentMethod::Shipping]
+    );
+
+    let stream = ListingStream::get_listings(
+        seller_filters(&user_id),
+        Pagination::default(),
+        SortOrder::Descending,
+        ListingStreamSorting::Timeline,
+    )
+    .await?
+    .expect("the shipping listing is in the seller stream");
+    assert_eq!(stream.0.len(), 1);
+    assert_eq!(stream.0[0].id, listing_id);
+    assert_eq!(
+        stream.0[0].fulfillment_methods,
+        vec![PubkyAppFulfillmentMethod::Shipping]
     );
 
     test.del(&user_kp, &listing_path).await?;
