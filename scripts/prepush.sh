@@ -92,9 +92,13 @@ if ! nc -z 127.0.0.1 6379 >/dev/null 2>&1; then
   exit 1
 fi
 
-neo_name="${PREPUSH_NEO4J_CONTAINER:-prepush-nexus-neo4j}"
+# db mock runs /test-graph/run-queries.sh via `docker exec neo4j`.
+neo_name="${PREPUSH_NEO4J_CONTAINER:-neo4j}"
 if ! nc -z 127.0.0.1 7687 >/dev/null 2>&1; then
-  docker rm -f "$neo_name" >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -qx "$neo_name"; then
+    echo "prepush: Neo4j port 7687 is closed and container name ${neo_name} is already taken" >&2
+    exit 1
+  fi
   docker run -d --name "$neo_name" \
     -e NEO4J_AUTH="${NEO4J_DB_USERNAME}/${NEO4J_PASSWORD}" \
     -e NEO4J_server_memory_pagecache_size=1G \
@@ -104,6 +108,7 @@ if ! nc -z 127.0.0.1 7687 >/dev/null 2>&1; then
     -e NEO4J_client_allow__telemetry=false \
     -p 127.0.0.1:7474:7474 \
     -p 127.0.0.1:7687:7687 \
+    -v "$ROOT/docker/test-graph:/test-graph:ro" \
     neo4j:5.26.20-community >/dev/null
 fi
 
@@ -124,7 +129,7 @@ echo "prepush: cargo clippy"
 run_heavy cargo clippy --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-run_heavy bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace -- --no-fail-fast'
+run_heavy bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --no-fail-fast'
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"
