@@ -129,10 +129,14 @@ echo "prepush: cargo clippy"
 run_heavy cargo clippy --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-# One Redis and one Neo4j. Parallel tests sign up over each other.
-# --lib --bins --tests skips doctests; two examples on main do not compile,
-# and CI runs nextest, which does not compile them.
-run_heavy bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --lib --bins --tests --no-fail-fast -- --test-threads=1'
+# One Redis and one Neo4j. --lib --bins --tests skips doctests; two examples
+# on main do not compile, and CI runs nextest, which does not compile them.
+# Watcher tests each install a testnet client with PubkyConnector::init_from,
+# and that client stays for the life of the process. cargo test shares one
+# process, so later homeservers are not on the first client's DHT. CI runs
+# nextest, one process per test. -j 1 keeps that isolation on the shared
+# Redis and Neo4j.
+run_heavy bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --lib --bins --tests --exclude nexus-watcher --no-fail-fast -- --test-threads=1 && cargo nextest run -p nexus-watcher --no-fail-fast -j 1'
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"
