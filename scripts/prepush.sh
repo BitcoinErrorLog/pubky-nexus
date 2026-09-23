@@ -129,7 +129,10 @@ echo "prepush: cargo clippy"
 run_heavy cargo clippy --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-run_heavy bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --no-fail-fast'
+# One Redis and one Neo4j. Parallel tests sign up over each other.
+# --lib --bins --tests skips doctests; two examples on main do not compile,
+# and CI runs nextest, which does not compile them.
+run_heavy bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --lib --bins --tests --no-fail-fast -- --test-threads=1'
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"
