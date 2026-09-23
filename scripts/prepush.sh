@@ -37,6 +37,9 @@ if [ ! -t 0 ]; then
   fi
 fi
 
+echo "prepush: cargo fmt"
+cargo fmt --check
+
 if ! docker info >/dev/null 2>&1; then
   echo "prepush: docker is required for the scram-sha-256 Postgres" >&2
   exit 1
@@ -46,15 +49,27 @@ set -a
 # shellcheck disable=SC1091
 . docker/.env-sample
 set +a
-export TEST_PUBKY_CONNECTION_STRING
 
-if ! docker ps --format '{{.Names}}' | grep -qx postgres; then
-  docker compose --env-file .env-sample -f docker/docker-compose.yml up -d
+port="${PREPUSH_PG_PORT:-55434}"
+name="${PREPUSH_PG_CONTAINER:-prepush-nexus-pg}"
+export POSTGRES_PORT="$port"
+export TEST_PUBKY_CONNECTION_STRING="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${port}/${POSTGRES_DB}?pubky-test=true"
+
+if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker run -d --name "$name" \
+    -e POSTGRES_USER="$POSTGRES_USER" \
+    -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+    -e POSTGRES_DB="$POSTGRES_DB" \
+    -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
+    -p "127.0.0.1:${port}:5432" \
+    postgres:18-alpine >/dev/null
 fi
 
 ready=0
 for _ in $(seq 1 60); do
-  if docker exec postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+  if docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$name" \
+    psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'SELECT 1' >/dev/null 2>&1; then
     ready=1
     break
   fi
@@ -65,24 +80,31 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 
-encryption="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" postgres psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'SHOW password_encryption' | tr -d '[:space:]')"
-trust_hosts="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" postgres psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT count(*) FROM pg_hba_file_rules WHERE type = 'host' AND auth_method = 'trust'")"
-if [ "$encryption" != "scram-sha-256" ] || [ "${trust_hosts:-1}" != "0" ]; then
-  echo "prepush: Postgres is not scram-sha-256 like CI (encryption=${encryption} trust_host_rules=${trust_hosts})" >&2
+encryption="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$name" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'SHOW password_encryption' | tr -d '[:space:]')"
+host_all="$(docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" "$name" psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT auth_method FROM pg_hba_file_rules WHERE type = 'host' AND address = 'all'" | tr -d '[:space:]')"
+if [ "$encryption" != "scram-sha-256" ] || [ "$host_all" != "scram-sha-256" ]; then
+  echo "prepush: Postgres is not scram-sha-256 like CI (encryption=${encryption} host_all=${host_all})" >&2
   exit 1
 fi
 
-redis_ready=0
-for _ in $(seq 1 60); do
-  if nc -z 127.0.0.1 6379 >/dev/null 2>&1; then
-    redis_ready=1
-    break
-  fi
-  sleep 1
-done
-if [ "$redis_ready" != 1 ]; then
-  echo "prepush: Redis did not become ready" >&2
+if ! nc -z 127.0.0.1 6379 >/dev/null 2>&1; then
+  echo "prepush: Redis is not accepting connections on 127.0.0.1:6379" >&2
   exit 1
+fi
+
+neo_name="${PREPUSH_NEO4J_CONTAINER:-prepush-nexus-neo4j}"
+if ! nc -z 127.0.0.1 7687 >/dev/null 2>&1; then
+  docker rm -f "$neo_name" >/dev/null 2>&1 || true
+  docker run -d --name "$neo_name" \
+    -e NEO4J_AUTH="${NEO4J_DB_USERNAME}/${NEO4J_PASSWORD}" \
+    -e NEO4J_server_memory_pagecache_size=1G \
+    -e NEO4J_server_memory_heap_initial__size=2G \
+    -e NEO4J_server_memory_heap_max__size=2G \
+    -e NEO4J_dbms_usage__report_enabled=false \
+    -e NEO4J_client_allow__telemetry=false \
+    -p 127.0.0.1:7474:7474 \
+    -p 127.0.0.1:7687:7687 \
+    neo4j:5.26.20-community >/dev/null
 fi
 
 neo_ready=0
@@ -97,9 +119,6 @@ if [ "$neo_ready" != 1 ]; then
   echo "prepush: Neo4j did not become ready" >&2
   exit 1
 fi
-
-echo "prepush: cargo fmt"
-cargo fmt --check
 
 echo "prepush: cargo clippy"
 run_heavy cargo clippy --workspace --all-targets -- -D warnings
