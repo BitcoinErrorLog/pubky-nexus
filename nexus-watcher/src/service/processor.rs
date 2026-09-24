@@ -4,7 +4,7 @@ use crate::events::handle;
 use crate::events::retry::event::RetryEvent;
 use crate::events::Moderation;
 use crate::service::traits::TEventProcessor;
-use crate::service::POLL_TIMEOUT_SECS;
+use crate::service::{POLL_TIMEOUT_SECS, RATE_LIMIT_BACKOFF_SECS};
 use nexus_common::db::PubkyConnector;
 use nexus_common::models::homeserver::Homeserver;
 use opentelemetry::trace::{FutureExt, Span, TraceContextExt, Tracer};
@@ -100,6 +100,16 @@ impl EventProcessor {
                 })??
         };
 
+        if is_rate_limit_response(&response_text) {
+            warn!(
+                retry_after_secs = RATE_LIMIT_BACKOFF_SECS,
+                homeserver = %self.homeserver.id,
+                "Homeserver rate-limited events poll; preserving cursor and backing off"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_BACKOFF_SECS)).await;
+            return Ok(None);
+        }
+
         let lines: Vec<String> = response_text.trim().lines().map(String::from).collect();
         debug!("Homeserver response lines {:?}", lines);
 
@@ -108,6 +118,12 @@ impl EventProcessor {
         }
 
         Ok(Some(lines))
+    }
+
+    fn is_rate_limit_response(response_text: &str) -> bool {
+        response_text
+            .trim()
+            .eq_ignore_ascii_case("rate limit exceeded")
     }
 
     /// Processes a batch of event lines retrieved from the homeserver.
@@ -202,4 +218,17 @@ fn extract_retry_event_info(
         }
     };
     Some((format!("{}:{}", event.event_type, index), retry_event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_rate_limit_response;
+
+    #[test]
+    fn recognizes_plain_text_events_rate_limit_response() {
+        assert!(is_rate_limit_response("Rate limit exceeded"));
+        assert!(is_rate_limit_response(" \nrate limit exceeded\r\n"));
+        assert!(!is_rate_limit_response("PUT pubky://example\ncursor: 42"));
+        assert!(!is_rate_limit_response("rate limit exceeded; retry later"));
+    }
 }
