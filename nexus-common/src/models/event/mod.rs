@@ -8,6 +8,17 @@ use tracing::{debug, error};
 
 pub use errors::EventProcessorError;
 
+/// Encrypted digital-delivery files. They are not public records, can be tens
+/// of megabytes, and Nexus never indexes them, so their events are dropped
+/// before any handler can fetch the body.
+pub const MARKETPLACE_DELIVERABLES_PATH: &str = "/pub/pubky.app/marketplace/v1/deliverables/";
+
+fn is_marketplace_deliverable(uri: &str) -> bool {
+    uri.strip_prefix("pubky://")
+        .and_then(|rest| rest.find('/').map(|slash| &rest[slash..]))
+        .is_some_and(|path| path.starts_with(MARKETPLACE_DELIVERABLES_PATH))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum EventType {
     Put,
@@ -67,6 +78,10 @@ impl Event {
 
         // Validate and parse the URI using pubky-app-specs
         let uri = parts[1].to_string();
+        if is_marketplace_deliverable(&uri) {
+            debug!("Skipping {event_type} for a marketplace deliverable");
+            return Ok(None);
+        }
         let parsed_uri = ParsedUri::try_from(uri.as_str()).map_err(|e| {
             EventProcessorError::InvalidEventLine(format!("Cannot parse event URI: {e}"))
         })?;
@@ -120,5 +135,70 @@ impl Event {
         let next_cursor = start + events.len() as u64;
 
         Ok((events, next_cursor))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const USER: &str = "operrr8wsbpr3ue9d4qj41ge1kcc6r7fdiy6o3ugjrrhi4y77rdo";
+
+    fn line(kind: &str, path: &str) -> String {
+        format!("{kind} pubky://{USER}{path}")
+    }
+
+    #[test]
+    fn deliverable_put_skipped_without_body_read() {
+        for path in [
+            "/pub/pubky.app/marketplace/v1/deliverables/0f6c2b1e9d7a4c3b/1",
+            "/pub/pubky.app/marketplace/v1/deliverables/0f6c2b1e9d7a4c3b/12",
+            "/pub/pubky.app/marketplace/v1/deliverables/x",
+        ] {
+            let parsed = Event::parse_event(&line("PUT", path), PathBuf::new())
+                .expect("a deliverable PUT is not an error");
+            assert!(parsed.is_none(), "{path} yields no event to handle");
+        }
+    }
+
+    #[test]
+    fn deliverable_del_skipped() {
+        let parsed = Event::parse_event(
+            &line(
+                "DEL",
+                "/pub/pubky.app/marketplace/v1/deliverables/0f6c2b1e9d7a4c3b/1",
+            ),
+            PathBuf::new(),
+        )
+        .expect("a deliverable DEL is not an error");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn deliverable_skip_is_prefix_exact() {
+        let listing = Event::parse_event(
+            &line("PUT", "/pub/pubky.app/marketplace/v1/listings/abc"),
+            PathBuf::new(),
+        )
+        .expect("listing parses")
+        .expect("listing is handled");
+        assert_eq!(listing.parsed_uri.resource, Resource::Listing("abc".into()));
+
+        for path in [
+            "/pub/pubky.app/marketplace/v1/deliverablesx/abc/1",
+            "/pub/pubky.app/marketplace/v1/media/abc",
+            "/pub/other.app/marketplace/v1/deliverables/abc/1",
+        ] {
+            assert!(
+                matches!(
+                    Event::parse_event(&line("PUT", path), PathBuf::new()),
+                    Err(EventProcessorError::InvalidEventLine(_))
+                ),
+                "{path} keeps the unknown-resource refusal"
+            );
+        }
+        assert!(!is_marketplace_deliverable(
+            "https://example.com/pub/pubky.app/marketplace/v1/deliverables/a/1"
+        ));
     }
 }
