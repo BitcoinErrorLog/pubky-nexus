@@ -568,8 +568,10 @@ pub fn get_global_hot_tags(tags_query: &HotTagsInputDTO) -> Query {
         "
         MATCH (user: User)-[tag:TAGGED]->(tagged:{})
         WHERE tag.indexed_at >= $from AND tag.indexed_at < $to
+        WITH tag.label AS label, user, tagged
+        ORDER BY user.id ASC
         WITH
-            tag.label AS label,
+            label,
             COLLECT(DISTINCT user.id)[..{}] AS taggers,
             COUNT(DISTINCT tagged) AS uniqueTaggedCount,
             COUNT(DISTINCT user.id) AS taggers_count
