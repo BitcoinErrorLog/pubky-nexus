@@ -100,7 +100,7 @@ impl EventProcessor {
                 })??
         };
 
-        if is_rate_limit_response(&response_text) {
+        if Self::is_rate_limit_response(&response_text) {
             warn!(
                 retry_after_secs = RATE_LIMIT_BACKOFF_SECS,
                 homeserver = %self.homeserver.id,
@@ -222,13 +222,21 @@ fn extract_retry_event_info(
 
 #[cfg(test)]
 mod tests {
-    use super::is_rate_limit_response;
+    use super::EventProcessor;
 
     #[test]
     fn recognizes_plain_text_events_rate_limit_response() {
-        assert!(is_rate_limit_response("Rate limit exceeded"));
-        assert!(is_rate_limit_response(" \nrate limit exceeded\r\n"));
-        assert!(!is_rate_limit_response("PUT pubky://example\ncursor: 42"));
-        assert!(!is_rate_limit_response("rate limit exceeded; retry later"));
+        assert!(EventProcessor::is_rate_limit_response(
+            "Rate limit exceeded"
+        ));
+        assert!(EventProcessor::is_rate_limit_response(
+            " \nrate limit exceeded\r\n"
+        ));
+        assert!(!EventProcessor::is_rate_limit_response(
+            "PUT pubky://example\ncursor: 42"
+        ));
+        assert!(!EventProcessor::is_rate_limit_response(
+            "rate limit exceeded; retry later"
+        ));
     }
 }
