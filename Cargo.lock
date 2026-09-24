@@ -4247,7 +4247,7 @@ dependencies = [
 [[package]]
 name = "pubky-app-specs"
 version = "0.6.2-marketplace.8"
-source = "git+https://github.com/BitcoinErrorLog/pubky-app-specs.git?rev=814d9bffb255c54f29cc5ed4947199c0cc512114#814d9bffb255c54f29cc5ed4947199c0cc512114"
+source = "git+https://github.com/BitcoinErrorLog/pubky-app-specs.git?rev=2f2797a8deeddcc44326bbc680aa30d47339454e#2f2797a8deeddcc44326bbc680aa30d47339454e"
 dependencies = [
  "base32",
  "blake3",
@@ -6887,7 +6887,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
