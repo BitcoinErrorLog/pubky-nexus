@@ -55,7 +55,7 @@ async fn rate_limited_homeserver_does_not_consume_the_next_poll_slot() -> Result
     };
 
     for hs_id in &HS_IDS[..2] {
-        Homeserver::new(PubkyId::try_from(*hs_id).unwrap())
+        Homeserver::new(PubkyId::try_from(hs_id).unwrap())
             .put_to_graph()
             .await
             .unwrap();
