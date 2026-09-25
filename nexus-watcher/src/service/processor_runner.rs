@@ -1,6 +1,6 @@
 use crate::events::Moderation;
-use crate::service::processor::EventProcessor;
 use crate::service::traits::{TEventProcessor, TEventProcessorRunner};
+use crate::service::{processor::EventProcessor, HomeserverPollBackoff};
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::types::DynError;
 use nexus_common::WatcherConfig;
@@ -20,6 +20,7 @@ pub struct EventProcessorRunner {
     pub shutdown_rx: Receiver<bool>,
     /// See [WatcherConfig::homeserver]
     pub default_homeserver: PubkyId,
+    pub poll_backoff: Arc<HomeserverPollBackoff>,
 }
 
 impl EventProcessorRunner {
@@ -36,6 +37,7 @@ impl EventProcessorRunner {
             }),
             shutdown_rx,
             default_homeserver: config.homeserver.clone(),
+            poll_backoff: Arc::new(HomeserverPollBackoff::default()),
         }
     }
 }
@@ -69,6 +71,13 @@ impl TEventProcessorRunner for EventProcessorRunner {
         Ok(hs_ids)
     }
 
+    async fn pre_run_all(&self) -> Result<Vec<String>, DynError> {
+        let hs_ids = self.homeservers_by_priority().await?;
+        Ok(self
+            .poll_backoff
+            .eligible(&hs_ids, self.monitored_homeservers_limit))
+    }
+
     /// Creates and returns a new event processor instance for the specified homeserver
     async fn build(&self, homeserver_id: String) -> Result<Arc<dyn TEventProcessor>, DynError> {
         let homeserver_id = PubkyId::try_from(&homeserver_id)?;
@@ -84,6 +93,7 @@ impl TEventProcessorRunner for EventProcessorRunner {
             tracer_name: self.tracer_name.clone(),
             moderation: self.moderation.clone(),
             shutdown_rx: self.shutdown_rx.clone(),
+            poll_backoff: self.poll_backoff.clone(),
         }))
     }
 }

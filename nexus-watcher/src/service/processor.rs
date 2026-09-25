@@ -4,7 +4,7 @@ use crate::events::handle;
 use crate::events::retry::event::RetryEvent;
 use crate::events::Moderation;
 use crate::service::traits::TEventProcessor;
-use crate::service::{POLL_TIMEOUT_SECS, RATE_LIMIT_BACKOFF_SECS};
+use crate::service::{HomeserverPollBackoff, POLL_TIMEOUT_SECS, RATE_LIMIT_BACKOFF_SECS};
 use nexus_common::db::PubkyConnector;
 use nexus_common::models::homeserver::Homeserver;
 use opentelemetry::trace::{FutureExt, Span, TraceContextExt, Tracer};
@@ -13,6 +13,7 @@ use pubky::Method;
 use pubky_app_specs::PubkyId;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch::Receiver;
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +25,7 @@ pub struct EventProcessor {
     pub tracer_name: String,
     pub moderation: Arc<Moderation>,
     pub shutdown_rx: Receiver<bool>,
+    pub poll_backoff: Arc<HomeserverPollBackoff>,
 }
 
 #[async_trait::async_trait]
@@ -104,9 +106,12 @@ impl EventProcessor {
             warn!(
                 retry_after_secs = RATE_LIMIT_BACKOFF_SECS,
                 homeserver = %self.homeserver.id,
-                "Homeserver rate-limited events poll; preserving cursor and backing off"
+                "Homeserver rate-limited events poll; preserving cursor and deferring only this feed"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(RATE_LIMIT_BACKOFF_SECS)).await;
+            self.poll_backoff.defer(
+                self.homeserver.id.as_ref(),
+                Duration::from_secs(RATE_LIMIT_BACKOFF_SECS),
+            );
             return Ok(None);
         }
 
