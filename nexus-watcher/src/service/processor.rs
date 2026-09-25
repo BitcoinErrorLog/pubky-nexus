@@ -102,16 +102,11 @@ impl EventProcessor {
                 })??
         };
 
-        if Self::is_rate_limit_response(&response_text) {
-            warn!(
-                retry_after_secs = RATE_LIMIT_BACKOFF_SECS,
-                homeserver = %self.homeserver.id,
-                "Homeserver rate-limited events poll; preserving cursor and deferring only this feed"
-            );
-            self.poll_backoff.defer(
-                self.homeserver.id.as_ref(),
-                Duration::from_secs(RATE_LIMIT_BACKOFF_SECS),
-            );
+        if Self::defer_rate_limited_feed(
+            &response_text,
+            self.homeserver.id.as_ref(),
+            &self.poll_backoff,
+        ) {
             return Ok(None);
         }
 
@@ -129,6 +124,24 @@ impl EventProcessor {
         response_text
             .trim()
             .eq_ignore_ascii_case("rate limit exceeded")
+    }
+
+    fn defer_rate_limited_feed(
+        response_text: &str,
+        homeserver_id: &str,
+        poll_backoff: &HomeserverPollBackoff,
+    ) -> bool {
+        if !Self::is_rate_limit_response(response_text) {
+            return false;
+        }
+
+        warn!(
+            retry_after_secs = RATE_LIMIT_BACKOFF_SECS,
+            homeserver = homeserver_id,
+            "Homeserver rate-limited events poll; preserving cursor and deferring only this feed"
+        );
+        poll_backoff.defer(homeserver_id, Duration::from_secs(RATE_LIMIT_BACKOFF_SECS));
+        true
     }
 
     /// Processes a batch of event lines retrieved from the homeserver.
@@ -227,7 +240,7 @@ fn extract_retry_event_info(
 
 #[cfg(test)]
 mod tests {
-    use super::EventProcessor;
+    use super::{EventProcessor, HomeserverPollBackoff};
 
     #[test]
     fn recognizes_plain_text_events_rate_limit_response() {
@@ -243,5 +256,20 @@ mod tests {
         assert!(!EventProcessor::is_rate_limit_response(
             "rate limit exceeded; retry later"
         ));
+    }
+
+    #[test]
+    fn rate_limited_feed_is_deferred_without_blocking_a_healthy_feed() {
+        let backoff = HomeserverPollBackoff::default();
+        let stored_cursor = "0000000000042";
+
+        assert!(EventProcessor::defer_rate_limited_feed(
+            "Rate limit exceeded",
+            "rate-limited",
+            &backoff
+        ));
+        assert_eq!(stored_cursor, "0000000000042");
+        assert!(!backoff.is_allowed("rate-limited"));
+        assert!(backoff.is_allowed("healthy"));
     }
 }
