@@ -12,8 +12,8 @@ use nexus_common::models::traits::Collection;
 use nexus_watcher::events::retry::event::RetryEvent;
 use nexus_watcher::events::{handle, Moderation};
 use nexus_watcher::service::EventProcessorRunner;
-use nexus_watcher::service::NexusWatcher;
 use nexus_watcher::service::TEventProcessorRunner;
+use nexus_watcher::service::{HomeserverPollBackoff, NexusWatcher};
 use pubky::Keypair;
 use pubky::PublicKey;
 use pubky::ResourcePath;
@@ -89,6 +89,7 @@ impl WatcherTest {
             moderation,
             shutdown_rx,
             default_homeserver,
+            poll_backoff: Arc::new(HomeserverPollBackoff::default()),
         }
     }
 
