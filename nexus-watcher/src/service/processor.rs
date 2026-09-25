@@ -4,7 +4,7 @@ use crate::events::handle;
 use crate::events::retry::event::RetryEvent;
 use crate::events::Moderation;
 use crate::service::traits::TEventProcessor;
-use crate::service::POLL_TIMEOUT_SECS;
+use crate::service::{HomeserverPollBackoff, POLL_TIMEOUT_SECS, RATE_LIMIT_BACKOFF_SECS};
 use nexus_common::db::PubkyConnector;
 use nexus_common::models::homeserver::Homeserver;
 use opentelemetry::trace::{FutureExt, Span, TraceContextExt, Tracer};
@@ -13,6 +13,7 @@ use pubky::Method;
 use pubky_app_specs::PubkyId;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch::Receiver;
 use tracing::{debug, error, info, warn};
 
@@ -24,6 +25,7 @@ pub struct EventProcessor {
     pub tracer_name: String,
     pub moderation: Arc<Moderation>,
     pub shutdown_rx: Receiver<bool>,
+    pub poll_backoff: Arc<HomeserverPollBackoff>,
 }
 
 #[async_trait::async_trait]
@@ -100,6 +102,14 @@ impl EventProcessor {
                 })??
         };
 
+        if Self::defer_rate_limited_feed(
+            &response_text,
+            self.homeserver.id.as_ref(),
+            &self.poll_backoff,
+        ) {
+            return Ok(None);
+        }
+
         let lines: Vec<String> = response_text.trim().lines().map(String::from).collect();
         debug!("Homeserver response lines {:?}", lines);
 
@@ -108,6 +118,30 @@ impl EventProcessor {
         }
 
         Ok(Some(lines))
+    }
+
+    fn is_rate_limit_response(response_text: &str) -> bool {
+        response_text
+            .trim()
+            .eq_ignore_ascii_case("rate limit exceeded")
+    }
+
+    fn defer_rate_limited_feed(
+        response_text: &str,
+        homeserver_id: &str,
+        poll_backoff: &HomeserverPollBackoff,
+    ) -> bool {
+        if !Self::is_rate_limit_response(response_text) {
+            return false;
+        }
+
+        warn!(
+            retry_after_secs = RATE_LIMIT_BACKOFF_SECS,
+            homeserver = homeserver_id,
+            "Homeserver rate-limited events poll; preserving cursor and deferring only this feed"
+        );
+        poll_backoff.defer(homeserver_id, Duration::from_secs(RATE_LIMIT_BACKOFF_SECS));
+        true
     }
 
     /// Processes a batch of event lines retrieved from the homeserver.
@@ -202,4 +236,40 @@ fn extract_retry_event_info(
         }
     };
     Some((format!("{}:{}", event.event_type, index), retry_event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventProcessor, HomeserverPollBackoff};
+
+    #[test]
+    fn recognizes_plain_text_events_rate_limit_response() {
+        assert!(EventProcessor::is_rate_limit_response(
+            "Rate limit exceeded"
+        ));
+        assert!(EventProcessor::is_rate_limit_response(
+            " \nrate limit exceeded\r\n"
+        ));
+        assert!(!EventProcessor::is_rate_limit_response(
+            "PUT pubky://example\ncursor: 42"
+        ));
+        assert!(!EventProcessor::is_rate_limit_response(
+            "rate limit exceeded; retry later"
+        ));
+    }
+
+    #[test]
+    fn rate_limited_feed_is_deferred_without_blocking_a_healthy_feed() {
+        let backoff = HomeserverPollBackoff::default();
+        let stored_cursor = "0000000000042";
+
+        assert!(EventProcessor::defer_rate_limited_feed(
+            "Rate limit exceeded",
+            "rate-limited",
+            &backoff
+        ));
+        assert_eq!(stored_cursor, "0000000000042");
+        assert!(!backoff.is_allowed("rate-limited"));
+        assert!(backoff.is_allowed("healthy"));
+    }
 }

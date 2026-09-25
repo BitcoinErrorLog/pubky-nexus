@@ -1,12 +1,16 @@
 mod constants;
+mod poll_backoff;
 mod processor;
 mod processor_runner;
 mod stats;
 mod traits;
 
 /// Module exports
-pub use constants::{POLL_TIMEOUT_SECS, PROCESSING_TIMEOUT_SECS, WATCHER_CONFIG_FILE_NAME};
+pub use constants::{
+    POLL_TIMEOUT_SECS, PROCESSING_TIMEOUT_SECS, RATE_LIMIT_BACKOFF_SECS, WATCHER_CONFIG_FILE_NAME,
+};
 use nexus_common::types::DynError;
+pub use poll_backoff::HomeserverPollBackoff;
 pub use processor::EventProcessor;
 pub use processor_runner::EventProcessorRunner;
 pub use traits::{TEventProcessor, TEventProcessorRunner};
