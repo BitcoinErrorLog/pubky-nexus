@@ -6,12 +6,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 start=$(date +%s)
-LOCK="/Volumes/t7/vibes-dev/.locks/heavy.lock"
-
-run_heavy() {
-  mkdir -p "$(dirname "$LOCK")"
-  lockf "$LOCK" "$@"
-}
+# shellcheck source=heavy-lock.sh
+source "$ROOT/scripts/heavy-lock.sh"
 
 if [ ! -t 0 ]; then
   skip=1
@@ -147,7 +143,7 @@ if [ "$neo_ready" != 1 ]; then
 fi
 
 echo "prepush: cargo clippy"
-run_heavy cargo clippy --workspace --all-targets -- -D warnings
+run_heavy cargo cargo clippy --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
 # One Redis and one Neo4j. --lib --bins --tests skips doctests; two examples
@@ -157,7 +153,7 @@ echo "prepush: cargo test"
 # process, so later homeservers are not on the first client's DHT. CI runs
 # nextest, one process per test. -j 1 keeps that isolation on the shared
 # Redis and Neo4j.
-run_heavy bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --lib --bins --tests --exclude nexus-watcher --no-fail-fast -- --test-threads=1 && cargo nextest run -p nexus-watcher --no-fail-fast -j 1'
+run_heavy cargo bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --lib --bins --tests --exclude nexus-watcher --no-fail-fast -- --test-threads=1 && cargo nextest run -p nexus-watcher --no-fail-fast -j 1'
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"
