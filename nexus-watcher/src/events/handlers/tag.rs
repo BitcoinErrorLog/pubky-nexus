@@ -471,8 +471,9 @@ pub enum TagTarget<'a> {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetTagCleanupStep {
-    TaggerCounted,
+    EdgesRead,
     EdgeDeleted,
+    TaggerCounted,
     TaggersPurged,
     TimelinePurged,
     SearchPruned,
@@ -507,16 +508,34 @@ impl TagTarget<'_> {
         }
     }
 
-    /// The set of `tagger:tag_id` members whose tagger count was already
-    /// decremented by this target's cleanup.
-    fn claim_key(self) -> String {
+    /// Names the target on its `TagCleanup` markers.
+    fn marker_target(self) -> String {
         match self {
             TagTarget::Listing {
                 owner_id,
                 listing_id,
-            } => format!("Cleanup:Tags:Listing:{owner_id}:{listing_id}"),
-            TagTarget::Shop { owner_id } => format!("Cleanup:Tags:Shop:{owner_id}"),
+            } => format!("listing:{owner_id}:{listing_id}"),
+            TagTarget::Shop { owner_id } => format!("shop:{owner_id}"),
         }
+    }
+
+    fn edges_to_markers_query(self) -> Query {
+        let target = self.marker_target();
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => queries::del::listing_tags_to_cleanup_markers(owner_id, listing_id, &target),
+            TagTarget::Shop { owner_id } => {
+                queries::del::shop_tags_to_cleanup_markers(owner_id, &target)
+            }
+        }
+    }
+
+    /// The set of marker ids whose tagger count this cleanup already
+    /// decremented.
+    fn claim_key(self) -> String {
+        format!("Cleanup:Tags:{}", self.marker_target())
     }
 
     fn score_key(self) -> Vec<String> {
@@ -646,13 +665,19 @@ impl TagTarget<'_> {
 /// tag search, tagger counts); left behind, they would reattach to a record
 /// re-created at the same id.
 ///
-/// Retry-safe at every step: a tagger's `tagged` count is decremented once
-/// per edge through a claim set, and only then is the edge deleted, so a
-/// failure on either side repeats neither; each label's target indexes are
-/// purged idempotently and its score entry goes last, so a retry still finds
-/// the label after its edges are gone. Rounds repeat until the target has no
-/// edge and no indexed label, which also sweeps a tag that landed while the
-/// cleanup ran.
+/// Retry-safe at every step, and exact under racing tag events:
+/// - One Cypher statement deletes the target's edges and leaves a
+///   `TagCleanup` marker, with a fresh id, per edge it deleted. A tagger's
+///   own untag that removes an edge first leaves no marker and counts itself
+///   down; one that arrives after finds no edge and counts nothing.
+/// - Each marker's tagger `tagged` count is decremented once through a
+///   claim on the marker id, then the marker is deleted. A re-tag during the
+///   cleanup is a new edge, so a later round gives it a new marker.
+/// - Each label's target indexes are purged idempotently and its score entry
+///   goes last, so a retry still finds the label once its edges are gone.
+///
+/// Rounds repeat until the target has no edge, no marker and no indexed
+/// label, which also sweeps a tag that landed while the cleanup ran.
 pub async fn del_target_tags(target: TagTarget<'_>) -> Result<(), EventProcessorError> {
     del_target_tags_with_hook(target, &NoopTargetTagCleanupHook).await
 }
@@ -665,33 +690,44 @@ pub async fn del_target_tags_with_hook(
     hook: &dyn TargetTagCleanupHook,
 ) -> Result<(), EventProcessorError> {
     let claim_key = target.claim_key();
+    let marker_target = target.marker_target();
     for _ in 0..TARGET_TAG_ROUNDS {
-        let rows = fetch_all_rows_from_graph(target.edges_query()).await?;
+        let edges = fetch_all_rows_from_graph(target.edges_query()).await?;
+        let mut markers =
+            fetch_all_rows_from_graph(queries::get::tag_cleanup_markers(&marker_target)).await?;
         let mut labels = target.indexed_labels().await?;
-        if rows.is_empty() && labels.is_empty() {
+        if edges.is_empty() && markers.is_empty() && labels.is_empty() {
             del_key(&claim_key).await?;
             return Ok(());
         }
-        for row in rows {
-            let tagger_id: String = row
-                .get("tagger_id")
-                .map_err(EventProcessorError::graph_query_failed)?;
-            let tag_id: String = row
-                .get("tag_id")
-                .map_err(EventProcessorError::graph_query_failed)?;
+        for row in &edges {
             let label: String = row
                 .get("label")
                 .map_err(EventProcessorError::graph_query_failed)?;
-            UserCounts::decrement_once(
-                &tagger_id,
-                "tagged",
-                &claim_key,
-                &format!("{tagger_id}:{tag_id}"),
-            )
-            .await?;
-            hook.at(TargetTagCleanupStep::TaggerCounted).await?;
-            exec_single_row(queries::del::delete_tag(&tagger_id, &tag_id)).await?;
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        hook.at(TargetTagCleanupStep::EdgesRead).await?;
+        if !edges.is_empty() {
+            exec_single_row(target.edges_to_markers_query()).await?;
             hook.at(TargetTagCleanupStep::EdgeDeleted).await?;
+            markers = fetch_all_rows_from_graph(queries::get::tag_cleanup_markers(&marker_target))
+                .await?;
+        }
+        for marker in markers {
+            let id: String = marker
+                .get("id")
+                .map_err(EventProcessorError::graph_query_failed)?;
+            let tagger_id: String = marker
+                .get("tagger_id")
+                .map_err(EventProcessorError::graph_query_failed)?;
+            let label: String = marker
+                .get("label")
+                .map_err(EventProcessorError::graph_query_failed)?;
+            UserCounts::decrement_once(&tagger_id, "tagged", &claim_key, &id).await?;
+            hook.at(TargetTagCleanupStep::TaggerCounted).await?;
+            exec_single_row(queries::del::delete_tag_cleanup_marker(&id)).await?;
             if !labels.contains(&label) {
                 labels.push(label);
             }

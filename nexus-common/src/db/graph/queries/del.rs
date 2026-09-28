@@ -85,6 +85,44 @@ pub fn delete_tag(user_id: &str, tag_id: &str) -> Query {
     .param("tag_id", tag_id)
 }
 
+/// Deletes every `TAGGED` edge on a marketplace listing and, in the same
+/// statement, leaves one `TagCleanup` marker per deleted edge naming its
+/// tagger, tag id and label. The marker id is fresh per deleted edge.
+pub fn listing_tags_to_cleanup_markers(owner_id: &str, listing_id: &str, target: &str) -> Query {
+    Query::new(
+        "listing_tags_to_cleanup_markers",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Listing {id: $listing_id, owner_id: $owner_id})
+         CREATE (:TagCleanup {id: randomUUID(), target: $target, tagger_id: tagger.id,
+                              tag_id: tag.id, label: tag.label})
+         DELETE tag",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+    .param("target", target)
+}
+
+/// [`listing_tags_to_cleanup_markers`] for a marketplace shop.
+pub fn shop_tags_to_cleanup_markers(owner_id: &str, target: &str) -> Query {
+    Query::new(
+        "shop_tags_to_cleanup_markers",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Shop {owner_id: $owner_id})
+         CREATE (:TagCleanup {id: randomUUID(), target: $target, tagger_id: tagger.id,
+                              tag_id: tag.id, label: tag.label})
+         DELETE tag",
+    )
+    .param("owner_id", owner_id)
+    .param("target", target)
+}
+
+/// Deletes one `TagCleanup` marker once its tagger count is settled.
+pub fn delete_tag_cleanup_marker(id: &str) -> Query {
+    Query::new(
+        "delete_tag_cleanup_marker",
+        "MATCH (c:TagCleanup {id: $id}) DELETE c",
+    )
+    .param("id", id)
+}
+
 /// Deletes the shop node of a seller and all its relationships
 /// # Arguments
 /// * `owner_id` - The unique identifier of the user who owns the shop

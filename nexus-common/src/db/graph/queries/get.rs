@@ -299,6 +299,16 @@ pub fn shop_tag_edges(owner_id: &str) -> Query {
     .param("owner_id", owner_id)
 }
 
+/// The `TagCleanup` markers a marketplace target's DEL still has to settle
+pub fn tag_cleanup_markers(target: &str) -> Query {
+    Query::new(
+        "tag_cleanup_markers",
+        "MATCH (c:TagCleanup {target: $target})
+         RETURN c.id AS id, c.tagger_id AS tagger_id, c.tag_id AS tag_id, c.label AS label",
+    )
+    .param("target", target)
+}
+
 /// Whether any `TAGGED` edge, on any target type, still carries the label
 pub fn tag_label_in_use(label: &str) -> Query {
     Query::new(

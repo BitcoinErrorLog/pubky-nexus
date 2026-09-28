@@ -65,6 +65,33 @@ impl TargetTagCleanupHook for TagLandsAt {
     }
 }
 
+/// Runs the tagger's own untag of one tag through the tag DEL handler, as
+/// a concurrently processed DEL event would, the first time the step is hit.
+struct UntagAt {
+    step: TargetTagCleanupStep,
+    tagger_id: PubkyId,
+    tag_id: String,
+    fired: AtomicBool,
+}
+
+#[async_trait]
+impl TargetTagCleanupHook for UntagAt {
+    async fn at(&self, step: TargetTagCleanupStep) -> Result<(), EventProcessorError> {
+        if step == self.step && !self.fired.swap(true, Ordering::SeqCst) {
+            match nexus_watcher::events::handlers::tag::del(
+                self.tagger_id.clone(),
+                self.tag_id.clone(),
+            )
+            .await
+            {
+                Ok(()) | Err(EventProcessorError::SkipIndexing) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
 async fn user(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
     let kp = Keypair::random();
     let user = PubkyAppUser {
@@ -145,8 +172,9 @@ async fn listing_tag_cleanup_retried_after_a_failure_at_any_step_ends_clean() ->
     let mut test = WatcherTest::setup().await?;
 
     for (round, step) in [
-        TargetTagCleanupStep::TaggerCounted,
+        TargetTagCleanupStep::EdgesRead,
         TargetTagCleanupStep::EdgeDeleted,
+        TargetTagCleanupStep::TaggerCounted,
         TargetTagCleanupStep::TaggersPurged,
         TargetTagCleanupStep::TimelinePurged,
         TargetTagCleanupStep::SearchPruned,
@@ -382,5 +410,115 @@ async fn untagging_a_shop_or_listing_prunes_autocomplete_only_when_unused() -> R
     test.del(&owner_kp, &shop_path).await?;
     test.cleanup_user(&a_kp).await?;
     test.cleanup_user(&owner_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_taggers_untag_racing_the_cleanup_is_counted_once() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    for (round, step) in [
+        TargetTagCleanupStep::EdgesRead,
+        TargetTagCleanupStep::EdgeDeleted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (seller_kp, seller_id) = user(&mut test, "Untag:Seller").await?;
+        let (a_kp, a_id) = user(&mut test, "Untag:TaggerA").await?;
+        let listing = test_listing(
+            &seller_id,
+            "Untag race boots",
+            "fashion",
+            PubkyAppListingCondition::New,
+            1_000,
+        );
+        let (listing_id, listing_path) = test.create_listing(&seller_kp, &listing).await?;
+        let label = format!("ur{round}{}", &seller_id[..6]);
+        let keep = format!("uk{round}{}", &seller_id[..6]);
+        let listing_tag = tag(
+            &mut test,
+            &a_kp,
+            listing_uri_builder(seller_id.clone(), listing_id.clone()),
+            &label,
+        )
+        .await?;
+        tag(&mut test, &a_kp, user_uri_builder(seller_id.clone()), &keep).await?;
+        assert_eq!(find_user_counts(&a_id).await.tagged, 2);
+
+        // The tagger's own DEL of the listing tag lands before the cleanup
+        // deletes the edge, or right after.
+        let untag = UntagAt {
+            step,
+            tagger_id: PubkyId::try_from(a_id.as_str()).map_err(anyhow::Error::msg)?,
+            tag_id: listing_tag.create_id(),
+            fired: AtomicBool::new(false),
+        };
+        del_target_tags_with_hook(
+            TagTarget::Listing {
+                owner_id: &seller_id,
+                listing_id: &listing_id,
+            },
+            &untag,
+        )
+        .await?;
+        assert!(untag.fired.load(Ordering::SeqCst));
+        assert_eq!(find_user_counts(&a_id).await.tagged, 1, "{step:?}");
+        listing_is_untagged(&seller_id, &listing_id, &[&label]).await?;
+
+        test.del(&seller_kp, &listing_path).await?;
+        test.cleanup_user(&a_kp).await?;
+        test.cleanup_user(&seller_kp).await?;
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_retag_during_a_multi_round_cleanup_is_counted() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, seller_id) = user(&mut test, "Retag:Seller").await?;
+    let (a_kp, a_id) = user(&mut test, "Retag:TaggerA").await?;
+    let listing = test_listing(
+        &seller_id,
+        "Retag race boots",
+        "fashion",
+        PubkyAppListingCondition::New,
+        1_000,
+    );
+    let (listing_id, listing_path) = test.create_listing(&seller_kp, &listing).await?;
+    let label = format!("rt{}", &seller_id[..8]);
+    let keep = format!("rk{}", &seller_id[..8]);
+    let listing_tag = tag(
+        &mut test,
+        &a_kp,
+        listing_uri_builder(seller_id.clone(), listing_id.clone()),
+        &label,
+    )
+    .await?;
+    tag(&mut test, &a_kp, user_uri_builder(seller_id.clone()), &keep).await?;
+    assert_eq!(find_user_counts(&a_id).await.tagged, 2);
+
+    // After the first edge is counted down, the same tagger tags the same
+    // label again: the same deterministic tag id, a new edge.
+    let retag = TagLandsAt {
+        step: TargetTagCleanupStep::TaggerCounted,
+        tagger_id: PubkyId::try_from(a_id.as_str()).map_err(anyhow::Error::msg)?,
+        tag: listing_tag,
+        fired: AtomicBool::new(false),
+    };
+    del_target_tags_with_hook(
+        TagTarget::Listing {
+            owner_id: &seller_id,
+            listing_id: &listing_id,
+        },
+        &retag,
+    )
+    .await?;
+    assert!(retag.fired.load(Ordering::SeqCst));
+    assert_eq!(find_user_counts(&a_id).await.tagged, 1);
+    listing_is_untagged(&seller_id, &listing_id, &[&label]).await?;
+
+    test.del(&seller_kp, &listing_path).await?;
+    test.cleanup_user(&a_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
     Ok(())
 }
