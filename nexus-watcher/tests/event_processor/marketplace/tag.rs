@@ -266,7 +266,7 @@ async fn deleting_a_tagged_listing_clears_its_tag_indexes() -> Result<()> {
         12_000,
     );
     let (listing_id, listing_path) = test.create_listing(&seller_kp, &listing).await?;
-    let label = "deleted-listing-label";
+    let label = "gone-listing";
     let tag = PubkyAppTag {
         uri: listing_uri_builder(seller_id.clone(), listing_id.clone()),
         label: label.to_string(),
@@ -367,7 +367,7 @@ async fn deleting_a_tagged_shop_clears_its_tag_indexes() -> Result<()> {
         .await?;
     let tag = PubkyAppTag {
         uri: shop_uri_builder(owner_id.clone()),
-        label: "deleted-shop-label".to_string(),
+        label: "gone-shop".to_string(),
         created_at: Utc::now().timestamp_millis(),
     };
     let tag_path = tag.hs_path();
