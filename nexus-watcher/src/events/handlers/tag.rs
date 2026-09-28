@@ -2,8 +2,9 @@ use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 
 use chrono::Utc;
+use nexus_common::db::graph::Query;
 use nexus_common::db::kv::ScoreAction;
-use nexus_common::db::OperationOutcome;
+use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome};
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::marketplace::ListingsByTagSearch;
 use nexus_common::models::notification::Notification;
@@ -448,6 +449,33 @@ pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorE
         }
     } else {
         return Err(EventProcessorError::SkipIndexing);
+    }
+    Ok(())
+}
+
+/// Deletes every community tag on a marketplace target (listing or shop)
+/// whose own DEL is being processed, through the tagger's tag DEL path.
+/// `DETACH DELETE` of the target removes the `TAGGED` edges from the graph
+/// but cannot reach their Redis indexes (label scores, taggers, the global
+/// label timeline, tag search, tagger counts); left behind, they would
+/// reattach to a record re-created at the same id. Each edge is deleted
+/// before its indexes, so a retried target DEL resumes with the edges that
+/// remain.
+pub async fn del_target_tags(edges: Query) -> Result<(), EventProcessorError> {
+    let rows = fetch_all_rows_from_graph(edges).await?;
+    for row in rows {
+        let tagger_id: String = row
+            .get("tagger_id")
+            .map_err(EventProcessorError::graph_query_failed)?;
+        let tag_id: String = row
+            .get("tag_id")
+            .map_err(EventProcessorError::graph_query_failed)?;
+        let tagger_id =
+            PubkyId::try_from(tagger_id.as_str()).map_err(EventProcessorError::generic)?;
+        match del(tagger_id, tag_id).await {
+            Ok(()) | Err(EventProcessorError::SkipIndexing) => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

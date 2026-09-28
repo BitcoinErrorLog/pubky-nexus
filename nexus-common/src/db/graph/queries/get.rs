@@ -278,6 +278,27 @@ pub fn listing_tags(owner_id: &str, listing_id: &str) -> Query {
     .param("listing_id", listing_id)
 }
 
+/// The `TAGGED` edges on a marketplace listing as `(tagger_id, tag_id)` rows
+pub fn listing_tag_edges(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "listing_tag_edges",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Listing {id: $listing_id, owner_id: $owner_id})
+         RETURN tagger.id AS tagger_id, tag.id AS tag_id",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
+/// The `TAGGED` edges on a marketplace shop as `(tagger_id, tag_id)` rows
+pub fn shop_tag_edges(owner_id: &str) -> Query {
+    Query::new(
+        "shop_tag_edges",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Shop {owner_id: $owner_id})
+         RETURN tagger.id AS tagger_id, tag.id AS tag_id",
+    )
+    .param("owner_id", owner_id)
+}
+
 // Retrieve all the tags of a marketplace shop
 pub fn shop_tags(owner_id: &str) -> Query {
     Query::new(
