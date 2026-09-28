@@ -51,7 +51,7 @@ impl ListingStreamQuery {
         ("state" = Option<PubkyAppListingState>, Query, description = "Filter listings by lifecycle state: active, paused, ended or removed"),
         ("min_price" = Option<f64>, Query, description = "Filter listings with a price greater than or equal to this value, expressed in major units of `currency`. Requires the currency parameter"),
         ("max_price" = Option<f64>, Query, description = "Filter listings with a price less than or equal to this value, expressed in major units of `currency`. Requires the currency parameter"),
-        ("currency" = Option<String>, Query, description = "Filter listings by their uppercase asset code. E.g., `USD` or `SAT`"),
+        ("currency" = Option<String>, Query, description = "Filter listings by their uppercase asset code. E.g., `USD` or `BTC`"),
         ("country" = Option<String>, Query, description = "Filter listings by the seller-declared item location: an ISO-3166-1 alpha-2 country code (e.g. `HR`), case-insensitive"),
         ("tags" = Option<String>, Query, description = "Filter listings by community tag labels, comma-separated (e.g. `handmade,vintage`). A listing matches when any user has tagged it with one of the labels"),
         ("order" = Option<SortOrder>, Query, description = "Ordering of response list. Either 'ascending' or 'descending'. Defaults to descending."),
