@@ -870,7 +870,7 @@ async fn a_label_tagged_during_the_autocomplete_prune_stays_suggested() -> Resul
     let (owner_kp, owner_id) = user(&mut test, "Prune:Owner").await?;
     let (a_kp, a_id) = user(&mut test, "Prune:Tagger").await?;
     let label = format!("pr{}", &owner_id[..8]);
-    TagSearch::put_to_index(&[label.clone()]).await?;
+    TagSearch::put_to_index(std::slice::from_ref(&label)).await?;
     let tag = PubkyAppTag {
         uri: user_uri_builder(owner_id.clone()),
         label: label.clone(),
