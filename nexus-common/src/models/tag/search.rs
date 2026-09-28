@@ -60,14 +60,37 @@ impl TagSearch {
     /// target type (post, user, listing, shop) still carries it. Call after
     /// the deleted edge is gone from the graph.
     pub async fn del_from_index_if_unused(tag_label: &str) -> ModelResult<()> {
+        Self::del_from_index_if_unused_with_hook(tag_label, async {}).await
+    }
+
+    /// [`Self::del_from_index_if_unused`] with `between` awaited after the
+    /// first in-use check and before the removal. Production callers use
+    /// [`Self::del_from_index_if_unused`].
+    #[doc(hidden)]
+    pub async fn del_from_index_if_unused_with_hook(
+        tag_label: &str,
+        between: impl std::future::Future<Output = ()>,
+    ) -> ModelResult<()> {
+        if Self::label_in_use(tag_label).await? {
+            return Ok(());
+        }
+        between.await;
+        Self::del_from_index(tag_label).await?;
+        // A tag PUT adds the label only after its edge commits. An edge that
+        // committed before the removal is seen here and the label goes back;
+        // a PUT that indexes after the removal re-adds the label itself.
+        if Self::label_in_use(tag_label).await? {
+            Self::put_to_index(&[tag_label.to_string()]).await?;
+        }
+        Ok(())
+    }
+
+    async fn label_in_use(tag_label: &str) -> ModelResult<bool> {
         let in_use: Option<bool> = fetch_key_from_graph(
             crate::db::queries::get::tag_label_in_use(tag_label),
             "in_use",
         )
         .await?;
-        if in_use != Some(true) {
-            Self::del_from_index(tag_label).await?;
-        }
-        Ok(())
+        Ok(in_use == Some(true))
     }
 }

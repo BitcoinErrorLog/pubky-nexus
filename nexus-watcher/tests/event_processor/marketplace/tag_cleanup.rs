@@ -4,15 +4,19 @@ use crate::event_processor::utils::watcher::{HomeserverHashIdPath, HomeserverPat
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
+use nexus_common::db::graph::Query;
+use nexus_common::db::kv::sets;
+use nexus_common::db::{fetch_key_from_graph, Neo4JConfig, RedisOps};
 use nexus_common::models::event::EventProcessorError;
 use nexus_common::models::marketplace::ListingsByTagSearch;
 use nexus_common::models::tag::listing::TagListing;
 use nexus_common::models::tag::search::TagSearch;
 use nexus_common::models::tag::shop::TagShop;
 use nexus_common::models::tag::traits::{TagCollection, TaggersCollection};
+use nexus_common::models::user::UserCounts;
 use nexus_common::types::Pagination;
 use nexus_watcher::events::handlers::tag::{
-    del_target_tags, del_target_tags_with_hook, TagTarget, TargetTagCleanupHook,
+    del_tagged_target, del_tagged_target_with_hook, TagTarget, TargetTagCleanupHook,
     TargetTagCleanupStep,
 };
 use pubky::Keypair;
@@ -174,10 +178,12 @@ async fn listing_tag_cleanup_retried_after_a_failure_at_any_step_ends_clean() ->
     for (round, step) in [
         TargetTagCleanupStep::EdgesRead,
         TargetTagCleanupStep::EdgeDeleted,
+        TargetTagCleanupStep::MarkersRead,
         TargetTagCleanupStep::TaggerCounted,
         TargetTagCleanupStep::TaggersPurged,
         TargetTagCleanupStep::TimelinePurged,
         TargetTagCleanupStep::SearchPruned,
+        TargetTagCleanupStep::FinalCheckPassed,
     ]
     .into_iter()
     .enumerate()
@@ -222,12 +228,12 @@ async fn listing_tag_cleanup_retried_after_a_failure_at_any_step_ends_clean() ->
             step,
             fired: AtomicBool::new(false),
         };
-        let first = del_target_tags_with_hook(target, &failing).await;
+        let first = del_tagged_target_with_hook(target, &failing).await;
         assert!(
             first.is_err(),
             "{step:?}: the injected failure must surface"
         );
-        del_target_tags(target).await?;
+        del_tagged_target(target).await?;
 
         // Exactly one decrement per listing tag, whatever failed.
         assert_eq!(find_user_counts(&a_id).await.tagged, 1, "{step:?}");
@@ -287,7 +293,7 @@ async fn a_tag_landing_during_listing_cleanup_is_swept_too() -> Result<()> {
         },
         fired: AtomicBool::new(false),
     };
-    del_target_tags_with_hook(
+    del_tagged_target_with_hook(
         TagTarget::Listing {
             owner_id: &seller_id,
             listing_id: &listing_id,
@@ -329,8 +335,8 @@ async fn shop_tag_cleanup_retried_after_a_failure_ends_clean() -> Result<()> {
         step: TargetTagCleanupStep::TaggersPurged,
         fired: AtomicBool::new(false),
     };
-    assert!(del_target_tags_with_hook(target, &failing).await.is_err());
-    del_target_tags(target).await?;
+    assert!(del_tagged_target_with_hook(target, &failing).await.is_err());
+    del_tagged_target(target).await?;
 
     assert_eq!(find_user_counts(&a_id).await.tagged, 0);
     let scores =
@@ -453,7 +459,7 @@ async fn a_taggers_untag_racing_the_cleanup_is_counted_once() -> Result<()> {
             tag_id: listing_tag.create_id(),
             fired: AtomicBool::new(false),
         };
-        del_target_tags_with_hook(
+        del_tagged_target_with_hook(
             TagTarget::Listing {
                 owner_id: &seller_id,
                 listing_id: &listing_id,
@@ -505,7 +511,7 @@ async fn a_retag_during_a_multi_round_cleanup_is_counted() -> Result<()> {
         tag: listing_tag,
         fired: AtomicBool::new(false),
     };
-    del_target_tags_with_hook(
+    del_tagged_target_with_hook(
         TagTarget::Listing {
             owner_id: &seller_id,
             listing_id: &listing_id,
@@ -520,5 +526,394 @@ async fn a_retag_during_a_multi_round_cleanup_is_counted() -> Result<()> {
     test.del(&seller_kp, &listing_path).await?;
     test.cleanup_user(&a_kp).await?;
     test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
+
+/// Runs a whole second cleanup of the same target, as an overlapping
+/// retry of the DEL would, the first time the step is hit.
+struct CleanupRunsAt {
+    step: TargetTagCleanupStep,
+    owner_id: String,
+    listing_id: String,
+    fired: AtomicBool,
+}
+
+#[async_trait]
+impl TargetTagCleanupHook for CleanupRunsAt {
+    async fn at(&self, step: TargetTagCleanupStep) -> Result<(), EventProcessorError> {
+        if step == self.step && !self.fired.swap(true, Ordering::SeqCst) {
+            del_tagged_target(TagTarget::Listing {
+                owner_id: &self.owner_id,
+                listing_id: &self.listing_id,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+async fn graph_count(query: Query) -> Result<i64> {
+    Ok(fetch_key_from_graph::<i64>(query, "n")
+        .await?
+        .unwrap_or_default())
+}
+
+async fn listing_nodes(owner_id: &str, listing_id: &str) -> Result<i64> {
+    graph_count(
+        Query::new(
+            "test_listing_nodes",
+            "MATCH (l:Listing {id: $listing_id, owner_id: $owner_id}) RETURN count(l) AS n",
+        )
+        .param("owner_id", owner_id)
+        .param("listing_id", listing_id),
+    )
+    .await
+}
+
+async fn shop_nodes(owner_id: &str) -> Result<i64> {
+    graph_count(
+        Query::new(
+            "test_shop_nodes",
+            "MATCH (s:Shop {owner_id: $owner_id}) RETURN count(s) AS n",
+        )
+        .param("owner_id", owner_id),
+    )
+    .await
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_tag_committed_after_the_final_check_refuses_the_listing_deletion() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, seller_id) = user(&mut test, "Final:Seller").await?;
+    let (c_kp, c_id) = user(&mut test, "Final:TaggerC").await?;
+    let listing = test_listing(
+        &seller_id,
+        "Final check boots",
+        "fashion",
+        PubkyAppListingCondition::New,
+        1_000,
+    );
+    let (listing_id, _) = test.create_listing(&seller_kp, &listing).await?;
+    let listing_uri = listing_uri_builder(seller_id.clone(), listing_id.clone());
+    let late = format!("fl{}", &seller_id[..8]);
+    let tag = PubkyAppTag {
+        uri: listing_uri.clone(),
+        label: late.clone(),
+        created_at: Utc::now().timestamp_millis(),
+    };
+    let tagger_id = PubkyId::try_from(c_id.as_str()).map_err(anyhow::Error::msg)?;
+
+    // The untagged listing passes the empty check; the tag commits before
+    // the deletion statement runs.
+    let landing = TagLandsAt {
+        step: TargetTagCleanupStep::FinalCheckPassed,
+        tagger_id: tagger_id.clone(),
+        tag: tag.clone(),
+        fired: AtomicBool::new(false),
+    };
+    del_tagged_target_with_hook(
+        TagTarget::Listing {
+            owner_id: &seller_id,
+            listing_id: &listing_id,
+        },
+        &landing,
+    )
+    .await?;
+    assert!(landing.fired.load(Ordering::SeqCst));
+    assert_eq!(listing_nodes(&seller_id, &listing_id).await?, 0);
+    assert_eq!(find_user_counts(&c_id).await.tagged, 0);
+    listing_is_untagged(&seller_id, &listing_id, &[&late]).await?;
+    assert!(!suggested(&late).await?);
+
+    // After the deletion the same tag finds no target and indexes nothing.
+    let after =
+        nexus_watcher::events::handlers::tag::sync_put(tag.clone(), tagger_id, tag.create_id())
+            .await;
+    assert!(
+        matches!(after, Err(EventProcessorError::MissingDependency { .. })),
+        "{after:?}"
+    );
+    assert_eq!(find_user_counts(&c_id).await.tagged, 0);
+    listing_is_untagged(&seller_id, &listing_id, &[&late]).await?;
+    assert!(!suggested(&late).await?);
+
+    test.cleanup_user(&c_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_tag_committed_after_the_final_check_refuses_the_shop_deletion() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (owner_kp, owner_id) = user(&mut test, "FinalShop:Owner").await?;
+    let (c_kp, c_id) = user(&mut test, "FinalShop:Tagger").await?;
+    let shop_path = PubkyAppShop::hs_path();
+    test.put(&owner_kp, &shop_path, &test_shop(&owner_id))
+        .await?;
+    let late = format!("fs{}", &owner_id[..8]);
+    let tag = PubkyAppTag {
+        uri: pubky_app_specs::shop_uri_builder(owner_id.clone()),
+        label: late.clone(),
+        created_at: Utc::now().timestamp_millis(),
+    };
+    let tagger_id = PubkyId::try_from(c_id.as_str()).map_err(anyhow::Error::msg)?;
+
+    let landing = TagLandsAt {
+        step: TargetTagCleanupStep::FinalCheckPassed,
+        tagger_id: tagger_id.clone(),
+        tag: tag.clone(),
+        fired: AtomicBool::new(false),
+    };
+    del_tagged_target_with_hook(
+        TagTarget::Shop {
+            owner_id: &owner_id,
+        },
+        &landing,
+    )
+    .await?;
+    assert!(landing.fired.load(Ordering::SeqCst));
+    assert_eq!(shop_nodes(&owner_id).await?, 0);
+    assert_eq!(find_user_counts(&c_id).await.tagged, 0);
+    let scores =
+        <TagShop as TagCollection>::get_from_index(&owner_id, None, None, None, None, None, false)
+            .await?
+            .unwrap_or_default();
+    assert!(scores.is_empty(), "shop label scores left: {scores:?}");
+    let (taggers, _) = <TagShop as TaggersCollection>::get_from_index(
+        vec![owner_id.as_str(), late.as_str()],
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    assert!(taggers.is_empty());
+    assert!(!suggested(&late).await?);
+
+    let after =
+        nexus_watcher::events::handlers::tag::sync_put(tag.clone(), tagger_id, tag.create_id())
+            .await;
+    assert!(
+        matches!(after, Err(EventProcessorError::MissingDependency { .. })),
+        "{after:?}"
+    );
+    assert_eq!(find_user_counts(&c_id).await.tagged, 0);
+    assert!(!suggested(&late).await?);
+
+    test.cleanup_user(&c_kp).await?;
+    test.cleanup_user(&owner_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn an_uncommitted_tag_holds_the_listing_deletion_until_it_commits() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, seller_id) = user(&mut test, "Lock:Seller").await?;
+    let (a_kp, a_id) = user(&mut test, "Lock:TaggerA").await?;
+    let listing = test_listing(
+        &seller_id,
+        "Lock boots",
+        "fashion",
+        PubkyAppListingCondition::New,
+        1_000,
+    );
+    let (listing_id, _) = test.create_listing(&seller_kp, &listing).await?;
+    let label = format!("lk{}", &seller_id[..8]);
+
+    // A tag PUT's graph write, still uncommitted on its own connection. It
+    // holds the listing's lock; its Redis writes follow its commit.
+    let config = Neo4JConfig::default();
+    let graph = neo4rs::Graph::new(config.uri.as_str(), &config.user, &config.password).await?;
+    let mut txn = graph.start_txn().await?;
+    txn.run(
+        neo4rs::query(
+            "MATCH (u:User {id: $tagger_id})
+             MATCH (l:Listing {id: $listing_id, owner_id: $owner_id})
+             CREATE (u)-[:TAGGED {id: $tag_id, label: $label, indexed_at: 0}]->(l)",
+        )
+        .param("tagger_id", a_id.as_str())
+        .param("listing_id", listing_id.as_str())
+        .param("owner_id", seller_id.as_str())
+        .param("tag_id", format!("lock{}", &seller_id[..8]))
+        .param("label", label.as_str()),
+    )
+    .await?;
+
+    let (owner, id) = (seller_id.clone(), listing_id.clone());
+    let cleanup = tokio::spawn(async move {
+        del_tagged_target(TagTarget::Listing {
+            owner_id: &owner,
+            listing_id: &id,
+        })
+        .await
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let blocked = graph_count(Query::new(
+            "test_blocked_finalize",
+            "SHOW TRANSACTIONS YIELD currentQuery, status
+             WHERE currentQuery CONTAINS 'DETACH DELETE listing'
+               AND status STARTS WITH 'Blocked'
+             RETURN count(*) AS n",
+        ))
+        .await?;
+        if blocked >= 1 {
+            break;
+        }
+        assert!(
+            !cleanup.is_finished(),
+            "the deletion did not wait for the uncommitted tag"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deletion never blocked on the listing"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // The deletion holds the node lock the tag's commit needs, so Neo4j
+    // either refuses the deletion (another round, or a deadlock abort and
+    // the event's retry, sweeps the committed tag) or aborts the tag, which
+    // then indexes nothing. The deletion never removes a committed tag
+    // silently.
+    let committed = txn.commit().await.is_ok();
+    if committed {
+        UserCounts::increment(&a_id, "tagged", None).await?;
+    }
+    if let Err(error) = cleanup.await? {
+        assert!(
+            committed,
+            "only a committed tag can fail the deletion: {error}"
+        );
+        assert!(
+            error.to_string().contains("DeadlockDetected"),
+            "unexpected deletion failure: {error}"
+        );
+        del_tagged_target(TagTarget::Listing {
+            owner_id: &seller_id,
+            listing_id: &listing_id,
+        })
+        .await?;
+    }
+
+    assert_eq!(listing_nodes(&seller_id, &listing_id).await?, 0);
+    assert_eq!(find_user_counts(&a_id).await.tagged, 0);
+    let edges = graph_count(
+        Query::new(
+            "test_orphan_tag",
+            "MATCH (:User {id: $tagger_id})-[t:TAGGED {label: $label}]->() RETURN count(t) AS n",
+        )
+        .param("tagger_id", a_id.as_str())
+        .param("label", label.as_str()),
+    )
+    .await?;
+    assert_eq!(edges, 0);
+
+    test.cleanup_user(&a_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn an_overlapping_cleanup_that_read_a_settled_marker_counts_nothing() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, seller_id) = user(&mut test, "Overlap:Seller").await?;
+    let (a_kp, a_id) = user(&mut test, "Overlap:TaggerA").await?;
+    let listing = test_listing(
+        &seller_id,
+        "Overlap boots",
+        "fashion",
+        PubkyAppListingCondition::New,
+        1_000,
+    );
+    let (listing_id, _) = test.create_listing(&seller_kp, &listing).await?;
+    let label = format!("ov{}", &seller_id[..8]);
+    let keep = format!("ok{}", &seller_id[..8]);
+    tag(
+        &mut test,
+        &a_kp,
+        listing_uri_builder(seller_id.clone(), listing_id.clone()),
+        &label,
+    )
+    .await?;
+    tag(&mut test, &a_kp, user_uri_builder(seller_id.clone()), &keep).await?;
+    assert_eq!(find_user_counts(&a_id).await.tagged, 2);
+
+    // This cleanup reads its marker; another settles it and deletes the
+    // listing before this one counts it.
+    let overlap = CleanupRunsAt {
+        step: TargetTagCleanupStep::MarkersRead,
+        owner_id: seller_id.clone(),
+        listing_id: listing_id.clone(),
+        fired: AtomicBool::new(false),
+    };
+    del_tagged_target_with_hook(
+        TagTarget::Listing {
+            owner_id: &seller_id,
+            listing_id: &listing_id,
+        },
+        &overlap,
+    )
+    .await?;
+    assert!(overlap.fired.load(Ordering::SeqCst));
+    assert_eq!(find_user_counts(&a_id).await.tagged, 1);
+    assert_eq!(listing_nodes(&seller_id, &listing_id).await?, 0);
+    listing_is_untagged(&seller_id, &listing_id, &[&label]).await?;
+
+    test.cleanup_user(&a_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_label_tagged_during_the_autocomplete_prune_stays_suggested() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (owner_kp, owner_id) = user(&mut test, "Prune:Owner").await?;
+    let (a_kp, a_id) = user(&mut test, "Prune:Tagger").await?;
+    let label = format!("pr{}", &owner_id[..8]);
+    TagSearch::put_to_index(&[label.clone()]).await?;
+    let tag = PubkyAppTag {
+        uri: user_uri_builder(owner_id.clone()),
+        label: label.clone(),
+        created_at: Utc::now().timestamp_millis(),
+    };
+    let tagger_id = PubkyId::try_from(a_id.as_str()).map_err(anyhow::Error::msg)?;
+
+    // The label is unused when checked; a profile tag is indexed with it
+    // before the prune removes it.
+    TagSearch::del_from_index_if_unused_with_hook(&label, async {
+        nexus_watcher::events::handlers::tag::sync_put(
+            tag.clone(),
+            tagger_id.clone(),
+            tag.create_id(),
+        )
+        .await
+        .expect("profile tag indexes");
+    })
+    .await?;
+    assert!(suggested(&label).await?, "a used label must stay suggested");
+
+    nexus_watcher::events::handlers::tag::del(tagger_id, tag.create_id()).await?;
+    assert!(!suggested(&label).await?, "unused again once untagged");
+    test.cleanup_user(&a_kp).await?;
+    test.cleanup_user(&owner_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_corrupt_counts_document_fails_before_its_claim() -> Result<()> {
+    WatcherTest::setup().await?;
+    let user_id = Keypair::random().public_key().to_string();
+    let counts_prefix = <UserCounts as RedisOps>::prefix().await;
+    // A counts key holding a set, not a JSON document.
+    sets::put(&counts_prefix, &user_id, &["corrupt"], Some(60)).await?;
+    let claim_key = format!("Cleanup:Tags:corrupt:{user_id}");
+
+    let result = UserCounts::decrement_once(&user_id, "tagged", &claim_key, "marker", 60).await;
+    assert!(result.is_err(), "{result:?}");
+    let (_, claimed) =
+        sets::check_member("Cleanup:Tags", &format!("corrupt:{user_id}"), "marker").await?;
+    assert!(!claimed, "a failed decrement must not consume its claim");
+
+    sets::del(&counts_prefix, &user_id, &["corrupt"]).await?;
     Ok(())
 }

@@ -304,7 +304,7 @@ pub fn tag_cleanup_markers(target: &str) -> Query {
     Query::new(
         "tag_cleanup_markers",
         "MATCH (c:TagCleanup {target: $target})
-         RETURN c.id AS id, c.tagger_id AS tagger_id, c.tag_id AS tag_id, c.label AS label",
+         RETURN c.id AS id, c.tagger_id AS tagger_id, c.label AS label",
     )
     .param("target", target)
 }

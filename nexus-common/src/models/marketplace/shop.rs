@@ -1,7 +1,6 @@
 use crate::db::kv::RedisResult;
 use crate::db::{
-    exec_single_row, execute_graph_operation, fetch_row_from_graph, queries, GraphResult,
-    OperationOutcome, RedisOps,
+    execute_graph_operation, fetch_row_from_graph, queries, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
 use chrono::Utc;
@@ -94,10 +93,9 @@ impl ShopDetails {
         self.put_index_json(&[&self.owner_id], None, None).await
     }
 
-    pub async fn delete(owner_id: &str) -> ModelResult<()> {
-        // Delete shop graph node
-        exec_single_row(queries::del::delete_shop(owner_id)).await?;
-        // Delete shop details on Redis
+    /// Deletes the shop's Redis details. The graph node goes with its tags
+    /// in the watcher's tagged-target cleanup.
+    pub async fn delete_indexes(owner_id: &str) -> ModelResult<()> {
         Self::remove_from_index_multiple_json(&[&[owner_id]]).await?;
         Ok(())
     }

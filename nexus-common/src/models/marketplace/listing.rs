@@ -212,6 +212,12 @@ impl ListingDetails {
     pub async fn delete(owner_id: &str, listing_id: &str) -> ModelResult<()> {
         // Delete listing graph node
         exec_single_row(queries::del::delete_listing(owner_id, listing_id)).await?;
+        Self::delete_indexes(owner_id, listing_id).await
+    }
+
+    /// Deletes the listing's Redis details and stream memberships. The
+    /// watcher deletes the graph node with its tags first.
+    pub async fn delete_indexes(owner_id: &str, listing_id: &str) -> ModelResult<()> {
         // Delete listing details on Redis
         Self::remove_from_index_multiple_json(&[&[owner_id, listing_id]]).await?;
         // Remove from stream sorted sets

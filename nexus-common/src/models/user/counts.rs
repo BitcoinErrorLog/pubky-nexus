@@ -157,12 +157,14 @@ impl UserCounts {
 
     /// Decrements a field that feeds no ranking set at most once per
     /// `claim_member` of the `claim_key` set, so a retried caller cannot
-    /// repeat it. Returns whether this call applied the decrement.
+    /// repeat it. The claim set expires `claim_ttl_seconds` after its last
+    /// claim. Returns whether this call applied the decrement.
     pub async fn decrement_once(
         user_id: &str,
         field: &str,
         claim_key: &str,
         claim_member: &str,
+        claim_ttl_seconds: i64,
     ) -> RedisResult<bool> {
         debug_assert!(!matches!(field, "followers" | "tags" | "posts"));
         crate::db::kv::modify_json_field_once(
@@ -172,6 +174,7 @@ impl UserCounts {
             user_id,
             field,
             JsonAction::Decrement(1),
+            claim_ttl_seconds,
         )
         .await
     }

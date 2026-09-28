@@ -164,8 +164,9 @@ pub async fn modify_json_field(
 /// [`modify_json_field`] applied at most once per `claim_member` of the
 /// `claim_key` set. The claim and the field update run in one Lua script, so
 /// a caller retried after a failure can neither skip nor repeat the update.
-/// A missing JSON document is claimed without an update. Returns whether
-/// this call applied the update.
+/// A missing JSON document is claimed without an update. Each claim renews
+/// the set's expiry to `claim_ttl_seconds`. Returns whether this call
+/// applied the update.
 pub async fn modify_json_field_once(
     claim_key: &str,
     claim_member: &str,
@@ -173,6 +174,7 @@ pub async fn modify_json_field_once(
     key: &str,
     field: &str,
     action: JsonAction,
+    claim_ttl_seconds: i64,
 ) -> RedisResult<bool> {
     let mut redis_conn = get_redis_conn().await?;
     let index_key = format!("{prefix}:{key}");
@@ -183,23 +185,29 @@ pub async fn modify_json_field_once(
     };
     let range = ValueRange::default();
 
-    // Every command that can fail (a missing document) is checked before the
-    // claim, because Redis does not roll back a script's earlier writes.
+    // Every command that can fail (a missing or non-JSON document) runs
+    // before the claim, because Redis does not roll back a script's earlier
+    // writes.
     let script = Script::new(
         r#"
-        if redis.call('EXISTS', KEYS[2]) == 0 then
-            redis.call('SADD', KEYS[1], ARGV[1])
-            return 0
+        local function claim()
+            local added = redis.call('SADD', KEYS[1], ARGV[1])
+            redis.call('EXPIRE', KEYS[1], ARGV[6])
+            return added
         end
-        if redis.call('SADD', KEYS[1], ARGV[1]) == 0 then
+        if redis.call('EXISTS', KEYS[2]) == 0 then
+            claim()
             return 0
         end
         local path = ARGV[2]
+        local current_value = redis.call('JSON.GET', KEYS[2], path)
+        if claim() == 0 then
+            return 0
+        end
         local amount = tonumber(ARGV[3])
         local min_value = tonumber(ARGV[4])
         local max_value = tonumber(ARGV[5])
         local current = 0
-        local current_value = redis.call('JSON.GET', KEYS[2], path)
         if current_value then
             local decoded = cjson.decode(current_value)
             if type(decoded) == 'table' then
@@ -234,17 +242,11 @@ pub async fn modify_json_field_once(
         .arg(amount.to_string())
         .arg(range.min.to_string())
         .arg(range.max.to_string())
+        .arg(claim_ttl_seconds.to_string())
         .invoke_async(&mut redis_conn)
         .await?;
 
     Ok(applied == 1)
-}
-
-/// Deletes one Redis key.
-pub async fn del_key(key: &str) -> RedisResult<()> {
-    let mut redis_conn = get_redis_conn().await?;
-    let _: () = redis_conn.del(key).await?;
-    Ok(())
 }
 
 /// Handles storing a boolean value in Redis with an optional expiration.

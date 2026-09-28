@@ -3,9 +3,10 @@ use crate::events::EventProcessorError;
 
 use chrono::Utc;
 use nexus_common::db::graph::Query;
-use nexus_common::db::kv::{del_key, ScoreAction, SortOrder};
+use nexus_common::db::kv::{ScoreAction, SortOrder};
 use nexus_common::db::{
-    exec_single_row, fetch_all_rows_from_graph, queries, OperationOutcome, RedisOps,
+    exec_single_row, fetch_all_rows_from_graph, fetch_key_from_graph, queries, OperationOutcome,
+    RedisOps,
 };
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::marketplace::ListingsByTagSearch;
@@ -466,17 +467,21 @@ pub enum TagTarget<'a> {
     },
 }
 
-/// Points of [`del_target_tags_with_hook`] where integration tests inject a
-/// failure or a concurrent write.
+/// Points of [`del_tagged_target_with_hook`] where integration tests inject
+/// a failure or a concurrent write.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetTagCleanupStep {
     EdgesRead,
     EdgeDeleted,
+    MarkersRead,
     TaggerCounted,
     TaggersPurged,
     TimelinePurged,
     SearchPruned,
+    /// The round saw no edge, marker or indexed label; the target is not
+    /// deleted yet.
+    FinalCheckPassed,
 }
 
 /// Internal deterministic seam for integration-testing cleanup retries.
@@ -493,9 +498,16 @@ struct NoopTargetTagCleanupHook;
 #[async_trait::async_trait]
 impl TargetTagCleanupHook for NoopTargetTagCleanupHook {}
 
-/// Rounds of [`del_target_tags`] before it gives up and lets the event retry:
-/// each round only repeats because a tag landed on the target meanwhile.
+/// Rounds of [`del_tagged_target`] before it gives up and lets the event
+/// retry: each round only repeats because a tag landed on the target
+/// meanwhile.
 const TARGET_TAG_ROUNDS: usize = 5;
+
+/// Lifetime of a target's claim set. Claims are never deleted once the
+/// target is gone: a cleanup still holding a marker it read before another
+/// cleanup settled it must find the claim. Marker ids are fresh per edge, so
+/// a re-created target never collides with an old claim.
+const CLAIM_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 impl TagTarget<'_> {
     fn edges_query(self) -> Query {
@@ -516,6 +528,18 @@ impl TagTarget<'_> {
                 listing_id,
             } => format!("listing:{owner_id}:{listing_id}"),
             TagTarget::Shop { owner_id } => format!("shop:{owner_id}"),
+        }
+    }
+
+    /// Deletes the target node only if no edge reaches it; see
+    /// [`queries::del::delete_untagged_listing`].
+    fn finalize_query(self) -> Query {
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => queries::del::delete_untagged_listing(owner_id, listing_id),
+            TagTarget::Shop { owner_id } => queries::del::delete_untagged_shop(owner_id),
         }
     }
 
@@ -658,12 +682,13 @@ impl TagTarget<'_> {
     }
 }
 
-/// Deletes every community tag on a marketplace target (listing or shop)
-/// whose own DEL is being processed, before the node goes. `DETACH DELETE`
-/// of the target removes the `TAGGED` edges from the graph but cannot reach
-/// their Redis indexes (label scores, taggers, the global label timeline,
-/// tag search, tagger counts); left behind, they would reattach to a record
-/// re-created at the same id.
+/// Deletes a marketplace target (listing or shop) node whose own DEL is
+/// being processed, together with every community tag on it. `DETACH
+/// DELETE` of the target removes the `TAGGED` edges from the graph but
+/// cannot reach their Redis indexes (label scores, taggers, the global label
+/// timeline, tag search, tagger counts); left behind, they would reattach to
+/// a record re-created at the same id. The caller deletes the target's own
+/// Redis details afterwards.
 ///
 /// Retry-safe at every step, and exact under racing tag events:
 /// - One Cypher statement deletes the target's edges and leaves a
@@ -672,20 +697,26 @@ impl TagTarget<'_> {
 ///   down; one that arrives after finds no edge and counts nothing.
 /// - Each marker's tagger `tagged` count is decremented once through a
 ///   claim on the marker id, then the marker is deleted. A re-tag during the
-///   cleanup is a new edge, so a later round gives it a new marker.
+///   cleanup is a new edge, so a later round gives it a new marker. Claims
+///   outlive the target (see [`CLAIM_TTL_SECONDS`]), so an overlapping
+///   cleanup that read a marker before another settled it counts nothing.
 /// - Each label's target indexes are purged idempotently and its score entry
 ///   goes last, so a retry still finds the label once its edges are gone.
 ///
 /// Rounds repeat until the target has no edge, no marker and no indexed
-/// label, which also sweeps a tag that landed while the cleanup ran.
-pub async fn del_target_tags(target: TagTarget<'_>) -> Result<(), EventProcessorError> {
-    del_target_tags_with_hook(target, &NoopTargetTagCleanupHook).await
+/// label, which also sweeps a tag that landed while the cleanup ran. The
+/// node is then deleted by one statement that holds its write lock while it
+/// re-checks for edges: a tag committed after the round's reads
+/// refuses the deletion and gets its own round, and a tag after the
+/// deletion finds no target and takes its missing-dependency path.
+pub async fn del_tagged_target(target: TagTarget<'_>) -> Result<(), EventProcessorError> {
+    del_tagged_target_with_hook(target, &NoopTargetTagCleanupHook).await
 }
 
-/// [`del_target_tags`] with deterministic interleaving points. Production
-/// callers use [`del_target_tags`].
+/// [`del_tagged_target`] with deterministic interleaving points. Production
+/// callers use [`del_tagged_target`].
 #[doc(hidden)]
-pub async fn del_target_tags_with_hook(
+pub async fn del_tagged_target_with_hook(
     target: TagTarget<'_>,
     hook: &dyn TargetTagCleanupHook,
 ) -> Result<(), EventProcessorError> {
@@ -697,8 +728,13 @@ pub async fn del_target_tags_with_hook(
             fetch_all_rows_from_graph(queries::get::tag_cleanup_markers(&marker_target)).await?;
         let mut labels = target.indexed_labels().await?;
         if edges.is_empty() && markers.is_empty() && labels.is_empty() {
-            del_key(&claim_key).await?;
-            return Ok(());
+            hook.at(TargetTagCleanupStep::FinalCheckPassed).await?;
+            let blocked: Option<bool> =
+                fetch_key_from_graph(target.finalize_query(), "blocked").await?;
+            if blocked != Some(true) {
+                return Ok(());
+            }
+            continue;
         }
         for row in &edges {
             let label: String = row
@@ -715,6 +751,7 @@ pub async fn del_target_tags_with_hook(
             markers = fetch_all_rows_from_graph(queries::get::tag_cleanup_markers(&marker_target))
                 .await?;
         }
+        hook.at(TargetTagCleanupStep::MarkersRead).await?;
         for marker in markers {
             let id: String = marker
                 .get("id")
@@ -725,7 +762,8 @@ pub async fn del_target_tags_with_hook(
             let label: String = marker
                 .get("label")
                 .map_err(EventProcessorError::graph_query_failed)?;
-            UserCounts::decrement_once(&tagger_id, "tagged", &claim_key, &id).await?;
+            UserCounts::decrement_once(&tagger_id, "tagged", &claim_key, &id, CLAIM_TTL_SECONDS)
+                .await?;
             hook.at(TargetTagCleanupStep::TaggerCounted).await?;
             exec_single_row(queries::del::delete_tag_cleanup_marker(&id)).await?;
             if !labels.contains(&label) {
