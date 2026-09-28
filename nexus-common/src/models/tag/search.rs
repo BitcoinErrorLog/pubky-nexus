@@ -55,4 +55,19 @@ impl TagSearch {
     pub async fn del_from_index(tag_label: &str) -> RedisResult<()> {
         Self::remove_from_index_sorted_set(None, &TAGS_LABEL, &[tag_label]).await
     }
+
+    /// Removes the label from the suggestions once no `TAGGED` edge on any
+    /// target type (post, user, listing, shop) still carries it. Call after
+    /// the deleted edge is gone from the graph.
+    pub async fn del_from_index_if_unused(tag_label: &str) -> ModelResult<()> {
+        let in_use: Option<bool> = fetch_key_from_graph(
+            crate::db::queries::get::tag_label_in_use(tag_label),
+            "in_use",
+        )
+        .await?;
+        if in_use != Some(true) {
+            Self::del_from_index(tag_label).await?;
+        }
+        Ok(())
+    }
 }

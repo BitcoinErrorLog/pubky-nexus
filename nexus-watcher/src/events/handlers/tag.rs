@@ -3,21 +3,22 @@ use crate::events::EventProcessorError;
 
 use chrono::Utc;
 use nexus_common::db::graph::Query;
-use nexus_common::db::kv::ScoreAction;
-use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome};
+use nexus_common::db::kv::{del_key, ScoreAction, SortOrder};
+use nexus_common::db::{
+    exec_single_row, fetch_all_rows_from_graph, queries, OperationOutcome, RedisOps,
+};
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::marketplace::ListingsByTagSearch;
 use nexus_common::models::notification::Notification;
 use nexus_common::models::post::search::PostsByTagSearch;
 use nexus_common::models::post::{PostCounts, PostStream};
-use nexus_common::models::tag::listing::TagListing;
+use nexus_common::models::tag::listing::{TagListing, LISTING_TAGS_KEY_PARTS};
 use nexus_common::models::tag::post::TagPost;
 use nexus_common::models::tag::search::TagSearch;
-use nexus_common::models::tag::shop::TagShop;
+use nexus_common::models::tag::shop::{TagShop, SHOP_TAGS_KEY_PARTS};
 use nexus_common::models::tag::traits::{TagCollection, TaggersCollection};
 use nexus_common::models::tag::user::TagUser;
 use nexus_common::models::user::UserCounts;
-use nexus_common::types::Pagination;
 use pubky_app_specs::{post_uri_builder, ParsedUri, PubkyAppTag, PubkyId, Resource};
 use tracing::debug;
 
@@ -453,31 +454,255 @@ pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorE
     Ok(())
 }
 
-/// Deletes every community tag on a marketplace target (listing or shop)
-/// whose own DEL is being processed, through the tagger's tag DEL path.
-/// `DETACH DELETE` of the target removes the `TAGGED` edges from the graph
-/// but cannot reach their Redis indexes (label scores, taggers, the global
-/// label timeline, tag search, tagger counts); left behind, they would
-/// reattach to a record re-created at the same id. Each edge is deleted
-/// before its indexes, so a retried target DEL resumes with the edges that
-/// remain.
-pub async fn del_target_tags(edges: Query) -> Result<(), EventProcessorError> {
-    let rows = fetch_all_rows_from_graph(edges).await?;
-    for row in rows {
-        let tagger_id: String = row
-            .get("tagger_id")
-            .map_err(EventProcessorError::graph_query_failed)?;
-        let tag_id: String = row
-            .get("tag_id")
-            .map_err(EventProcessorError::graph_query_failed)?;
-        let tagger_id =
-            PubkyId::try_from(tagger_id.as_str()).map_err(EventProcessorError::generic)?;
-        match del(tagger_id, tag_id).await {
-            Ok(()) | Err(EventProcessorError::SkipIndexing) => {}
-            Err(error) => return Err(error),
+/// A marketplace target whose own DEL is removing its community tags.
+#[derive(Clone, Copy)]
+pub enum TagTarget<'a> {
+    Listing {
+        owner_id: &'a str,
+        listing_id: &'a str,
+    },
+    Shop {
+        owner_id: &'a str,
+    },
+}
+
+/// Points of [`del_target_tags_with_hook`] where integration tests inject a
+/// failure or a concurrent write.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetTagCleanupStep {
+    TaggerCounted,
+    EdgeDeleted,
+    TaggersPurged,
+    TimelinePurged,
+    SearchPruned,
+}
+
+/// Internal deterministic seam for integration-testing cleanup retries.
+#[doc(hidden)]
+#[async_trait::async_trait]
+pub trait TargetTagCleanupHook: Sync {
+    async fn at(&self, _step: TargetTagCleanupStep) -> Result<(), EventProcessorError> {
+        Ok(())
+    }
+}
+
+struct NoopTargetTagCleanupHook;
+
+#[async_trait::async_trait]
+impl TargetTagCleanupHook for NoopTargetTagCleanupHook {}
+
+/// Rounds of [`del_target_tags`] before it gives up and lets the event retry:
+/// each round only repeats because a tag landed on the target meanwhile.
+const TARGET_TAG_ROUNDS: usize = 5;
+
+impl TagTarget<'_> {
+    fn edges_query(self) -> Query {
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => queries::get::listing_tag_edges(owner_id, listing_id),
+            TagTarget::Shop { owner_id } => queries::get::shop_tag_edges(owner_id),
         }
     }
-    Ok(())
+
+    /// The set of `tagger:tag_id` members whose tagger count was already
+    /// decremented by this target's cleanup.
+    fn claim_key(self) -> String {
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => format!("Cleanup:Tags:Listing:{owner_id}:{listing_id}"),
+            TagTarget::Shop { owner_id } => format!("Cleanup:Tags:Shop:{owner_id}"),
+        }
+    }
+
+    fn score_key(self) -> Vec<String> {
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => [&LISTING_TAGS_KEY_PARTS[..], &[owner_id, listing_id]]
+                .concat()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            TagTarget::Shop { owner_id } => [&SHOP_TAGS_KEY_PARTS[..], &[owner_id]]
+                .concat()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
+    /// Labels still in the target's label-score set. The set survives until
+    /// every other index of a label is gone, so a retry can find labels
+    /// whose graph edges were already deleted.
+    async fn indexed_labels(self) -> Result<Vec<String>, EventProcessorError> {
+        let key = self.score_key();
+        let key: Vec<&str> = key.iter().map(String::as_str).collect();
+        let labels = match self {
+            TagTarget::Listing { .. } => {
+                TagListing::try_from_index_sorted_set(
+                    &key,
+                    None,
+                    None,
+                    None,
+                    None,
+                    SortOrder::Descending,
+                    None,
+                )
+                .await?
+            }
+            TagTarget::Shop { .. } => {
+                TagShop::try_from_index_sorted_set(
+                    &key,
+                    None,
+                    None,
+                    None,
+                    None,
+                    SortOrder::Descending,
+                    None,
+                )
+                .await?
+            }
+        };
+        Ok(labels
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect())
+    }
+
+    /// Removes one label's target indexes: taggers set, the listing's
+    /// global-timeline membership, the autocomplete entry when the label is
+    /// unused, and last the label score that lets a retry find the label.
+    /// Every step is idempotent.
+    async fn purge_label(
+        self,
+        label: &str,
+        hook: &dyn TargetTagCleanupHook,
+    ) -> Result<(), EventProcessorError> {
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => loop {
+                let key = vec![owner_id, listing_id, label];
+                let (taggers, _) =
+                    <TagListing as TaggersCollection>::get_from_index(key, None, None, None, None)
+                        .await?;
+                if taggers.is_empty() {
+                    break;
+                }
+                TagListing(taggers)
+                    .del_from_index(owner_id, Some(listing_id), label)
+                    .await?;
+            },
+            TagTarget::Shop { owner_id } => loop {
+                let key = vec![owner_id, label];
+                let (taggers, _) =
+                    <TagShop as TaggersCollection>::get_from_index(key, None, None, None, None)
+                        .await?;
+                if taggers.is_empty() {
+                    break;
+                }
+                TagShop(taggers)
+                    .del_from_index(owner_id, None, label)
+                    .await?;
+            },
+        }
+        hook.at(TargetTagCleanupStep::TaggersPurged).await?;
+        if let TagTarget::Listing {
+            owner_id,
+            listing_id,
+        } = self
+        {
+            ListingsByTagSearch::del_from_index(owner_id, listing_id, label).await?;
+        }
+        hook.at(TargetTagCleanupStep::TimelinePurged).await?;
+        TagSearch::del_from_index_if_unused(label).await?;
+        hook.at(TargetTagCleanupStep::SearchPruned).await?;
+        let key = self.score_key();
+        let key: Vec<&str> = key.iter().map(String::as_str).collect();
+        match self {
+            TagTarget::Listing { .. } => {
+                TagListing::remove_from_index_sorted_set(None, &key, &[label]).await?
+            }
+            TagTarget::Shop { .. } => {
+                TagShop::remove_from_index_sorted_set(None, &key, &[label]).await?
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Deletes every community tag on a marketplace target (listing or shop)
+/// whose own DEL is being processed, before the node goes. `DETACH DELETE`
+/// of the target removes the `TAGGED` edges from the graph but cannot reach
+/// their Redis indexes (label scores, taggers, the global label timeline,
+/// tag search, tagger counts); left behind, they would reattach to a record
+/// re-created at the same id.
+///
+/// Retry-safe at every step: a tagger's `tagged` count is decremented once
+/// per edge through a claim set, and only then is the edge deleted, so a
+/// failure on either side repeats neither; each label's target indexes are
+/// purged idempotently and its score entry goes last, so a retry still finds
+/// the label after its edges are gone. Rounds repeat until the target has no
+/// edge and no indexed label, which also sweeps a tag that landed while the
+/// cleanup ran.
+pub async fn del_target_tags(target: TagTarget<'_>) -> Result<(), EventProcessorError> {
+    del_target_tags_with_hook(target, &NoopTargetTagCleanupHook).await
+}
+
+/// [`del_target_tags`] with deterministic interleaving points. Production
+/// callers use [`del_target_tags`].
+#[doc(hidden)]
+pub async fn del_target_tags_with_hook(
+    target: TagTarget<'_>,
+    hook: &dyn TargetTagCleanupHook,
+) -> Result<(), EventProcessorError> {
+    let claim_key = target.claim_key();
+    for _ in 0..TARGET_TAG_ROUNDS {
+        let rows = fetch_all_rows_from_graph(target.edges_query()).await?;
+        let mut labels = target.indexed_labels().await?;
+        if rows.is_empty() && labels.is_empty() {
+            del_key(&claim_key).await?;
+            return Ok(());
+        }
+        for row in rows {
+            let tagger_id: String = row
+                .get("tagger_id")
+                .map_err(EventProcessorError::graph_query_failed)?;
+            let tag_id: String = row
+                .get("tag_id")
+                .map_err(EventProcessorError::graph_query_failed)?;
+            let label: String = row
+                .get("label")
+                .map_err(EventProcessorError::graph_query_failed)?;
+            UserCounts::decrement_once(
+                &tagger_id,
+                "tagged",
+                &claim_key,
+                &format!("{tagger_id}:{tag_id}"),
+            )
+            .await?;
+            hook.at(TargetTagCleanupStep::TaggerCounted).await?;
+            exec_single_row(queries::del::delete_tag(&tagger_id, &tag_id)).await?;
+            hook.at(TargetTagCleanupStep::EdgeDeleted).await?;
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        for label in &labels {
+            target.purge_label(label, hook).await?;
+        }
+    }
+    Err(EventProcessorError::generic(
+        "Marketplace target kept gaining tags while its DEL removed them",
+    ))
 }
 
 async fn del_sync_user(
@@ -507,7 +732,9 @@ async fn del_sync_user(
             Ok::<(), EventProcessorError>(())
         },
         // Save new notification
-        Notification::new_user_untag(&tagger_id, tagged_id, tag_label)
+        Notification::new_user_untag(&tagger_id, tagged_id, tag_label),
+        // Drop the label from autocomplete once no target uses it
+        TagSearch::del_from_index_if_unused(tag_label)
     );
 
     indexing_results.0?;
@@ -515,6 +742,7 @@ async fn del_sync_user(
     indexing_results.2?;
     indexing_results.3?;
     indexing_results.4?;
+    indexing_results.5?;
 
     Ok(())
 }
@@ -548,25 +776,16 @@ async fn del_sync_listing(
             // NOTE: The by-tag timeline depends on the listing taggers collection to delete
             // Delete listing from the global label timeline
             ListingsByTagSearch::del_from_index(owner_id, listing_id, tag_label).await?;
-
-            let listings_by_tag =
-                ListingsByTagSearch::get_by_label(tag_label, Pagination::default()).await?;
-            let listings_by_tag_found = listings_by_tag.is_some_and(|x| !x.is_empty());
-            let posts_by_tag =
-                PostsByTagSearch::get_by_label(tag_label, None, Pagination::default()).await?;
-            let posts_by_tag_found = posts_by_tag.is_some_and(|x| !x.is_empty());
-            if !listings_by_tag_found && !posts_by_tag_found {
-                // If we just removed the last target using this tag, remove tag from autocomplete suggestion list
-                TagSearch::del_from_index(tag_label).await?;
-            }
-
             Ok::<(), EventProcessorError>(())
-        }
+        },
+        // Drop the label from autocomplete once no target uses it
+        TagSearch::del_from_index_if_unused(tag_label)
     );
 
     indexing_results.0?;
     indexing_results.1?;
     indexing_results.2?;
+    indexing_results.3?;
 
     Ok(())
 }
@@ -589,12 +808,15 @@ async fn del_sync_shop(
                 .del_from_index(owner_id, None, tag_label)
                 .await?;
             Ok::<(), EventProcessorError>(())
-        }
+        },
+        // Drop the label from autocomplete once no target uses it
+        TagSearch::del_from_index_if_unused(tag_label)
     );
 
     indexing_results.0?;
     indexing_results.1?;
     indexing_results.2?;
+    indexing_results.3?;
 
     Ok(())
 }
@@ -655,19 +877,12 @@ async fn del_sync_post(
             // NOTE: The tag search index, depends on the post taggers collection to delete
             // Delete post from global label timeline
             PostsByTagSearch::del_from_index(author_id, post_id, tag_label).await?;
-
-            let posts_by_tag =
-                PostsByTagSearch::get_by_label(tag_label, None, Pagination::default()).await?;
-            let posts_by_tag_found = posts_by_tag.is_some_and(|x| !x.is_empty());
-            if !posts_by_tag_found {
-                // If we just removed the last post using this tag, remove tag from autocomplete suggestion list
-                TagSearch::del_from_index(tag_label).await?;
-            }
-
             Ok::<(), EventProcessorError>(())
         },
         // Save new notification
-        Notification::new_post_untag(&tagger_id, author_id, tag_label, &post_uri)
+        Notification::new_post_untag(&tagger_id, author_id, tag_label, &post_uri),
+        // Drop the label from autocomplete once no target uses it
+        TagSearch::del_from_index_if_unused(tag_label)
     );
 
     indexing_results.0?;
@@ -677,6 +892,7 @@ async fn del_sync_post(
     indexing_results.4?;
     indexing_results.5?;
     indexing_results.6?;
+    indexing_results.7?;
 
     Ok(())
 }

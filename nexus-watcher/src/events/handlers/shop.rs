@@ -1,6 +1,6 @@
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
-use nexus_common::db::{queries, OperationOutcome};
+use nexus_common::db::OperationOutcome;
 use nexus_common::models::marketplace::ShopDetails;
 use pubky_app_specs::{PubkyAppShop, PubkyId};
 use tracing::debug;
@@ -29,7 +29,7 @@ pub async fn sync_put(shop: PubkyAppShop, user_id: PubkyId) -> Result<(), EventP
 pub async fn del(user_id: PubkyId) -> Result<(), EventProcessorError> {
     debug!("Deleting shop: {}", user_id);
 
-    super::tag::del_target_tags(queries::get::shop_tag_edges(&user_id)).await?;
+    super::tag::del_target_tags(super::tag::TagTarget::Shop { owner_id: &user_id }).await?;
     ShopDetails::delete(&user_id).await?;
 
     Ok(())

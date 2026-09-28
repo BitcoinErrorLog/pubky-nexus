@@ -3,9 +3,7 @@ use crate::events::EventProcessorError;
 use async_trait::async_trait;
 use nexus_common::db::graph::Query;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
-use nexus_common::db::{
-    fetch_all_rows_from_graph, queries, OperationOutcome, PubkyConnector, RedisOps,
-};
+use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome, PubkyConnector, RedisOps};
 use nexus_common::models::marketplace::ListingDetails;
 use nexus_common::types::DynError;
 use pubky_app_specs::{listing_uri_builder, PubkyAppListing, PubkyAppObject, PubkyId, Resource};
@@ -82,7 +80,11 @@ pub(crate) async fn sync_put(
 pub async fn del(user_id: PubkyId, listing_id: String) -> Result<(), EventProcessorError> {
     debug!("Deleting listing: {}/{}", user_id, listing_id);
 
-    super::tag::del_target_tags(queries::get::listing_tag_edges(&user_id, &listing_id)).await?;
+    super::tag::del_target_tags(super::tag::TagTarget::Listing {
+        owner_id: &user_id,
+        listing_id: &listing_id,
+    })
+    .await?;
     ListingDetails::delete(&user_id, &listing_id).await?;
 
     Ok(())
