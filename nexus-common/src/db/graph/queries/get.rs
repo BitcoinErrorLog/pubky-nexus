@@ -278,6 +278,46 @@ pub fn listing_tags(owner_id: &str, listing_id: &str) -> Query {
     .param("listing_id", listing_id)
 }
 
+/// The `TAGGED` edges on a marketplace listing as `(tagger_id, tag_id, label)` rows
+pub fn listing_tag_edges(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "listing_tag_edges",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Listing {id: $listing_id, owner_id: $owner_id})
+         RETURN tagger.id AS tagger_id, tag.id AS tag_id, tag.label AS label",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
+/// The `TAGGED` edges on a marketplace shop as `(tagger_id, tag_id, label)` rows
+pub fn shop_tag_edges(owner_id: &str) -> Query {
+    Query::new(
+        "shop_tag_edges",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Shop {owner_id: $owner_id})
+         RETURN tagger.id AS tagger_id, tag.id AS tag_id, tag.label AS label",
+    )
+    .param("owner_id", owner_id)
+}
+
+/// The `TagCleanup` markers a marketplace target's DEL still has to settle
+pub fn tag_cleanup_markers(target: &str) -> Query {
+    Query::new(
+        "tag_cleanup_markers",
+        "MATCH (c:TagCleanup {target: $target})
+         RETURN c.id AS id, c.tagger_id AS tagger_id, c.label AS label",
+    )
+    .param("target", target)
+}
+
+/// Whether any `TAGGED` edge, on any target type, still carries the label
+pub fn tag_label_in_use(label: &str) -> Query {
+    Query::new(
+        "tag_label_in_use",
+        "RETURN EXISTS { MATCH ()-[:TAGGED {label: $label}]->() } AS in_use",
+    )
+    .param("label", label)
+}
+
 // Retrieve all the tags of a marketplace shop
 pub fn shop_tags(owner_id: &str) -> Query {
     Query::new(

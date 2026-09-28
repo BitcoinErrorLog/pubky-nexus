@@ -234,3 +234,166 @@ async fn test_homeserver_tag_shop_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn deleting_a_tagged_listing_clears_its_tag_indexes() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+
+    let seller_kp = Keypair::random();
+    let seller = PubkyAppUser {
+        bio: Some("deleting_a_tagged_listing_clears_its_tag_indexes".to_string()),
+        image: None,
+        links: None,
+        name: "Watcher:DeleteTaggedListing:Seller".to_string(),
+        status: None,
+    };
+    let seller_id = test.create_user(&seller_kp, &seller).await?;
+    let tagger_kp = Keypair::random();
+    let tagger = PubkyAppUser {
+        bio: Some("deleting_a_tagged_listing_clears_its_tag_indexes".to_string()),
+        image: None,
+        links: None,
+        name: "Watcher:DeleteTaggedListing:Tagger".to_string(),
+        status: None,
+    };
+    let tagger_id = test.create_user(&tagger_kp, &tagger).await?;
+
+    let listing = test_listing(
+        &seller_id,
+        "Tagged then deleted boots",
+        "fashion",
+        PubkyAppListingCondition::New,
+        12_000,
+    );
+    let (listing_id, listing_path) = test.create_listing(&seller_kp, &listing).await?;
+    let label = "gone-listing";
+    let tag = PubkyAppTag {
+        uri: listing_uri_builder(seller_id.clone(), listing_id.clone()),
+        label: label.to_string(),
+        created_at: Utc::now().timestamp_millis(),
+    };
+    let tag_path = tag.hs_path();
+    test.put(&tagger_kp, &tag_path, tag).await?;
+    let listing_key = format!("{seller_id}:{listing_id}");
+    let by_tag = ListingsByTagSearch::get_by_label(label, Pagination::default())
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(by_tag.iter().any(|entry| entry.listing_key == listing_key));
+    assert_eq!(find_user_counts(&tagger_id).await.tagged, 1);
+
+    // The seller deletes the listing; the tagger's tag file stays.
+    test.del(&seller_kp, &listing_path).await?;
+
+    let cached =
+        TagListing::get_from_index(&seller_id, Some(&listing_id), None, None, None, None, false)
+            .await
+            .unwrap()
+            .unwrap_or_default();
+    assert!(cached.is_empty(), "the listing's label scores must go");
+    let (taggers, _) =
+        <TagListing as nexus_common::models::tag::traits::TaggersCollection>::get_from_index(
+            vec![seller_id.as_str(), listing_id.as_str(), label],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(taggers.is_empty(), "the listing's taggers set must go");
+    let by_tag = ListingsByTagSearch::get_by_label(label, Pagination::default())
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        !by_tag.iter().any(|entry| entry.listing_key == listing_key),
+        "the deleted listing must leave the label's global timeline"
+    );
+    assert_eq!(find_user_counts(&tagger_id).await.tagged, 0);
+    let suggestions = TagSearch::get_by_label(label, &Pagination::default()).await?;
+    assert!(suggestions.is_none_or(|x| x.is_empty()));
+
+    // Re-created at the same id, the listing starts with no community tags.
+    let mut recreated = listing.clone();
+    recreated.listing_id = listing_id.clone();
+    test.put(&seller_kp, &listing_path, &recreated).await?;
+    let tags = TagListing::get_by_id(&seller_id, Some(&listing_id), None, None, None, None, None)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(tags.is_empty(), "stale tags must not reattach: {tags:?}");
+    let by_tag = ListingsByTagSearch::get_by_label(label, Pagination::default())
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(!by_tag.iter().any(|entry| entry.listing_key == listing_key));
+
+    // The tagger's later tag DEL finds nothing left to remove.
+    test.del(&tagger_kp, &tag_path).await?;
+    assert_eq!(find_user_counts(&tagger_id).await.tagged, 0);
+
+    test.del(&seller_kp, &listing_path).await?;
+    test.cleanup_user(&tagger_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn deleting_a_tagged_shop_clears_its_tag_indexes() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+
+    let owner_kp = Keypair::random();
+    let owner = PubkyAppUser {
+        bio: Some("deleting_a_tagged_shop_clears_its_tag_indexes".to_string()),
+        image: None,
+        links: None,
+        name: "Watcher:DeleteTaggedShop:Owner".to_string(),
+        status: None,
+    };
+    let owner_id = test.create_user(&owner_kp, &owner).await?;
+    let tagger_kp = Keypair::random();
+    let tagger = PubkyAppUser {
+        bio: Some("deleting_a_tagged_shop_clears_its_tag_indexes".to_string()),
+        image: None,
+        links: None,
+        name: "Watcher:DeleteTaggedShop:Tagger".to_string(),
+        status: None,
+    };
+    let tagger_id = test.create_user(&tagger_kp, &tagger).await?;
+
+    let shop_path = PubkyAppShop::hs_path();
+    test.put(&owner_kp, &shop_path, &test_shop(&owner_id))
+        .await?;
+    let tag = PubkyAppTag {
+        uri: shop_uri_builder(owner_id.clone()),
+        label: "gone-shop".to_string(),
+        created_at: Utc::now().timestamp_millis(),
+    };
+    let tag_path = tag.hs_path();
+    test.put(&tagger_kp, &tag_path, tag).await?;
+    assert_eq!(find_user_counts(&tagger_id).await.tagged, 1);
+
+    test.del(&owner_kp, &shop_path).await?;
+
+    let cached = TagShop::get_from_index(&owner_id, None, None, None, None, None, false)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(cached.is_empty(), "the shop's label scores must go");
+    assert_eq!(find_user_counts(&tagger_id).await.tagged, 0);
+
+    test.put(&owner_kp, &shop_path, &test_shop(&owner_id))
+        .await?;
+    let tags = TagShop::get_by_id(&owner_id, None, None, None, None, None, None)
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    assert!(tags.is_empty(), "stale tags must not reattach: {tags:?}");
+
+    test.del(&tagger_kp, &tag_path).await?;
+    test.del(&owner_kp, &shop_path).await?;
+    test.cleanup_user(&tagger_kp).await?;
+    test.cleanup_user(&owner_kp).await?;
+    Ok(())
+}

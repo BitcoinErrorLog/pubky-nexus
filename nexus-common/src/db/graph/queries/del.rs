@@ -85,16 +85,79 @@ pub fn delete_tag(user_id: &str, tag_id: &str) -> Query {
     .param("tag_id", tag_id)
 }
 
-/// Deletes the shop node of a seller and all its relationships
-/// # Arguments
-/// * `owner_id` - The unique identifier of the user who owns the shop
-pub fn delete_shop(owner_id: &str) -> Query {
+/// Deletes every `TAGGED` edge on a marketplace listing and, in the same
+/// statement, leaves one `TagCleanup` marker per deleted edge naming its
+/// tagger and label. The marker id is fresh per deleted edge.
+pub fn listing_tags_to_cleanup_markers(owner_id: &str, listing_id: &str, target: &str) -> Query {
     Query::new(
-        "delete_shop",
-        "MATCH (u:User {id: $owner_id})-[:HAS_SHOP]->(shop:Shop)
-         DETACH DELETE shop;",
+        "listing_tags_to_cleanup_markers",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Listing {id: $listing_id, owner_id: $owner_id})
+         CREATE (:TagCleanup {id: randomUUID(), target: $target, tagger_id: tagger.id,
+                              label: tag.label})
+         DELETE tag",
     )
-    .param("owner_id", owner_id.to_string())
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+    .param("target", target)
+}
+
+/// [`listing_tags_to_cleanup_markers`] for a marketplace shop.
+pub fn shop_tags_to_cleanup_markers(owner_id: &str, target: &str) -> Query {
+    Query::new(
+        "shop_tags_to_cleanup_markers",
+        "MATCH (tagger:User)-[tag:TAGGED]->(:Shop {owner_id: $owner_id})
+         CREATE (:TagCleanup {id: randomUUID(), target: $target, tagger_id: tagger.id,
+                              label: tag.label})
+         DELETE tag",
+    )
+    .param("owner_id", owner_id)
+    .param("target", target)
+}
+
+/// Deletes a marketplace listing node only if no `TAGGED` edge reaches it.
+/// The write lock on the node is taken before the check (creating a
+/// relationship locks both of its nodes), so a tag that commits first is
+/// seen and refuses the deletion, and a tag that comes after finds no node.
+///
+/// Returns one row, `blocked`, when the node exists; no row when it is
+/// already gone.
+pub fn delete_untagged_listing(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "delete_untagged_listing",
+        "MATCH (listing:Listing {id: $listing_id, owner_id: $owner_id})
+         SET listing.tag_cleanup_lock = true
+         REMOVE listing.tag_cleanup_lock
+         WITH listing,
+              EXISTS { MATCH ()-[:TAGGED]->(listing) } AS blocked
+         FOREACH (_ IN CASE WHEN blocked THEN [] ELSE [1] END | DETACH DELETE listing)
+         RETURN blocked",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
+/// [`delete_untagged_listing`] for a marketplace shop.
+pub fn delete_untagged_shop(owner_id: &str) -> Query {
+    Query::new(
+        "delete_untagged_shop",
+        "MATCH (shop:Shop {owner_id: $owner_id})
+         SET shop.tag_cleanup_lock = true
+         REMOVE shop.tag_cleanup_lock
+         WITH shop,
+              EXISTS { MATCH ()-[:TAGGED]->(shop) } AS blocked
+         FOREACH (_ IN CASE WHEN blocked THEN [] ELSE [1] END | DETACH DELETE shop)
+         RETURN blocked",
+    )
+    .param("owner_id", owner_id)
+}
+
+/// Deletes one `TagCleanup` marker once its tagger count is settled.
+pub fn delete_tag_cleanup_marker(id: &str) -> Query {
+    Query::new(
+        "delete_tag_cleanup_marker",
+        "MATCH (c:TagCleanup {id: $id}) DELETE c",
+    )
+    .param("id", id)
 }
 
 /// Deletes a listing node and all its relationships

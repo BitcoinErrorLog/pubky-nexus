@@ -27,6 +27,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE CONSTRAINT uniqueShopOwnerId IF NOT EXISTS FOR (s:Shop) REQUIRE s.owner_id IS UNIQUE",
         "CREATE CONSTRAINT uniqueListingId IF NOT EXISTS FOR (l:Listing) REQUIRE (l.owner_id, l.id) IS UNIQUE",
         "CREATE CONSTRAINT uniqueDropId IF NOT EXISTS FOR (d:Drop) REQUIRE (d.owner_id, d.id) IS UNIQUE",
+        "CREATE CONSTRAINT uniqueTagCleanupId IF NOT EXISTS FOR (c:TagCleanup) REQUIRE c.id IS UNIQUE",
     ];
 
     // Create indexes
@@ -51,6 +52,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE INDEX dropIdIndex IF NOT EXISTS FOR (d:Drop) ON (d.owner_id, d.id)",
         "CREATE INDEX dropStartsAtIndex IF NOT EXISTS FOR (d:Drop) ON (d.starts_at_ms)",
         "CREATE INDEX dropEndsAtIndex IF NOT EXISTS FOR (d:Drop) ON (d.ends_at_ms)",
+        "CREATE INDEX tagCleanupTargetIndex IF NOT EXISTS FOR (c:TagCleanup) ON (c.target)",
     ];
 
     let queries = constraints.iter().chain(indexes.iter());

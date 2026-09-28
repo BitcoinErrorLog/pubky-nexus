@@ -80,7 +80,12 @@ pub(crate) async fn sync_put(
 pub async fn del(user_id: PubkyId, listing_id: String) -> Result<(), EventProcessorError> {
     debug!("Deleting listing: {}/{}", user_id, listing_id);
 
-    ListingDetails::delete(&user_id, &listing_id).await?;
+    super::tag::del_tagged_target(super::tag::TagTarget::Listing {
+        owner_id: &user_id,
+        listing_id: &listing_id,
+    })
+    .await?;
+    ListingDetails::delete_indexes(&user_id, &listing_id).await?;
 
     Ok(())
 }

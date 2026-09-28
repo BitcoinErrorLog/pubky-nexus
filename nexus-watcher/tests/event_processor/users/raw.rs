@@ -32,7 +32,9 @@ async fn test_homeserver_user_put_event() -> Result<()> {
         name: "Watcher:UserEvent:User".to_string(),
         status: Some("Running Nexus Watcher".to_string()),
     };
-    let (_, events_in_redis_before) = Event::get_events_from_redis(None, 1000).await.unwrap();
+    // A 1000-line page is already full by the time this test runs in the
+    // watcher suite, so both reads would return 1000 and hide the new line.
+    let (_, events_in_redis_before) = Event::get_events_from_redis(None, 100_000).await.unwrap();
 
     let user_id = test.create_user(&user_kp, &user).await?;
 
@@ -61,7 +63,7 @@ async fn test_homeserver_user_put_event() -> Result<()> {
 
     // CACHE_OP: Check if the event writes in the graph
     // User:Counts:user_id
-    let (_, events_in_redis_after) = Event::get_events_from_redis(None, 1000).await.unwrap();
+    let (_, events_in_redis_after) = Event::get_events_from_redis(None, 100_000).await.unwrap();
     assert!(events_in_redis_after > events_in_redis_before);
 
     let user_counts = UserCounts::get_from_index(&user_id)
