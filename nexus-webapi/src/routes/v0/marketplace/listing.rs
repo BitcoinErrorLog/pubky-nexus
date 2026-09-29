@@ -15,7 +15,8 @@ use utoipa::OpenApi;
     get,
     path = LISTING_ROUTE,
     description = "Listing details together with the compact seller and listing reputation objects. \
-Reputation fields are absent (not zero) when no review is indexed for the scope.",
+Reputation fields are absent (not zero) when no review is indexed for the scope. \
+An `active` auction whose `auction_ends_at` has been reached is served with `state` `ended`.",
     tag = "Marketplace",
     params(
         ("seller_id" = String, Path, description = "Seller Pubky ID"),

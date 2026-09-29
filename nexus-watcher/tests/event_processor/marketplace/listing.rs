@@ -746,6 +746,215 @@ async fn test_stream_listings_sorted_by_auction_end() -> Result<()> {
     Ok(())
 }
 
+/// Ended auctions stay `state: active` in the seller's record, so the index
+/// derives the ended state from `auction_ends_at` when it serves a read.
+#[tokio_shared_rt::test(shared)]
+async fn test_ended_auctions_are_not_served_as_active() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+
+    let user_kp = Keypair::random();
+    let user = PubkyAppUser {
+        bio: Some("test_ended_auctions_are_not_served_as_active".to_string()),
+        image: None,
+        links: None,
+        name: "Watcher:EndedAuction:User".to_string(),
+        status: None,
+    };
+    let user_id = test.create_user(&user_kp, &user).await?;
+    let category = format!("cat-{}", chrono::Utc::now().timestamp_micros());
+
+    // `boundary_ms` is an hour ahead of the real clock, so the wall-clock
+    // reads at the end of the test see Expired as ended and the others open.
+    // The injected clocks pin the exact-boundary behavior.
+    let day_ms = 86_400_000;
+    let boundary_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+    let rfc3339 = |ms: i64| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    let starts_at = "2025-01-01T00:00:00Z";
+
+    let mut listing_ids = std::collections::HashMap::new();
+    let auctions = [
+        (
+            "Expired",
+            boundary_ms - day_ms,
+            PubkyAppListingState::Active,
+        ),
+        ("Boundary", boundary_ms, PubkyAppListingState::Active),
+        ("Open", boundary_ms + day_ms, PubkyAppListingState::Active),
+        (
+            "PausedExpired",
+            boundary_ms - day_ms,
+            PubkyAppListingState::Paused,
+        ),
+    ];
+    for (title, ends_at_ms, state) in auctions {
+        let mut listing =
+            test_auction_listing(&user_id, title, &category, starts_at, &rfc3339(ends_at_ms));
+        listing.state = state;
+        let (listing_id, _) = test.create_listing(&user_kp, &listing).await?;
+        listing_ids.insert(title, listing_id);
+    }
+    let fixed_listing = test_listing(
+        &user_id,
+        "Fixed",
+        &category,
+        PubkyAppListingCondition::New,
+        12_000,
+    );
+    let (fixed_id, _) = test.create_listing(&user_kp, &fixed_listing).await?;
+    listing_ids.insert("Fixed", fixed_id);
+
+    let titles_at = |state: Option<PubkyAppListingState>, now_ms: i64| {
+        let filters = ListingStreamFilters {
+            category: Some(category.clone()),
+            state,
+            ..Default::default()
+        };
+        async move {
+            let stream = ListingStream::get_listings_at(
+                filters,
+                Pagination::default(),
+                SortOrder::Ascending,
+                ListingStreamSorting::Timeline,
+                now_ms,
+            )
+            .await
+            .unwrap()
+            .unwrap_or_default();
+            let mut entries: Vec<(String, PubkyAppListingState)> = stream
+                .0
+                .iter()
+                .map(|entry| (entry.title.clone(), entry.state))
+                .collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            entries
+        }
+    };
+    let entry = |title: &str, state: PubkyAppListingState| (title.to_string(), state);
+    use PubkyAppListingState::{Active, Ended, Paused};
+
+    // One millisecond before Boundary ends, only Expired has ended.
+    assert_eq!(
+        titles_at(Some(Active), boundary_ms - 1).await,
+        vec![
+            entry("Boundary", Active),
+            entry("Fixed", Active),
+            entry("Open", Active)
+        ],
+        "state=active drops the auction that ended a day earlier"
+    );
+    assert_eq!(
+        titles_at(Some(Ended), boundary_ms - 1).await,
+        vec![entry("Expired", Ended)],
+    );
+
+    // At exactly the end time the auction is ended; it is not active.
+    assert_eq!(
+        titles_at(Some(Active), boundary_ms).await,
+        vec![entry("Fixed", Active), entry("Open", Active)],
+        "an auction whose end time equals now is no longer active"
+    );
+    assert_eq!(
+        titles_at(Some(Ended), boundary_ms).await,
+        vec![entry("Boundary", Ended), entry("Expired", Ended)],
+    );
+    assert_eq!(
+        titles_at(Some(Active), boundary_ms + 1).await,
+        vec![entry("Fixed", Active), entry("Open", Active)],
+    );
+
+    // The seller's paused choice is never overridden by the clock.
+    assert_eq!(
+        titles_at(Some(Paused), boundary_ms + 2 * day_ms).await,
+        vec![entry("PausedExpired", Paused)],
+    );
+
+    // Without a state filter every entry still reports its effective state.
+    assert_eq!(
+        titles_at(None, boundary_ms).await,
+        vec![
+            entry("Boundary", Ended),
+            entry("Expired", Ended),
+            entry("Fixed", Active),
+            entry("Open", Active),
+            entry("PausedExpired", Paused),
+        ],
+    );
+
+    // The end-time sort obeys the same filter: an "ending soon" stream of
+    // active auctions holds only the open ones.
+    let stream = ListingStream::get_listings_at(
+        ListingStreamFilters {
+            category: Some(category.clone()),
+            state: Some(Active),
+            ..Default::default()
+        },
+        Pagination::default(),
+        SortOrder::Ascending,
+        ListingStreamSorting::EndsAt,
+        boundary_ms,
+    )
+    .await
+    .unwrap()
+    .expect("The open auctions should be streamed");
+    let ending_soon: Vec<&str> = stream.0.iter().map(|e| e.title.as_str()).collect();
+    assert_eq!(ending_soon, vec!["Open"]);
+
+    // The wall-clock entry points agree with the injected clock: Expired is
+    // ended, Boundary and Open are still running an hour ahead of now.
+    let stream = ListingStream::get_listings(
+        ListingStreamFilters {
+            category: Some(category.clone()),
+            state: Some(Active),
+            sale_format: Some(ListingSaleFormat::Auction),
+            ..Default::default()
+        },
+        Pagination::default(),
+        SortOrder::Ascending,
+        ListingStreamSorting::EndsAt,
+    )
+    .await
+    .unwrap()
+    .expect("The running auctions should be streamed");
+    let running: Vec<&str> = stream.0.iter().map(|e| e.title.as_str()).collect();
+    assert_eq!(running, vec!["Boundary", "Open"]);
+
+    // The single-listing read derives the state too; the stored state stays
+    // what the seller published, in the graph and in the Redis cache.
+    let expired_id = &listing_ids["Expired"];
+    let served = ListingDetails::get_by_id_at(&user_id, expired_id, boundary_ms)
+        .await
+        .unwrap()
+        .expect("expired auction");
+    assert_eq!(served.state, Ended);
+    let boundary_id = &listing_ids["Boundary"];
+    let served = ListingDetails::get_by_id_at(&user_id, boundary_id, boundary_ms - 1)
+        .await
+        .unwrap()
+        .expect("boundary auction");
+    assert_eq!(served.state, Active);
+    for stored in [
+        ListingDetails::get_from_graph(&user_id, expired_id)
+            .await
+            .unwrap()
+            .expect("graph listing"),
+        ListingDetails::get_from_index(&user_id, expired_id)
+            .await
+            .unwrap()
+            .expect("indexed listing"),
+    ] {
+        assert_eq!(stored.state, Active, "reads never rewrite the stored state");
+    }
+
+    // Cleanup user
+    test.cleanup_user(&user_kp).await?;
+
+    Ok(())
+}
+
 #[tokio_shared_rt::test(shared)]
 async fn test_auction_terms_backfill_reindexes_pre_term_rows() -> Result<()> {
     let mut test = WatcherTest::setup().await?;
