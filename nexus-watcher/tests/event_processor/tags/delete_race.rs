@@ -18,7 +18,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use nexus_common::db::graph::Query;
-use nexus_common::db::{fetch_key_from_graph, get_redis_conn};
+use nexus_common::db::{fetch_key_from_graph, get_redis_conn, Neo4JConfig};
 use nexus_common::models::event::EventProcessorError;
 use nexus_common::models::marketplace::ListingsByTagSearch;
 use nexus_common::models::post::search::PostsByTagSearch;
@@ -432,6 +432,30 @@ impl World {
         })
     }
 
+    /// Whether the target's write lock can be taken on a connection of its
+    /// own, which no pool recycling of the cancelled writer's connection can
+    /// release.
+    async fn target_lock_is_free(&self) -> Result<bool> {
+        let lock = match self.kind {
+            Kind::Post => "MATCH (:User {id: $owner})-[:AUTHORED]->(t:Post {id: $id})",
+            Kind::User => "MATCH (t:User {id: $owner})",
+            Kind::Listing => "MATCH (t:Listing {id: $id, owner_id: $owner})",
+            Kind::Shop => "MATCH (t:Shop {owner_id: $owner})",
+        };
+        let config = Neo4JConfig::default();
+        let graph = neo4rs::Graph::new(config.uri.as_str(), &config.user, &config.password).await?;
+        let query = neo4rs::query(&format!(
+            "{lock} SET t.tag_cleanup_lock = true REMOVE t.tag_cleanup_lock"
+        ))
+        .param("owner", self.owner_id.as_str())
+        .param("id", self.target_id.as_str());
+        Ok(
+            tokio::time::timeout(Duration::from_secs(10), graph.run(query))
+                .await
+                .is_ok_and(|done| done.is_ok()),
+        )
+    }
+
     async fn tagged(&self) -> u32 {
         find_user_counts(&self.tagger_id).await.tagged
     }
@@ -777,6 +801,10 @@ async fn a_cancelled_tag_put_releases_its_locks_and_leaves_no_edge() -> Result<(
         gate.reached.notified().await;
         put.abort();
         assert!(put.await.is_err_and(|e| e.is_cancelled()));
+        assert!(
+            w.target_lock_is_free().await?,
+            "{kind:?}: the cancelled PUT still holds the target's lock"
+        );
 
         tokio::time::timeout(Duration::from_secs(30), w.delete_now())
             .await
