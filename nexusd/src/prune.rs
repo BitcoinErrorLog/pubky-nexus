@@ -13,11 +13,22 @@ pub fn render_prune_summary(summary: &StaleListingPrune, apply: bool) -> String 
     for (owner_id, listing_id) in &summary.stale {
         lines.push(format!("gone from homeserver: {owner_id}/{listing_id}"));
     }
+    for (owner_id, listing_id) in &summary.to_restore {
+        lines.push(format!(
+            "record back after an interrupted run: {owner_id}/{listing_id}"
+        ));
+    }
     if apply {
         lines.push(format!("Deleted {} stale listing(s)", summary.pruned));
-    } else if !summary.stale.is_empty() {
+        if summary.restored > 0 {
+            lines.push(format!(
+                "Re-indexed {} listing(s) whose record came back",
+                summary.restored
+            ));
+        }
+    } else if !summary.stale.is_empty() || !summary.to_restore.is_empty() {
         lines.push(
-            "Dry run: nothing deleted. Re-run with --apply to delete the listings above"
+            "Dry run: nothing changed. Re-run with --apply to delete the listings above"
                 .to_string(),
         );
     }
@@ -48,7 +59,9 @@ mod tests {
             stale: (0..stale)
                 .map(|i| ("owner".to_string(), format!("listing{i}")))
                 .collect(),
+            to_restore: Vec::new(),
             pruned,
+            restored: 0,
             failed,
         }
     }
@@ -59,7 +72,7 @@ mod tests {
         assert!(report.contains("2 gone"));
         assert!(report.contains("gone from homeserver: owner/listing0"));
         assert!(report.contains("gone from homeserver: owner/listing1"));
-        assert!(report.contains("Dry run: nothing deleted"));
+        assert!(report.contains("Dry run: nothing changed"));
         assert!(!report.contains("Deleted"));
         assert!(prune_outcome(&summary(2, 0, 0)).is_ok());
     }
@@ -69,6 +82,19 @@ mod tests {
         let report = render_prune_summary(&summary(2, 2, 0), true);
         assert!(report.contains("Deleted 2 stale listing(s)"));
         assert!(!report.contains("Dry run"));
+    }
+
+    #[test]
+    fn a_resumed_run_reports_what_it_restored() {
+        let mut resumed = summary(0, 0, 0);
+        resumed.to_restore = vec![("owner".to_string(), "back".to_string())];
+        resumed.restored = 1;
+        let report = render_prune_summary(&resumed, true);
+        assert!(report.contains("record back after an interrupted run: owner/back"));
+        assert!(report.contains("Re-indexed 1 listing(s) whose record came back"));
+        let dry = render_prune_summary(&resumed, false);
+        assert!(dry.contains("Dry run: nothing changed"));
+        assert!(!dry.contains("Re-indexed"));
     }
 
     #[test]
