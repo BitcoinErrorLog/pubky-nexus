@@ -27,9 +27,23 @@ pub async fn sync_put(shop: PubkyAppShop, user_id: PubkyId) -> Result<(), EventP
 }
 
 pub async fn del(user_id: PubkyId) -> Result<(), EventProcessorError> {
+    del_with_hook(user_id, &super::tag::NoopTargetTagCleanupHook).await
+}
+
+/// [`del`] with deterministic interleaving points in the tag cleanup.
+/// Production callers use [`del`].
+#[doc(hidden)]
+pub async fn del_with_hook(
+    user_id: PubkyId,
+    hook: &dyn super::tag::TargetTagCleanupHook,
+) -> Result<(), EventProcessorError> {
     debug!("Deleting shop: {}", user_id);
 
-    super::tag::del_tagged_target(super::tag::TagTarget::Shop { owner_id: &user_id }).await?;
+    super::tag::del_tagged_target_with_hook(
+        super::tag::TagTarget::Shop { owner_id: &user_id },
+        hook,
+    )
+    .await?;
     ShopDetails::delete_indexes(&user_id).await?;
 
     Ok(())

@@ -5,8 +5,8 @@ use chrono::Utc;
 use nexus_common::db::graph::Query;
 use nexus_common::db::kv::{ScoreAction, SortOrder};
 use nexus_common::db::{
-    exec_single_row, fetch_all_rows_from_graph, fetch_key_from_graph, queries, OperationOutcome,
-    RedisOps,
+    exec_single_row, fetch_all_rows_from_graph, queries, start_graph_txn, GraphTxn,
+    OperationOutcome, RedisOps,
 };
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::marketplace::ListingsByTagSearch;
@@ -14,21 +14,74 @@ use nexus_common::models::notification::Notification;
 use nexus_common::models::post::search::PostsByTagSearch;
 use nexus_common::models::post::{PostCounts, PostStream};
 use nexus_common::models::tag::listing::{TagListing, LISTING_TAGS_KEY_PARTS};
-use nexus_common::models::tag::post::TagPost;
+use nexus_common::models::tag::post::{TagPost, POST_TAGS_KEY_PARTS};
 use nexus_common::models::tag::search::TagSearch;
 use nexus_common::models::tag::shop::{TagShop, SHOP_TAGS_KEY_PARTS};
 use nexus_common::models::tag::traits::{TagCollection, TaggersCollection};
-use nexus_common::models::tag::user::TagUser;
+use nexus_common::models::tag::user::{TagUser, USER_TAGS_KEY_PARTS};
 use nexus_common::models::user::UserCounts;
 use pubky_app_specs::{post_uri_builder, ParsedUri, PubkyAppTag, PubkyId, Resource};
 use tracing::debug;
 
-use super::utils::post_relationships_is_reply;
+use super::utils::{finish_txn, post_relationships_is_reply};
 
+/// Points of a tag write where integration tests inject a failure or a
+/// concurrent event.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWriteStep {
+    /// The tag PUT wrote its edge in its open transaction, holding the write
+    /// locks of the target and the tagger; no Redis index is written yet.
+    GraphWritten,
+    /// The untag deleted the edge in its open transaction, holding the write
+    /// locks of the target and the tagger; no Redis index is changed yet.
+    EdgeDeleted,
+    /// Every Redis index of the write is done; the transaction is not
+    /// committed yet.
+    IndexesWritten,
+}
+
+/// Internal deterministic seam for integration-testing tag writes against a
+/// deletion of their target.
+#[doc(hidden)]
+#[async_trait::async_trait]
+pub trait TagWriteHook: Sync {
+    async fn at(&self, _step: TagWriteStep) -> Result<(), EventProcessorError> {
+        Ok(())
+    }
+}
+
+struct NoopTagWriteHook;
+
+#[async_trait::async_trait]
+impl TagWriteHook for NoopTagWriteHook {}
+
+/// Indexes a tag PUT.
+///
+/// The edge and every Redis index of the tag are written inside one graph
+/// transaction that holds the write locks of the tagged target and the
+/// tagger. A deletion of the target locks the same node: it waits for the
+/// tag's Redis writes and then sees the committed edge, and a deletion that
+/// finished first leaves no target, so the PUT writes nothing. Any failure
+/// rolls the edge back, so the retried event starts from a clean state. The
+/// global autocomplete entry is written once the edge is committed, where a
+/// concurrent untag's unused-label check finds the edge.
 pub async fn sync_put(
     tag: PubkyAppTag,
     tagger_id: PubkyId,
     tag_id: String,
+) -> Result<(), EventProcessorError> {
+    sync_put_with_hook(tag, tagger_id, tag_id, &NoopTagWriteHook).await
+}
+
+/// [`sync_put`] with deterministic interleaving points. Production callers
+/// use [`sync_put`].
+#[doc(hidden)]
+pub async fn sync_put_with_hook(
+    tag: PubkyAppTag,
+    tagger_id: PubkyId,
+    tag_id: String,
+    hook: &dyn TagWriteHook,
 ) -> Result<(), EventProcessorError> {
     debug!("Indexing new tag: {} -> {}", tagger_id, tag_id);
 
@@ -40,20 +93,29 @@ pub async fn sync_put(
     let target_dependency_key = RetryEvent::generate_index_key_from_uri(&parsed_uri);
     let indexed_at = Utc::now().timestamp_millis();
 
-    match parsed_uri.resource {
+    let mut txn = start_graph_txn().await?;
+    let result = match parsed_uri.resource {
         // If post_id is in the tagged URI, we place tag to a post.
         Resource::Post(post_id) => {
             // Place the tag on post
             put_sync_post(
-                tagger_id, user_id, &post_id, &tag_id, &tag.label, &tag.uri, indexed_at,
+                &mut txn, hook, tagger_id, user_id, &post_id, &tag_id, &tag.label, &tag.uri,
+                indexed_at,
             )
             .await
         }
         // If no post_id in the tagged URI, we place tag to a user.
-        Resource::User => put_sync_user(tagger_id, user_id, &tag_id, &tag.label, indexed_at).await,
+        Resource::User => {
+            put_sync_user(
+                &mut txn, hook, tagger_id, user_id, &tag_id, &tag.label, indexed_at,
+            )
+            .await
+        }
         // Marketplace targets: tags on listings and shops (community layer).
         Resource::Listing(listing_id) => {
             put_sync_listing(
+                &mut txn,
+                hook,
                 tagger_id,
                 user_id,
                 &listing_id,
@@ -66,6 +128,8 @@ pub async fn sync_put(
         }
         Resource::Shop => {
             put_sync_shop(
+                &mut txn,
+                hook,
                 tagger_id,
                 user_id,
                 &tag_id,
@@ -78,7 +142,12 @@ pub async fn sync_put(
         other => Err(EventProcessorError::generic(format!(
             "The tagged resource is not Post, User, Listing or Shop, instead is: {other:?}"
         ))),
-    }
+    };
+    finish_txn(txn, result).await?;
+
+    // Add tag to search index
+    TagSearch::put_to_index(&[tag.label]).await?;
+    Ok(())
 }
 
 /// Handles the synchronization of a tagged post by updating the graph, indexes, and related counts.
@@ -91,7 +160,10 @@ pub async fn sync_put(
 /// - `post_uri` - A `String` representing the homeserver URI of the tagged post.
 /// - `indexed_at` - A 64-bit integer representing the timestamp when the post was indexed.
 ///
+#[allow(clippy::too_many_arguments)]
 async fn put_sync_post(
+    txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
     tagger_user_id: PubkyId,
     author_id: PubkyId,
     post_id: &str,
@@ -101,6 +173,7 @@ async fn put_sync_post(
     indexed_at: i64,
 ) -> Result<(), EventProcessorError> {
     match TagPost::put_to_graph(
+        txn,
         &tagger_user_id,
         &author_id,
         Some(post_id),
@@ -122,9 +195,9 @@ async fn put_sync_post(
             Err(EventProcessorError::MissingDependency { dependency })
         }
         OperationOutcome::CreatedOrDeleted => {
+            hook.at(TagWriteStep::GraphWritten).await?;
             // SAVE TO INDEXES
             let post_key_slice: &[&str] = &[&author_id, post_id];
-            let tag_label_slice = &[tag_label.to_string()];
 
             let indexing_results = tokio::join!(
                 // Update user counts for tagger
@@ -177,9 +250,7 @@ async fn put_sync_post(
                 // Add post to global label timeline
                 PostsByTagSearch::put_to_index(&author_id, post_id, tag_label),
                 // Save new notification
-                Notification::new_post_tag(&tagger_user_id, &author_id, tag_label, post_uri),
-                // Add tag to search index
-                TagSearch::put_to_index(tag_label_slice)
+                Notification::new_post_tag(&tagger_user_id, &author_id, tag_label, post_uri)
             );
 
             indexing_results.0?;
@@ -190,8 +261,8 @@ async fn put_sync_post(
             indexing_results.5?;
             indexing_results.6?;
             indexing_results.7?;
-            indexing_results.8?;
 
+            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
@@ -206,6 +277,8 @@ async fn put_sync_post(
 /// - `tag_label` - A `String` representing the label of the tag.
 /// - `indexed_at` - A 64-bit integer representing the timestamp when the user was indexed.
 async fn put_sync_user(
+    txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
     tagger_user_id: PubkyId,
     tagged_user_id: PubkyId,
     tag_id: &str,
@@ -213,6 +286,7 @@ async fn put_sync_user(
     indexed_at: i64,
 ) -> Result<(), EventProcessorError> {
     match TagUser::put_to_graph(
+        txn,
         &tagger_user_id,
         &tagged_user_id,
         None,
@@ -233,7 +307,7 @@ async fn put_sync_user(
             Err(EventProcessorError::MissingDependency { dependency })
         }
         OperationOutcome::CreatedOrDeleted => {
-            let tag_label_slice = &[tag_label.to_string()];
+            hook.at(TagWriteStep::GraphWritten).await?;
 
             // SAVE TO INDEX
             let indexing_results = tokio::join!(
@@ -259,9 +333,7 @@ async fn put_sync_user(
                 // Add tagger to the user taggers list
                 TagUser::add_tagger_to_index(&tagged_user_id, None, &tagger_user_id, tag_label),
                 // Save new notification
-                Notification::new_user_tag(&tagger_user_id, &tagged_user_id, tag_label),
-                // Add tag to search index
-                TagSearch::put_to_index(tag_label_slice)
+                Notification::new_user_tag(&tagger_user_id, &tagged_user_id, tag_label)
             );
 
             indexing_results.0?;
@@ -269,8 +341,8 @@ async fn put_sync_user(
             indexing_results.2?;
             indexing_results.3?;
             indexing_results.4?;
-            indexing_results.5?;
 
+            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
@@ -291,7 +363,10 @@ async fn put_sync_user(
 /// - `dependency_key` - Retry-manager key of the listing, used when the
 ///   listing is not indexed yet.
 /// - `indexed_at` - Timestamp (ms) when the tag was indexed.
+#[allow(clippy::too_many_arguments)]
 async fn put_sync_listing(
+    txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
     tagger_user_id: PubkyId,
     seller_id: PubkyId,
     listing_id: &str,
@@ -301,6 +376,7 @@ async fn put_sync_listing(
     indexed_at: i64,
 ) -> Result<(), EventProcessorError> {
     match TagListing::put_to_graph(
+        txn,
         &tagger_user_id,
         &seller_id,
         Some(listing_id),
@@ -315,7 +391,7 @@ async fn put_sync_listing(
             dependency: vec![dependency_key],
         }),
         OperationOutcome::CreatedOrDeleted => {
-            let tag_label_slice = &[tag_label.to_string()];
+            hook.at(TagWriteStep::GraphWritten).await?;
 
             let indexing_results = tokio::join!(
                 // Update user counts for tagger
@@ -335,17 +411,15 @@ async fn put_sync_listing(
                     tag_label
                 ),
                 // Add listing to the global label timeline
-                ListingsByTagSearch::put_to_index(&seller_id, listing_id, tag_label),
-                // Add tag to search index
-                TagSearch::put_to_index(tag_label_slice)
+                ListingsByTagSearch::put_to_index(&seller_id, listing_id, tag_label)
             );
 
             indexing_results.0?;
             indexing_results.1?;
             indexing_results.2?;
             indexing_results.3?;
-            indexing_results.4?;
 
+            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
@@ -363,7 +437,10 @@ async fn put_sync_listing(
 /// - `dependency_key` - Retry-manager key of the shop, used when the shop is
 ///   not indexed yet.
 /// - `indexed_at` - Timestamp (ms) when the tag was indexed.
+#[allow(clippy::too_many_arguments)]
 async fn put_sync_shop(
+    txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
     tagger_user_id: PubkyId,
     owner_id: PubkyId,
     tag_id: &str,
@@ -372,6 +449,7 @@ async fn put_sync_shop(
     indexed_at: i64,
 ) -> Result<(), EventProcessorError> {
     match TagShop::put_to_graph(
+        txn,
         &tagger_user_id,
         &owner_id,
         None,
@@ -386,7 +464,7 @@ async fn put_sync_shop(
             dependency: vec![dependency_key],
         }),
         OperationOutcome::CreatedOrDeleted => {
-            let tag_label_slice = &[tag_label.to_string()];
+            hook.at(TagWriteStep::GraphWritten).await?;
 
             let indexing_results = tokio::join!(
                 // Update user counts for tagger
@@ -399,26 +477,53 @@ async fn put_sync_shop(
                     ScoreAction::Increment(1.0)
                 ),
                 // Add tagger to the shop taggers list
-                TagShop::add_tagger_to_index(&owner_id, None, &tagger_user_id, tag_label),
-                // Add tag to search index
-                TagSearch::put_to_index(tag_label_slice)
+                TagShop::add_tagger_to_index(&owner_id, None, &tagger_user_id, tag_label)
             );
 
             indexing_results.0?;
             indexing_results.1?;
             indexing_results.2?;
-            indexing_results.3?;
 
+            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
 }
 
+/// Indexes a tag DEL (an untag).
+///
+/// Like [`sync_put`], the edge deletion and every Redis index change run in
+/// one graph transaction holding the write locks of the target and the
+/// tagger, so a deletion of the target cannot interleave: it waits for the
+/// untag, or it finished first and the untag finds no edge.
 pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorError> {
+    del_with_hook(user_id, tag_id, &NoopTagWriteHook).await
+}
+
+/// [`del`] with deterministic interleaving points. Production callers use
+/// [`del`].
+#[doc(hidden)]
+pub async fn del_with_hook(
+    user_id: PubkyId,
+    tag_id: String,
+    hook: &dyn TagWriteHook,
+) -> Result<(), EventProcessorError> {
     debug!("Deleting tag: {} -> {}", user_id, tag_id);
-    let tag_details = TagUser::del_from_graph(&user_id, &tag_id).await?;
+    let mut txn = start_graph_txn().await?;
+    let result = del_in_txn(&mut txn, hook, user_id, tag_id).await;
+    finish_txn(txn, result).await
+}
+
+async fn del_in_txn(
+    txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
+    user_id: PubkyId,
+    tag_id: String,
+) -> Result<(), EventProcessorError> {
+    let tag_details = TagUser::del_from_graph(txn, &user_id, &tag_id).await?;
     // CHOOSE THE EVENT TYPE
     if let Some(target) = tag_details {
+        hook.at(TagWriteStep::EdgeDeleted).await?;
         let label = target.label.clone();
         match (
             target.user_id,
@@ -430,19 +535,19 @@ pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorE
         ) {
             // Delete user related indexes
             (Some(tagged_id), None, None, None, None, None) => {
-                del_sync_user(user_id, &tagged_id, &label).await?;
+                del_sync_user(txn, user_id, &tagged_id, &label).await?;
             }
             // Delete post related indexes
             (None, Some(post_id), Some(author_id), None, None, None) => {
-                del_sync_post(user_id, &post_id, &author_id, &label).await?;
+                del_sync_post(txn, user_id, &post_id, &author_id, &label).await?;
             }
             // Delete marketplace listing related indexes
             (None, None, None, Some(listing_id), Some(listing_owner_id), None) => {
-                del_sync_listing(user_id, &listing_id, &listing_owner_id, &label).await?;
+                del_sync_listing(txn, user_id, &listing_id, &listing_owner_id, &label).await?;
             }
             // Delete marketplace shop related indexes
             (None, None, None, None, None, Some(shop_owner_id)) => {
-                del_sync_shop(user_id, &shop_owner_id, &label).await?;
+                del_sync_shop(txn, user_id, &shop_owner_id, &label).await?;
             }
             // Handle other unexpected cases
             _ => {
@@ -452,6 +557,7 @@ pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorE
     } else {
         return Err(EventProcessorError::SkipIndexing);
     }
+    hook.at(TagWriteStep::IndexesWritten).await?;
     Ok(())
 }
 
@@ -482,6 +588,9 @@ pub enum TargetTagCleanupStep {
     /// The round saw no edge, marker or indexed label; the target is not
     /// deleted yet.
     FinalCheckPassed,
+    /// The target's write lock is held and the edges, markers and indexed
+    /// labels were read empty under it; the node is about to be deleted.
+    FinalLocked,
 }
 
 /// Internal deterministic seam for integration-testing cleanup retries.
@@ -493,7 +602,8 @@ pub trait TargetTagCleanupHook: Sync {
     }
 }
 
-struct NoopTargetTagCleanupHook;
+#[doc(hidden)]
+pub struct NoopTargetTagCleanupHook;
 
 #[async_trait::async_trait]
 impl TargetTagCleanupHook for NoopTargetTagCleanupHook {}
@@ -531,15 +641,24 @@ impl TagTarget<'_> {
         }
     }
 
-    /// Deletes the target node only if no edge reaches it; see
-    /// [`queries::del::delete_untagged_listing`].
-    fn finalize_query(self) -> Query {
+    /// Takes the target's write lock; see [`queries::del::lock_listing`].
+    fn lock_query(self) -> Query {
         match self {
             TagTarget::Listing {
                 owner_id,
                 listing_id,
-            } => queries::del::delete_untagged_listing(owner_id, listing_id),
-            TagTarget::Shop { owner_id } => queries::del::delete_untagged_shop(owner_id),
+            } => queries::del::lock_listing(owner_id, listing_id),
+            TagTarget::Shop { owner_id } => queries::del::lock_shop(owner_id),
+        }
+    }
+
+    fn delete_query(self) -> Query {
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => queries::del::delete_listing(owner_id, listing_id),
+            TagTarget::Shop { owner_id } => queries::del::delete_shop(owner_id),
         }
     }
 
@@ -619,6 +738,43 @@ impl TagTarget<'_> {
             .collect())
     }
 
+    /// Deletes the target node if it has no edge, marker or indexed label,
+    /// read under its write lock. Returns whether the node is gone.
+    ///
+    /// Tag PUTs and untags hold the same lock from their graph write through
+    /// their Redis writes, so under it none is half done: each either
+    /// finished, and its edge or indexed label is seen here and refuses the
+    /// deletion, or it starts after the deletion and finds no target.
+    async fn delete_if_settled(
+        self,
+        hook: &dyn TargetTagCleanupHook,
+    ) -> Result<bool, EventProcessorError> {
+        let mut txn = start_graph_txn().await?;
+        let result = self.delete_if_settled_in(&mut txn, hook).await;
+        finish_txn(txn, result).await
+    }
+
+    async fn delete_if_settled_in(
+        self,
+        txn: &mut GraphTxn,
+        hook: &dyn TargetTagCleanupHook,
+    ) -> Result<bool, EventProcessorError> {
+        if txn.fetch_row(self.lock_query()).await?.is_none() {
+            return Ok(true);
+        }
+        let edges = txn.fetch_all(self.edges_query()).await?;
+        let markers = txn
+            .fetch_all(queries::get::tag_cleanup_markers(&self.marker_target()))
+            .await?;
+        let labels = self.indexed_labels().await?;
+        if !(edges.is_empty() && markers.is_empty() && labels.is_empty()) {
+            return Ok(false);
+        }
+        hook.at(TargetTagCleanupStep::FinalLocked).await?;
+        txn.run(self.delete_query()).await?;
+        Ok(true)
+    }
+
     /// Removes one label's target indexes: taggers set, the listing's
     /// global-timeline membership, the autocomplete entry when the label is
     /// unused, and last the label score that lets a retry find the label.
@@ -691,7 +847,8 @@ impl TagTarget<'_> {
 /// Redis details afterwards.
 ///
 /// Retry-safe at every step, and exact under racing tag events:
-/// - One Cypher statement deletes the target's edges and leaves a
+/// - One Cypher statement, taken under the target's write lock, deletes the
+///   target's edges and leaves a
 ///   `TagCleanup` marker, with a fresh id, per edge it deleted. A tagger's
 ///   own untag that removes an edge first leaves no marker and counts itself
 ///   down; one that arrives after finds no edge and counts nothing.
@@ -705,10 +862,12 @@ impl TagTarget<'_> {
 ///
 /// Rounds repeat until the target has no edge, no marker and no indexed
 /// label, which also sweeps a tag that landed while the cleanup ran. The
-/// node is then deleted by one statement that holds its write lock while it
-/// re-checks for edges: a tag committed after the round's reads
-/// refuses the deletion and gets its own round, and a tag after the
-/// deletion finds no target and takes its missing-dependency path.
+/// node is then deleted in a transaction that takes its write lock and
+/// re-reads edges, markers and indexed labels under it. Tag PUTs and untags
+/// hold that lock from their graph write through their Redis writes: one
+/// still running is waited for, and what it wrote is seen and refuses the
+/// deletion, which then gets another round; one that starts after the
+/// deletion finds no target and writes nothing.
 pub async fn del_tagged_target(target: TagTarget<'_>) -> Result<(), EventProcessorError> {
     del_tagged_target_with_hook(target, &NoopTargetTagCleanupHook).await
 }
@@ -729,9 +888,7 @@ pub async fn del_tagged_target_with_hook(
         let mut labels = target.indexed_labels().await?;
         if edges.is_empty() && markers.is_empty() && labels.is_empty() {
             hook.at(TargetTagCleanupStep::FinalCheckPassed).await?;
-            let blocked: Option<bool> =
-                fetch_key_from_graph(target.finalize_query(), "blocked").await?;
-            if blocked != Some(true) {
+            if target.delete_if_settled(hook).await? {
                 return Ok(());
             }
             continue;
@@ -779,7 +936,123 @@ pub async fn del_tagged_target_with_hook(
     ))
 }
 
+/// Removes the tag indexes of a post that is being deleted, in the
+/// deletion's transaction (which holds the post's write lock, so no tag
+/// write is half done): every label's taggers, its global timeline and
+/// engagement entries, its score entry and, once no edge carries the label,
+/// its autocomplete entry. Tag edges still on the post (a moderated post can
+/// have them) are deleted first. Returns the tagger of each deleted edge;
+/// the caller decrements their `tagged` count as its last write.
+pub async fn purge_deleted_post_tags(
+    txn: &mut GraphTxn,
+    author_id: &str,
+    post_id: &str,
+) -> Result<Vec<String>, EventProcessorError> {
+    let mut taggers = Vec::new();
+    let mut labels = Vec::new();
+    for row in txn
+        .fetch_all(queries::del::delete_post_tags(author_id, post_id))
+        .await?
+    {
+        taggers.push(
+            row.get::<String>("tagger_id")
+                .map_err(EventProcessorError::graph_query_failed)?,
+        );
+        let label: String = row
+            .get("label")
+            .map_err(EventProcessorError::graph_query_failed)?;
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    let score_key: Vec<&str> = [&POST_TAGS_KEY_PARTS[..], &[author_id, post_id]].concat();
+    for (label, _) in TagPost::try_from_index_sorted_set(
+        &score_key,
+        None,
+        None,
+        None,
+        None,
+        SortOrder::Descending,
+        None,
+    )
+    .await?
+    .unwrap_or_default()
+    {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    for label in &labels {
+        loop {
+            let (label_taggers, _) = <TagPost as TaggersCollection>::get_from_index(
+                vec![author_id, post_id, label],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+            if label_taggers.is_empty() {
+                break;
+            }
+            TagPost(label_taggers)
+                .del_from_index(author_id, Some(post_id), label)
+                .await?;
+        }
+        PostsByTagSearch::purge_post(author_id, post_id, label).await?;
+        TagSearch::del_from_index_if_unused_in(txn, label).await?;
+        TagPost::remove_from_index_sorted_set(None, &score_key, &[label]).await?;
+    }
+    Ok(taggers)
+}
+
+/// [`purge_deleted_post_tags`] for a user that is being deleted. A user is
+/// deleted outright only when it has no relationship, so no edge is left to
+/// delete.
+pub async fn purge_deleted_user_tags(
+    txn: &mut GraphTxn,
+    user_id: &str,
+) -> Result<(), EventProcessorError> {
+    let score_key: Vec<&str> = [&USER_TAGS_KEY_PARTS[..], &[user_id]].concat();
+    let labels: Vec<String> = TagUser::try_from_index_sorted_set(
+        &score_key,
+        None,
+        None,
+        None,
+        None,
+        SortOrder::Descending,
+        None,
+    )
+    .await?
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(label, _)| label)
+    .collect();
+    for label in &labels {
+        loop {
+            let (label_taggers, _) = <TagUser as TaggersCollection>::get_from_index(
+                vec![user_id, label],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+            if label_taggers.is_empty() {
+                break;
+            }
+            TagUser(label_taggers)
+                .del_from_index(user_id, None, label)
+                .await?;
+        }
+        TagSearch::del_from_index_if_unused_in(txn, label).await?;
+        TagUser::remove_from_index_sorted_set(None, &score_key, &[label]).await?;
+    }
+    Ok(())
+}
+
 async fn del_sync_user(
+    txn: &mut GraphTxn,
     tagger_id: PubkyId,
     tagged_id: &str,
     tag_label: &str,
@@ -808,7 +1081,7 @@ async fn del_sync_user(
         // Save new notification
         Notification::new_user_untag(&tagger_id, tagged_id, tag_label),
         // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused(tag_label)
+        TagSearch::del_from_index_if_unused_in(txn, tag_label)
     );
 
     indexing_results.0?;
@@ -827,6 +1100,7 @@ async fn del_sync_user(
 /// search suggestions. Mirrors [`del_sync_post`] minus per-listing counts,
 /// engagement scoring, and notifications.
 async fn del_sync_listing(
+    txn: &mut GraphTxn,
     tagger_id: PubkyId,
     listing_id: &str,
     owner_id: &str,
@@ -853,7 +1127,7 @@ async fn del_sync_listing(
             Ok::<(), EventProcessorError>(())
         },
         // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused(tag_label)
+        TagSearch::del_from_index_if_unused_in(txn, tag_label)
     );
 
     indexing_results.0?;
@@ -867,6 +1141,7 @@ async fn del_sync_listing(
 /// Removes a deleted shop tag from the Redis indexes. Mirrors
 /// [`del_sync_user`] minus per-target counts and notifications.
 async fn del_sync_shop(
+    txn: &mut GraphTxn,
     tagger_id: PubkyId,
     owner_id: &str,
     tag_label: &str,
@@ -884,7 +1159,7 @@ async fn del_sync_shop(
             Ok::<(), EventProcessorError>(())
         },
         // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused(tag_label)
+        TagSearch::del_from_index_if_unused_in(txn, tag_label)
     );
 
     indexing_results.0?;
@@ -896,6 +1171,7 @@ async fn del_sync_shop(
 }
 
 async fn del_sync_post(
+    txn: &mut GraphTxn,
     tagger_id: PubkyId,
     post_id: &str,
     author_id: &str,
@@ -956,7 +1232,7 @@ async fn del_sync_post(
         // Save new notification
         Notification::new_post_untag(&tagger_id, author_id, tag_label, &post_uri),
         // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused(tag_label)
+        TagSearch::del_from_index_if_unused_in(txn, tag_label)
     );
 
     indexing_results.0?;

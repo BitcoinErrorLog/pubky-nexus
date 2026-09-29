@@ -1321,7 +1321,10 @@ fn build_query_with_params(
     query
 }
 
-/// Determines whether a user has any relationships
+/// Determines whether a user has any relationships. The statement takes the
+/// user's write lock before it counts, so run it in the deletion's
+/// transaction: a tag or another edge that commits first is counted, and one
+/// that starts later waits for the deletion to end and then finds no user.
 /// # Arguments
 /// * `user_id` - The unique identifier of the user
 pub fn user_is_safe_to_delete(user_id: &str) -> Query {
@@ -1329,6 +1332,9 @@ pub fn user_is_safe_to_delete(user_id: &str) -> Query {
         "user_is_safe_to_delete",
         "
         MATCH (u:User {id: $user_id})
+        SET u.tag_cleanup_lock = true
+        REMOVE u.tag_cleanup_lock
+        WITH u
         // Ensures all relationships to the user (u) are checked, counting as 0 if none exist
         OPTIONAL MATCH (u)-[r]-()
         // Checks if the user has any relationships
@@ -1342,7 +1348,9 @@ pub fn user_is_safe_to_delete(user_id: &str) -> Query {
 /// Checks if a post has any relationships that aren't in the set of allowed
 /// relationships for post deletion. If the post has such relationships,
 /// the query returns `true`; otherwise, `false`
-/// If the user or post does not exist, the query returns no rows.
+/// If the user or post does not exist, the query returns no rows. The
+/// statement takes the post's write lock before it counts, so run it in the
+/// deletion's transaction (see [`user_is_safe_to_delete`]).
 /// # Arguments
 /// * `author_id` - The unique identifier of the user who authored the post
 /// * `post_id` - The unique identifier of the post
@@ -1351,6 +1359,9 @@ pub fn post_is_safe_to_delete(author_id: &str, post_id: &str) -> Query {
         "post_is_safe_to_delete",
         "
         MATCH (u:User {id: $author_id})-[:AUTHORED]->(p:Post {id: $post_id})
+        SET p.tag_cleanup_lock = true
+        REMOVE p.tag_cleanup_lock
+        WITH u, p
         // Ensures all relationships to the post (p) are checked, counting as 0 if none exist
         OPTIONAL MATCH (p)-[r]-()
         WHERE NOT (

@@ -1,6 +1,6 @@
 use crate::db::kv::RedisResult;
 use crate::db::queries::get::get_tags;
-use crate::db::{fetch_key_from_graph, RedisOps};
+use crate::db::{fetch_key_from_graph, GraphTxn, RedisOps};
 use crate::models::create_zero_score_tuples;
 use crate::models::error::ModelResult;
 use crate::types::Pagination;
@@ -63,6 +63,24 @@ impl TagSearch {
         Self::del_from_index_if_unused_with_hook(tag_label, async {}).await
     }
 
+    /// [`Self::del_from_index_if_unused`] for an untag whose edge deletion
+    /// is still uncommitted in `txn`: the in-use checks run in `txn`, which
+    /// sees its own deletion, where another connection would still see the
+    /// edge.
+    pub async fn del_from_index_if_unused_in(
+        txn: &mut GraphTxn,
+        tag_label: &str,
+    ) -> ModelResult<()> {
+        if Self::label_in_use_in(txn, tag_label).await? {
+            return Ok(());
+        }
+        Self::del_from_index(tag_label).await?;
+        if Self::label_in_use_in(txn, tag_label).await? {
+            Self::put_to_index(&[tag_label.to_string()]).await?;
+        }
+        Ok(())
+    }
+
     /// [`Self::del_from_index_if_unused`] with `between` awaited after the
     /// first in-use check and before the removal. Production callers use
     /// [`Self::del_from_index_if_unused`].
@@ -83,6 +101,14 @@ impl TagSearch {
             Self::put_to_index(&[tag_label.to_string()]).await?;
         }
         Ok(())
+    }
+
+    async fn label_in_use_in(txn: &mut GraphTxn, tag_label: &str) -> ModelResult<bool> {
+        let row = txn
+            .fetch_row(crate::db::queries::get::tag_label_in_use(tag_label))
+            .await?;
+        let in_use: Option<bool> = row.map(|row| row.get("in_use")).transpose()?;
+        Ok(in_use == Some(true))
     }
 
     async fn label_in_use(tag_label: &str) -> ModelResult<bool> {

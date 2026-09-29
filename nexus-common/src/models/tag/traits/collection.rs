@@ -1,7 +1,8 @@
 use crate::db::graph::Query;
 use crate::db::kv::{RedisResult, ScoreAction, SortOrder};
 use crate::db::{
-    execute_graph_operation, fetch_row_from_graph, queries, GraphResult, OperationOutcome, RedisOps,
+    execute_graph_operation_in, fetch_row_from_graph, queries, GraphResult, GraphTxn,
+    OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
 use async_trait::async_trait;
@@ -322,10 +323,16 @@ where
         Self::put_index_set(&key, &[tagger_user_id], None, None).await
     }
 
-    /// Inserts a tag relationship into the graph database.
+    /// Inserts a tag relationship into the graph database inside `txn`. The
+    /// statement takes the write locks of the tagged target and the tagger,
+    /// which stay held until the caller ends `txn`: the caller writes the
+    /// tag's Redis indexes before it commits, so a deletion of the target
+    /// waits for them and a deletion that finished first leaves no target to
+    /// tag ([`OperationOutcome::MissingDependency`]).
     ///
     /// # Arguments
     ///
+    /// - `txn` - The transaction the tag's graph and Redis writes belong to.
     /// - `tagger_user_id` - A string slice representing the ID of the user (tagger) creating the tag.
     /// - `tagged_user_id` - A string slice representing the ID of the user being tagged.
     /// - `extra_param` - An optional parameter for specifying additional context, such as a post ID.
@@ -336,6 +343,7 @@ where
     /// - `indexed_at` - A 64-bit integer representing the timestamp (milliseconds)
     ///   when the tag was indexed.
     async fn put_to_graph(
+        txn: &mut GraphTxn,
         tagger_user_id: &str,
         tagged_user_id: &str,
         extra_param: Option<&str>,
@@ -360,7 +368,7 @@ where
                 indexed_at,
             ),
         };
-        execute_graph_operation(query).await
+        execute_graph_operation_in(txn, query).await
     }
 
     /// Reindexes tags for a given author by retrieving data from the graph database and updating the index.
@@ -384,8 +392,14 @@ where
     }
 
     /// Deletes a tag relationship between a user and a tagged target
-    /// (User, Post, marketplace Listing, or marketplace Shop) in the graph database.
+    /// (User, Post, marketplace Listing, or marketplace Shop) in the graph database
+    /// inside `txn`. The target's and the tagger's write locks are taken
+    /// first and stay held until the caller ends `txn`; the edge is read
+    /// after they are granted, so an edge a target's cleanup removed in the
+    /// meantime is reported as absent and its indexes are not decremented
+    /// twice.
     /// # Arguments
+    /// * `txn` - The transaction the untag's graph and Redis writes belong to.
     /// * `user_id` - The ID of the user who owns the tag relationship.
     /// * `tag_id` - The ID of the tag to be deleted.
     ///
@@ -399,9 +413,21 @@ where
     /// # Errors
     ///
     /// Returns a boxed `std::error::Error` if there is any issue querying or executing the delete operation in Neo4j.
-    async fn del_from_graph(user_id: &str, tag_id: &str) -> GraphResult<Option<DeletedTagTarget>> {
-        let query = queries::del::delete_tag(user_id, tag_id);
-        let maybe_row = fetch_row_from_graph(query).await?;
+    async fn del_from_graph(
+        txn: &mut GraphTxn,
+        user_id: &str,
+        tag_id: &str,
+    ) -> GraphResult<Option<DeletedTagTarget>> {
+        if txn
+            .fetch_row(queries::del::lock_tag_target(user_id, tag_id))
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let maybe_row = txn
+            .fetch_row(queries::del::delete_tag(user_id, tag_id))
+            .await?;
 
         let Some(row) = maybe_row else {
             return Ok(None);

@@ -1,6 +1,8 @@
 use crate::db::graph::Query;
 use crate::db::kv::{RedisResult, ScoreAction};
-use crate::db::{execute_graph_operation, queries, GraphResult, OperationOutcome, RedisOps};
+use crate::db::{
+    execute_graph_operation_in, queries, GraphResult, GraphTxn, OperationOutcome, RedisOps,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -50,6 +52,7 @@ impl TagCollection for TagListing {
     /// The trait default writes post/user tag edges; listings tag the
     /// `Listing` node instead.
     async fn put_to_graph(
+        txn: &mut GraphTxn,
         tagger_user_id: &str,
         tagged_user_id: &str,
         extra_param: Option<&str>,
@@ -66,7 +69,7 @@ impl TagCollection for TagListing {
             label,
             indexed_at,
         );
-        execute_graph_operation(query).await
+        execute_graph_operation_in(txn, query).await
     }
 
     fn read_graph_query(user_id: &str, extra_param: Option<&str>) -> Query {

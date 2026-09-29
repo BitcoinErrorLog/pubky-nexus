@@ -2,8 +2,8 @@ use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 
 use nexus_common::db::queries::get::post_is_safe_to_delete;
-use nexus_common::db::{exec_single_row, execute_graph_operation, OperationOutcome};
-use nexus_common::db::{queries, RedisOps};
+use nexus_common::db::{exec_single_row, OperationOutcome};
+use nexus_common::db::{execute_graph_operation_in, queries, start_graph_txn, GraphTxn, RedisOps};
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::notification::{Notification, PostChangedSource, PostChangedType};
 use nexus_common::models::post::{
@@ -15,7 +15,10 @@ use pubky_app_specs::{
 };
 use tracing::debug;
 
-use super::utils::post_relationships_is_reply;
+use super::utils::{
+    finish_txn, post_relationships_is_reply, NoopTargetDeleteHook, TargetDeleteHook,
+    TargetDeleteStep,
+};
 
 pub async fn sync_put(
     post: PubkyAppPost,
@@ -327,20 +330,42 @@ async fn put_mentioned_relationships_for_prefix(
 }
 
 pub async fn del(author_id: PubkyId, post_id: String) -> Result<(), EventProcessorError> {
+    del_with_hook(author_id, post_id, &NoopTargetDeleteHook).await
+}
+
+/// [`del`] with a deterministic interleaving point. Production callers use
+/// [`del`].
+#[doc(hidden)]
+pub async fn del_with_hook(
+    author_id: PubkyId,
+    post_id: String,
+    hook: &dyn TargetDeleteHook,
+) -> Result<(), EventProcessorError> {
     debug!("Deleting post: {}/{}", author_id, post_id);
 
     // Graph query to check if there is any edge at all to this post other than AUTHORED, is a reply or is a repost.
+    // The check takes the post's write lock and the transaction holds it until the post is deleted: a
+    // tag PUT that commits first is counted, and one that starts later waits and finds no post.
     let query = post_is_safe_to_delete(&author_id, &post_id);
+    let mut txn = start_graph_txn().await?;
+    let outcome = execute_graph_operation_in(&mut txn, query)
+        .await
+        .map_err(EventProcessorError::graph_query_failed);
 
     // If there is none other relationship (OperationOutcome::CreatedOrDeleted), we delete from graph and redis.
     // But if there is any (OperationOutcome::Updated), then we simply update the post with keyword content [DELETED].
     // A deleted post is a post whose content is EXACTLY `"[DELETED]"`
-    match execute_graph_operation(query)
-        .await
-        .map_err(EventProcessorError::graph_query_failed)?
-    {
-        OperationOutcome::CreatedOrDeleted => sync_del(author_id, post_id).await?,
-        OperationOutcome::Updated => {
+    match outcome {
+        Ok(OperationOutcome::CreatedOrDeleted) => {
+            let result = async {
+                hook.at(TargetDeleteStep::Checked).await?;
+                sync_del_in_txn(&mut txn, &author_id, &post_id).await
+            }
+            .await;
+            finish_txn(txn, result).await?;
+        }
+        Ok(OperationOutcome::Updated) => {
+            finish_txn(txn, Ok(())).await?;
             let existing_relationships = PostRelationships::get_by_id(&author_id, &post_id).await?;
             let parent = existing_relationships
                 .and_then(|rel| rel.replied)
@@ -358,13 +383,39 @@ pub async fn del(author_id: PubkyId, post_id: String) -> Result<(), EventProcess
 
             sync_put(dummy_deleted_post, author_id, post_id).await?;
         }
-        OperationOutcome::MissingDependency => return Err(EventProcessorError::SkipIndexing),
+        Ok(OperationOutcome::MissingDependency) => {
+            finish_txn(txn, Err::<(), _>(EventProcessorError::SkipIndexing)).await?;
+        }
+        Err(error) => {
+            finish_txn(txn, Err::<(), _>(error)).await?;
+        }
     };
 
     Ok(())
 }
 
+/// Deletes a post from the graph and Redis in one transaction that holds the
+/// post's write lock until every index is cleaned. A tag PUT or untag on the
+/// post either finished first or starts after the deletion and finds no post.
 pub async fn sync_del(author_id: PubkyId, post_id: String) -> Result<(), EventProcessorError> {
+    let mut txn = start_graph_txn().await?;
+    let result = async {
+        txn.fetch_row(queries::del::lock_post(&author_id, &post_id))
+            .await?;
+        sync_del_in_txn(&mut txn, &author_id, &post_id).await
+    }
+    .await;
+    finish_txn(txn, result).await
+}
+
+async fn sync_del_in_txn(
+    txn: &mut GraphTxn,
+    author_id: &PubkyId,
+    post_id: &str,
+) -> Result<(), EventProcessorError> {
+    let author_id = author_id.clone();
+    let post_id = post_id.to_string();
+    let untagged_by = super::tag::purge_deleted_post_tags(txn, &author_id, &post_id).await?;
     let deleted_uri = post_uri_builder(author_id.to_string(), post_id.clone());
 
     let post_relationships = PostRelationships::get_by_id(&author_id, &post_id).await?;
@@ -491,12 +542,18 @@ pub async fn sync_del(author_id: PubkyId, post_id: String) -> Result<(), EventPr
         }
     }
     let indexing_results = tokio::join!(
-        PostDetails::delete(&author_id, &post_id, reply_parent_post_key_wrapper),
+        PostDetails::delete(txn, &author_id, &post_id, reply_parent_post_key_wrapper),
         PostRelationships::delete(&author_id, &post_id)
     );
 
     indexing_results.0?;
     indexing_results.1?;
+
+    // Last, so a failure before it rolls the deletion back without a count
+    // to repeat on the retry
+    for tagger_id in untagged_by {
+        UserCounts::decrement(&tagger_id, "tagged", None).await?;
+    }
 
     Ok(())
 }

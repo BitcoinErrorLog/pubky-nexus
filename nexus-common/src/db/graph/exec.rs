@@ -1,3 +1,4 @@
+use super::ops::GraphTxn;
 use super::query::Query;
 use crate::db::{get_neo4j_graph, graph::error::GraphResult};
 use futures::TryStreamExt;
@@ -33,6 +34,29 @@ pub async fn execute_graph_operation(query: Query) -> GraphResult<OperationOutco
         Some(false) => Ok(OperationOutcome::CreatedOrDeleted),
         None => Ok(OperationOutcome::MissingDependency),
     }
+}
+
+/// [`execute_graph_operation`] inside an open transaction: same "flag"
+/// contract, and the locks the statement takes stay held until the
+/// transaction ends.
+pub async fn execute_graph_operation_in(
+    txn: &mut GraphTxn,
+    query: Query,
+) -> GraphResult<OperationOutcome> {
+    let maybe_row = txn.fetch_row(query).await?;
+    let Some(row) = maybe_row else {
+        return Ok(OperationOutcome::MissingDependency);
+    };
+    match row.get::<bool>("flag")? {
+        true => Ok(OperationOutcome::Updated),
+        false => Ok(OperationOutcome::CreatedOrDeleted),
+    }
+}
+
+/// Opens an explicit graph transaction on a dedicated connection.
+pub async fn start_graph_txn() -> GraphResult<GraphTxn> {
+    let graph = get_neo4j_graph()?;
+    graph.start_txn().await.map_err(Into::into)
 }
 
 /// Exec a fire-and-forget graph query (no rows needed).

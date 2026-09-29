@@ -26,6 +26,20 @@ pub fn delete_post(author_id: &str, post_id: &str) -> Query {
     .param("post_id", post_id.to_string())
 }
 
+/// Takes a post's write lock and returns one row when the post exists. Run
+/// it in the deletion's transaction; see [`lock_listing`].
+pub fn lock_post(author_id: &str, post_id: &str) -> Query {
+    Query::new(
+        "lock_post",
+        "MATCH (:User {id: $author_id})-[:AUTHORED]->(post:Post {id: $post_id})
+         SET post.tag_cleanup_lock = true
+         REMOVE post.tag_cleanup_lock
+         RETURN true AS locked",
+    )
+    .param("author_id", author_id.to_string())
+    .param("post_id", post_id.to_string())
+}
+
 /// Deletes a "follows" relationship between two users
 /// # Arguments
 /// * `follower_id` - The unique identifier of the user who is following another user.
@@ -61,6 +75,27 @@ pub fn delete_bookmark(user_id: &str, bookmark_id: &str) -> Query {
     .param("bookmark_id", bookmark_id)
 }
 
+/// Takes the write locks a tag's untag needs, target first and then the
+/// tagger, and returns one row when the tag exists. Run it in the untag's
+/// transaction before [`delete_tag`]: the locks stay held until the
+/// transaction ends, so a cleanup that removes the same edge waits for the
+/// untag's Redis writes, and [`delete_tag`] reads the edge after any such
+/// cleanup finished.
+pub fn lock_tag_target(user_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "lock_tag_target",
+        "MATCH (user:User {id: $user_id})-[:TAGGED {id: $tag_id}]->(target)
+         SET target.tag_cleanup_lock = true
+         REMOVE target.tag_cleanup_lock
+         WITH user
+         SET user.tag_cleanup_lock = true
+         REMOVE user.tag_cleanup_lock
+         RETURN true AS locked",
+    )
+    .param("user_id", user_id)
+    .param("tag_id", tag_id)
+}
+
 /// Deletes a tag relationship created by a user and retrieves relevant details about the tag's target
 /// # Arguments
 /// * `user_id` - The unique identifier of the user who created the tag.
@@ -87,11 +122,18 @@ pub fn delete_tag(user_id: &str, tag_id: &str) -> Query {
 
 /// Deletes every `TAGGED` edge on a marketplace listing and, in the same
 /// statement, leaves one `TagCleanup` marker per deleted edge naming its
-/// tagger and label. The marker id is fresh per deleted edge.
+/// tagger and label. The marker id is fresh per deleted edge. The
+/// statement takes the listing's write lock before it reads the edges, so
+/// an untag holding the lock has finished, Redis writes included, and its
+/// edge is already gone; a tag PUT holding it has committed its edge.
 pub fn listing_tags_to_cleanup_markers(owner_id: &str, listing_id: &str, target: &str) -> Query {
     Query::new(
         "listing_tags_to_cleanup_markers",
-        "MATCH (tagger:User)-[tag:TAGGED]->(:Listing {id: $listing_id, owner_id: $owner_id})
+        "MATCH (listing:Listing {id: $listing_id, owner_id: $owner_id})
+         SET listing.tag_cleanup_lock = true
+         REMOVE listing.tag_cleanup_lock
+         WITH listing
+         MATCH (tagger:User)-[tag:TAGGED]->(listing)
          CREATE (:TagCleanup {id: randomUUID(), target: $target, tagger_id: tagger.id,
                               label: tag.label})
          DELETE tag",
@@ -105,7 +147,11 @@ pub fn listing_tags_to_cleanup_markers(owner_id: &str, listing_id: &str, target:
 pub fn shop_tags_to_cleanup_markers(owner_id: &str, target: &str) -> Query {
     Query::new(
         "shop_tags_to_cleanup_markers",
-        "MATCH (tagger:User)-[tag:TAGGED]->(:Shop {owner_id: $owner_id})
+        "MATCH (shop:Shop {owner_id: $owner_id})
+         SET shop.tag_cleanup_lock = true
+         REMOVE shop.tag_cleanup_lock
+         WITH shop
+         MATCH (tagger:User)-[tag:TAGGED]->(shop)
          CREATE (:TagCleanup {id: randomUUID(), target: $target, tagger_id: tagger.id,
                               label: tag.label})
          DELETE tag",
@@ -114,41 +160,61 @@ pub fn shop_tags_to_cleanup_markers(owner_id: &str, target: &str) -> Query {
     .param("target", target)
 }
 
-/// Deletes a marketplace listing node only if no `TAGGED` edge reaches it.
-/// The write lock on the node is taken before the check (creating a
-/// relationship locks both of its nodes), so a tag that commits first is
-/// seen and refuses the deletion, and a tag that comes after finds no node.
-///
-/// Returns one row, `blocked`, when the node exists; no row when it is
-/// already gone.
-pub fn delete_untagged_listing(owner_id: &str, listing_id: &str) -> Query {
+/// Takes a marketplace listing's write lock and returns one row when the
+/// listing exists. Run it in a transaction: the lock stays held until the
+/// transaction ends, so tag PUTs and untags of the listing wait, and each
+/// one that finished before the lock was granted has committed its edge
+/// and its Redis writes.
+pub fn lock_listing(owner_id: &str, listing_id: &str) -> Query {
     Query::new(
-        "delete_untagged_listing",
+        "lock_listing",
         "MATCH (listing:Listing {id: $listing_id, owner_id: $owner_id})
          SET listing.tag_cleanup_lock = true
          REMOVE listing.tag_cleanup_lock
-         WITH listing,
-              EXISTS { MATCH ()-[:TAGGED]->(listing) } AS blocked
-         FOREACH (_ IN CASE WHEN blocked THEN [] ELSE [1] END | DETACH DELETE listing)
-         RETURN blocked",
+         RETURN true AS locked",
     )
     .param("owner_id", owner_id)
     .param("listing_id", listing_id)
 }
 
-/// [`delete_untagged_listing`] for a marketplace shop.
-pub fn delete_untagged_shop(owner_id: &str) -> Query {
+/// [`lock_listing`] for a marketplace shop.
+pub fn lock_shop(owner_id: &str) -> Query {
     Query::new(
-        "delete_untagged_shop",
+        "lock_shop",
         "MATCH (shop:Shop {owner_id: $owner_id})
          SET shop.tag_cleanup_lock = true
          REMOVE shop.tag_cleanup_lock
-         WITH shop,
-              EXISTS { MATCH ()-[:TAGGED]->(shop) } AS blocked
-         FOREACH (_ IN CASE WHEN blocked THEN [] ELSE [1] END | DETACH DELETE shop)
-         RETURN blocked",
+         RETURN true AS locked",
     )
     .param("owner_id", owner_id)
+}
+
+/// Deletes a shop node and all its relationships
+/// # Arguments
+/// * `owner_id` - The unique identifier of the user who owns the shop
+pub fn delete_shop(owner_id: &str) -> Query {
+    Query::new(
+        "delete_shop",
+        "MATCH (shop:Shop {owner_id: $owner_id})
+         DETACH DELETE shop;",
+    )
+    .param("owner_id", owner_id.to_string())
+}
+
+/// Deletes every `TAGGED` edge on a post and returns the tagger and label
+/// of each. Run it in the post deletion's transaction, after the post's
+/// write lock is taken.
+pub fn delete_post_tags(author_id: &str, post_id: &str) -> Query {
+    Query::new(
+        "delete_post_tags",
+        "MATCH (:User {id: $author_id})-[:AUTHORED]->(post:Post {id: $post_id})
+         MATCH (tagger:User)-[tag:TAGGED]->(post)
+         WITH tagger.id AS tagger_id, tag.label AS label, tag
+         DELETE tag
+         RETURN tagger_id, label",
+    )
+    .param("author_id", author_id)
+    .param("post_id", post_id)
 }
 
 /// Deletes one `TagCleanup` marker once its tagger count is settled.

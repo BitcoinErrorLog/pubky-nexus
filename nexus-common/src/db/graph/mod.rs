@@ -9,5 +9,5 @@ pub mod setup;
 pub use error::{GraphError, GraphResult};
 pub(crate) use instrumented::InstrumentedGraph;
 pub(crate) use ops::Graph;
-pub use ops::GraphOps;
+pub use ops::{GraphOps, GraphTxn};
 pub use query::Query;

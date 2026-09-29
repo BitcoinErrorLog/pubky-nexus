@@ -1,7 +1,7 @@
 use super::{PostRelationships, PostStream};
 use crate::db::kv::RedisResult;
 use crate::db::{
-    exec_single_row, execute_graph_operation, fetch_row_from_graph, queries, GraphResult,
+    execute_graph_operation, fetch_row_from_graph, queries, GraphResult, GraphTxn,
     OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
@@ -137,7 +137,11 @@ impl PostDetails {
         execute_graph_operation(query).await
     }
 
+    /// Deletes the post's Redis details, its graph node and its feed
+    /// memberships. The node is deleted in `txn`, which holds the post's
+    /// write lock; the caller commits after this returns.
     pub async fn delete(
+        txn: &mut GraphTxn,
         author_id: &str,
         post_id: &str,
         parent_post_key_wrapper: Option<[String; 2]>,
@@ -145,7 +149,8 @@ impl PostDetails {
         // Delete user_details on Redis
         Self::remove_from_index_multiple_json(&[&[author_id, post_id]]).await?;
         // Delete post graph node
-        exec_single_row(queries::del::delete_post(author_id, post_id)).await?;
+        txn.run(queries::del::delete_post(author_id, post_id))
+            .await?;
         // The replies are not indexed in the global feeds
         match parent_post_key_wrapper {
             None => {

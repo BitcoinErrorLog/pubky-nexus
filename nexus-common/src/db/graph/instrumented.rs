@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-use super::ops::{Graph, GraphOps};
+use super::ops::{Graph, GraphOps, GraphTxn};
 use super::query::Query;
 
 /// The OpenTelemetry meter name used by all Neo4j graph metrics.
@@ -303,6 +303,10 @@ impl<G: GraphOps> GraphOps for InstrumentedGraph<G> {
 
         result
     }
+
+    async fn start_txn(&self) -> neo4rs::Result<GraphTxn> {
+        self.inner.start_txn().await
+    }
 }
 
 fn ms(d: Duration) -> f64 {
@@ -449,6 +453,10 @@ mod tests {
 
         async fn run(&self, _query: Query) -> neo4rs::Result<()> {
             Ok(())
+        }
+
+        async fn start_txn(&self) -> neo4rs::Result<GraphTxn> {
+            Err(neo4rs::Error::ConnectionError)
         }
     }
 

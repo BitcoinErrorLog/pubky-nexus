@@ -78,12 +78,26 @@ pub(crate) async fn sync_put(
 }
 
 pub async fn del(user_id: PubkyId, listing_id: String) -> Result<(), EventProcessorError> {
+    del_with_hook(user_id, listing_id, &super::tag::NoopTargetTagCleanupHook).await
+}
+
+/// [`del`] with deterministic interleaving points in the tag cleanup.
+/// Production callers use [`del`].
+#[doc(hidden)]
+pub async fn del_with_hook(
+    user_id: PubkyId,
+    listing_id: String,
+    hook: &dyn super::tag::TargetTagCleanupHook,
+) -> Result<(), EventProcessorError> {
     debug!("Deleting listing: {}/{}", user_id, listing_id);
 
-    super::tag::del_tagged_target(super::tag::TagTarget::Listing {
-        owner_id: &user_id,
-        listing_id: &listing_id,
-    })
+    super::tag::del_tagged_target_with_hook(
+        super::tag::TagTarget::Listing {
+            owner_id: &user_id,
+            listing_id: &listing_id,
+        },
+        hook,
+    )
     .await?;
     ListingDetails::delete_indexes(&user_id, &listing_id).await?;
 

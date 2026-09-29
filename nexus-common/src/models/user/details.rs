@@ -1,7 +1,7 @@
 use super::UserSearch;
 use crate::db::graph::Query;
 use crate::db::kv::RedisResult;
-use crate::db::{exec_single_row, queries, GraphResult, RedisOps};
+use crate::db::{queries, GraphResult, GraphTxn, RedisOps};
 use crate::models::error::ModelResult;
 use crate::models::traits::Collection;
 use async_trait::async_trait;
@@ -102,11 +102,14 @@ impl UserDetails {
         }
     }
 
-    pub async fn delete(user_id: &str) -> ModelResult<()> {
+    /// Deletes the user's Redis details and, in `txn`, its graph node. The
+    /// transaction holds the user's write lock; the caller commits after this
+    /// returns.
+    pub async fn delete(txn: &mut GraphTxn, user_id: &str) -> ModelResult<()> {
         // Delete user_details on Redis
         Self::remove_from_index_multiple_json(&[&[user_id]]).await?;
         // Delete user graph node;
-        exec_single_row(queries::del::delete_user(user_id)).await?;
+        txn.run(queries::del::delete_user(user_id)).await?;
 
         Ok(())
     }

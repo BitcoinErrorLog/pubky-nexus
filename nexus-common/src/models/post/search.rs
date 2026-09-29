@@ -130,6 +130,17 @@ impl PostsByTagSearch {
         Ok(())
     }
 
+    /// Removes the post from the label's global timeline and engagement
+    /// sorted sets whatever its taggers, for a post that is being deleted.
+    pub async fn purge_post(author_id: &str, post_id: &str, tag_label: &str) -> RedisResult<()> {
+        let post_key = format!("{author_id}:{post_id}");
+        for index in [&TAG_GLOBAL_POST_TIMELINE, &TAG_GLOBAL_POST_ENGAGEMENT] {
+            let key_parts = [&index[..], &[tag_label]].concat();
+            Self::remove_from_index_sorted_set(None, &key_parts, &[&post_key]).await?;
+        }
+        Ok(())
+    }
+
     pub async fn del_from_index(
         author_id: &str,
         post_id: &str,
