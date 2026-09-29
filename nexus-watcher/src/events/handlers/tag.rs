@@ -12,7 +12,6 @@ use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::marketplace::ListingsByTagSearch;
 use nexus_common::models::notification::Notification;
 use nexus_common::models::post::search::PostsByTagSearch;
-use nexus_common::models::post::{PostCounts, PostStream};
 use nexus_common::models::tag::listing::{TagListing, LISTING_TAGS_KEY_PARTS};
 use nexus_common::models::tag::post::{TagPost, POST_TAGS_KEY_PARTS};
 use nexus_common::models::tag::search::TagSearch;
@@ -23,7 +22,8 @@ use nexus_common::models::user::UserCounts;
 use pubky_app_specs::{post_uri_builder, ParsedUri, PubkyAppTag, PubkyId, Resource};
 use tracing::debug;
 
-use super::utils::{finish_txn, post_relationships_is_reply};
+use super::utils::{finish_txn, post_relationships_is_reply_in};
+use super::write_log::{Target, WriteLog};
 
 /// Points of a tag write where integration tests inject a failure or a
 /// concurrent event.
@@ -36,6 +36,14 @@ pub enum TagWriteStep {
     /// The untag deleted the edge in its open transaction, holding the
     /// target's write lock; no Redis index is changed yet.
     EdgeDeleted,
+    /// The n-th Redis write of the tag PUT or untag is done (counting from
+    /// 1); the transaction is still open.
+    IndexStep(u32),
+    /// Every Redis write is done and the transaction is about to commit.
+    BeforeCommit,
+    /// The transaction has ended and the PUT is about to ingest the homeserver
+    /// of the target it did not find.
+    IngestingMissingTarget,
 }
 
 /// Internal deterministic seam for integration-testing tag writes against a
@@ -53,16 +61,124 @@ struct NoopTagWriteHook;
 #[async_trait::async_trait]
 impl TagWriteHook for NoopTagWriteHook {}
 
+/// The target whose homeserver a PUT ingests when the target is missing.
+enum MissingTarget {
+    Post(Box<ParsedUri>),
+    User(Box<PubkyId>),
+    Other,
+}
+
+/// The notification a tag write sends once its transaction has committed. A
+/// notification is not an index and cannot be taken back, so it is sent last
+/// and a failure to send it is logged, not retried into a second tag write.
+enum Notify {
+    None,
+    PostTag {
+        tagger_id: String,
+        author_id: String,
+        label: String,
+        post_uri: String,
+    },
+    UserTag {
+        tagger_id: String,
+        tagged_id: String,
+        label: String,
+    },
+    PostUntag {
+        tagger_id: String,
+        author_id: String,
+        label: String,
+        post_uri: String,
+    },
+    UserUntag {
+        tagger_id: String,
+        tagged_id: String,
+        label: String,
+    },
+}
+
+impl Notify {
+    async fn send(self) {
+        let result = match self {
+            Notify::None => return,
+            Notify::PostTag {
+                tagger_id,
+                author_id,
+                label,
+                post_uri,
+            } => Notification::new_post_tag(&tagger_id, &author_id, &label, &post_uri)
+                .await
+                .map(|_| ()),
+            Notify::UserTag {
+                tagger_id,
+                tagged_id,
+                label,
+            } => Notification::new_user_tag(&tagger_id, &tagged_id, &label)
+                .await
+                .map(|_| ()),
+            Notify::PostUntag {
+                tagger_id,
+                author_id,
+                label,
+                post_uri,
+            } => Notification::new_post_untag(&tagger_id, &author_id, &label, &post_uri)
+                .await
+                .map(|_| ()),
+            Notify::UserUntag {
+                tagger_id,
+                tagged_id,
+                label,
+            } => Notification::new_user_untag(&tagger_id, &tagged_id, &label)
+                .await
+                .map(|_| ()),
+        };
+        if let Err(error) = result {
+            tracing::warn!("Sending a tag notification failed: {error}");
+        }
+    }
+}
+
+/// Ends the transaction of a tag write whose graph and Redis writes `result`
+/// reports. Redis writes are undone before the transaction ends, while it
+/// still holds the target's lock; a commit that fails afterwards undoes them
+/// too. Whatever the outcome, no Redis write survives a rolled-back edge, so
+/// the retried event repeats nothing.
+async fn end_tag_write(
+    txn: GraphTxn,
+    log: &mut WriteLog,
+    hook: &dyn TagWriteHook,
+    result: Result<Notify, EventProcessorError>,
+) -> Result<Notify, EventProcessorError> {
+    let result = match result {
+        Ok(notify) => hook.at(TagWriteStep::BeforeCommit).await.map(|_| notify),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        log.rollback().await;
+    }
+    let outcome = finish_txn(txn, result).await;
+    if outcome.is_err() {
+        log.rollback().await;
+    }
+    outcome
+}
+
 /// Indexes a tag PUT.
 ///
 /// The edge and every Redis index of the tag are written inside one graph
 /// transaction that holds the write lock of the tagged target. A deletion of
-/// the target locks the same node: it waits for the
-/// tag's Redis writes and then sees the committed edge, and a deletion that
-/// finished first leaves no target, so the PUT writes nothing. Any failure
-/// rolls the edge back, so the retried event starts from a clean state. The
-/// global autocomplete entry is written once the edge is committed, where a
-/// concurrent untag's unused-label check finds the edge.
+/// the target locks the same node: it waits for the tag's Redis writes and
+/// then sees the committed edge, and a deletion that finished first leaves no
+/// target, so the PUT writes nothing.
+///
+/// Each Redis write is recorded with its undo (see [`WriteLog`]) and undone if
+/// a later write, the commit, or anything else fails, so the retried event
+/// starts from the state before the first attempt. While the transaction is
+/// open nothing but that transaction's own connection is used: the target's
+/// relationships are read through it, notifications are sent after the
+/// commit, and the homeserver of a missing target is ingested only after the
+/// transaction has ended. The global autocomplete entry is written last, once
+/// the edge is committed.
 pub async fn sync_put(
     tag: PubkyAppTag,
     tagger_id: PubkyId,
@@ -89,22 +205,27 @@ pub async fn sync_put_with_hook(
     // key for marketplace targets (matches how their PUT events are keyed).
     let target_dependency_key = RetryEvent::generate_index_key_from_uri(&parsed_uri);
     let indexed_at = Utc::now().timestamp_millis();
+    let ingest = match &parsed_uri.resource {
+        Resource::Post(_) => MissingTarget::Post(Box::new(parsed_uri.clone())),
+        Resource::User => MissingTarget::User(Box::new(user_id.clone())),
+        _ => MissingTarget::Other,
+    };
 
     let mut txn = start_graph_txn().await?;
+    let mut log = WriteLog::new();
     let result = match parsed_uri.resource {
         // If post_id is in the tagged URI, we place tag to a post.
         Resource::Post(post_id) => {
-            // Place the tag on post
             put_sync_post(
-                &mut txn, hook, tagger_id, user_id, &post_id, &tag_id, &tag.label, &tag.uri,
-                indexed_at,
+                &mut txn, hook, &mut log, tagger_id, user_id, &post_id, &tag_id, &tag.label,
+                &tag.uri, indexed_at,
             )
             .await
         }
         // If no post_id in the tagged URI, we place tag to a user.
         Resource::User => {
             put_sync_user(
-                &mut txn, hook, tagger_id, user_id, &tag_id, &tag.label, indexed_at,
+                &mut txn, hook, &mut log, tagger_id, user_id, &tag_id, &tag.label, indexed_at,
             )
             .await
         }
@@ -113,6 +234,7 @@ pub async fn sync_put_with_hook(
             put_sync_listing(
                 &mut txn,
                 hook,
+                &mut log,
                 tagger_id,
                 user_id,
                 &listing_id,
@@ -127,6 +249,7 @@ pub async fn sync_put_with_hook(
             put_sync_shop(
                 &mut txn,
                 hook,
+                &mut log,
                 tagger_id,
                 user_id,
                 &tag_id,
@@ -140,7 +263,26 @@ pub async fn sync_put_with_hook(
             "The tagged resource is not Post, User, Listing or Shop, instead is: {other:?}"
         ))),
     };
-    finish_txn(txn, result).await?;
+    let outcome = end_tag_write(txn, &mut log, hook, result).await;
+
+    if matches!(outcome, Err(EventProcessorError::MissingDependency { .. })) {
+        let _ = hook.at(TagWriteStep::IngestingMissingTarget).await;
+        match ingest {
+            MissingTarget::Post(uri) => {
+                if let Err(e) = Homeserver::maybe_ingest_for_post(&uri).await {
+                    tracing::error!("Failed to ingest homeserver: {e}");
+                }
+            }
+            MissingTarget::User(user_id) => {
+                if let Err(e) = Homeserver::maybe_ingest_for_user(user_id.as_ref()).await {
+                    tracing::error!("Failed to ingest homeserver: {e}");
+                }
+            }
+            MissingTarget::Other => {}
+        }
+    }
+    let notify = outcome?;
+    notify.send().await;
 
     // Add tag to search index
     TagSearch::put_to_index(&[tag.label]).await?;
@@ -161,6 +303,7 @@ pub async fn sync_put_with_hook(
 async fn put_sync_post(
     txn: &mut GraphTxn,
     hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_user_id: PubkyId,
     author_id: PubkyId,
     post_id: &str,
@@ -168,7 +311,7 @@ async fn put_sync_post(
     tag_label: &str,
     post_uri: &str,
     indexed_at: i64,
-) -> Result<(), EventProcessorError> {
+) -> Result<Notify, EventProcessorError> {
     match TagPost::put_to_graph(
         txn,
         &tagger_user_id,
@@ -180,86 +323,57 @@ async fn put_sync_post(
     )
     .await?
     {
-        OperationOutcome::Updated => Ok(()),
+        OperationOutcome::Updated => Ok(Notify::None),
         OperationOutcome::MissingDependency => {
             // Ensure that dependencies follow the same format as the RetryManager keys
             let dependency = vec![format!("{author_id}:posts:{post_id}")];
-            if let Ok(referenced_post_uri) = ParsedUri::try_from(post_uri) {
-                if let Err(e) = Homeserver::maybe_ingest_for_post(&referenced_post_uri).await {
-                    tracing::error!("Failed to ingest homeserver: {e}");
-                }
-            }
             Err(EventProcessorError::MissingDependency { dependency })
         }
         OperationOutcome::CreatedOrDeleted => {
             hook.at(TagWriteStep::GraphWritten).await?;
-            // SAVE TO INDEXES
-            let post_key_slice: &[&str] = &[&author_id, post_id];
-
-            let indexing_results = tokio::join!(
-                // Update user counts for tagger
-                UserCounts::increment(&tagger_user_id, "tagged", None),
-                // Increment in one the post tags
-                PostCounts::increment_index_field(post_key_slice, "tags", None),
-                async {
-                    // Increase unique_tags if the tag does not exist already
-                    // NOTE: To update that field, it cannot exist in TagPost SORTED SET the tag. Thats why it has to be executed
-                    // before TagPost operation
-                    PostCounts::increment_index_field(
-                        post_key_slice,
-                        "unique_tags",
-                        Some(tag_label),
-                    )
-                    .await?;
-                    // Increment the label count to post
-                    TagPost::update_index_score(
-                        &author_id,
-                        Some(post_id),
-                        tag_label,
-                        ScoreAction::Increment(1.0),
-                    )
-                    .await?;
-                    Ok::<(), EventProcessorError>(())
-                },
-                // Add user tag in post
-                TagPost::add_tagger_to_index(&author_id, Some(post_id), &tagger_user_id, tag_label),
-                // Add post to label total engagement
-                PostsByTagSearch::update_index_score(
-                    &author_id,
-                    post_id,
-                    tag_label,
-                    ScoreAction::Increment(1.0),
-                ),
-                async {
-                    // Post replies cannot be included in the total engagement index once they have been tagged
-                    if !post_relationships_is_reply(&author_id, post_id).await? {
-                        // Increment in one post global engagement
-                        PostStream::update_index_score(
-                            &author_id,
-                            post_id,
-                            ScoreAction::Increment(1.0),
-                        )
-                        .await
-                        .map_err(EventProcessorError::index_operation_failed)?;
-                    }
-                    Ok::<(), EventProcessorError>(())
-                },
-                // Add post to global label timeline
-                PostsByTagSearch::put_to_index(&author_id, post_id, tag_label),
-                // Save new notification
-                Notification::new_post_tag(&tagger_user_id, &author_id, tag_label, post_uri)
-            );
-
-            indexing_results.0?;
-            indexing_results.1?;
-            indexing_results.2?;
-            indexing_results.3?;
-            indexing_results.4?;
-            indexing_results.5?;
-            indexing_results.6?;
-            indexing_results.7?;
-
-            Ok(())
+            // Post replies cannot be included in the total engagement index once they have been tagged
+            let is_reply = post_relationships_is_reply_in(txn, &author_id, post_id).await?;
+            let target = Target::Post {
+                author_id: &author_id,
+                post_id,
+            };
+            // Update user counts for tagger
+            log.user_counter(hook, &tagger_user_id, "tagged", true)
+                .await?;
+            // Increment in one the post tags
+            log.post_counter(hook, &author_id, post_id, "tags", true)
+                .await?;
+            // Increase unique_tags if the tag does not exist already. It has to
+            // come before the label score below: it reads whether the label
+            // is already on the post.
+            log.unique_tags(hook, target, tag_label, true).await?;
+            // Increment the label count to post
+            log.score(hook, target, tag_label, ScoreAction::Increment(1.0))
+                .await?;
+            // Add user tag in post
+            log.tagger(hook, target, &tagger_user_id, tag_label, true)
+                .await?;
+            // Add post to label total engagement
+            log.label_engagement(
+                hook,
+                &author_id,
+                post_id,
+                tag_label,
+                ScoreAction::Increment(1.0),
+            )
+            .await?;
+            if !is_reply {
+                // Increment in one post global engagement
+                log.post_engagement(hook, &author_id, post_id, true).await?;
+            }
+            // Add post to global label timeline
+            log.timeline(hook, target, tag_label, true).await?;
+            Ok(Notify::PostTag {
+                tagger_id: tagger_user_id.to_string(),
+                author_id: author_id.to_string(),
+                label: tag_label.to_string(),
+                post_uri: post_uri.to_string(),
+            })
         }
     }
 }
@@ -272,15 +386,17 @@ async fn put_sync_post(
 /// - `tag_id` - A `String` representing the unique identifier of the tag.
 /// - `tag_label` - A `String` representing the label of the tag.
 /// - `indexed_at` - A 64-bit integer representing the timestamp when the user was indexed.
+#[allow(clippy::too_many_arguments)]
 async fn put_sync_user(
     txn: &mut GraphTxn,
     hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_user_id: PubkyId,
     tagged_user_id: PubkyId,
     tag_id: &str,
     tag_label: &str,
     indexed_at: i64,
-) -> Result<(), EventProcessorError> {
+) -> Result<Notify, EventProcessorError> {
     match TagUser::put_to_graph(
         txn,
         &tagger_user_id,
@@ -292,53 +408,37 @@ async fn put_sync_user(
     )
     .await?
     {
-        OperationOutcome::Updated => Ok(()),
+        OperationOutcome::Updated => Ok(Notify::None),
         OperationOutcome::MissingDependency => {
-            if let Err(e) = Homeserver::maybe_ingest_for_user(tagged_user_id.as_ref()).await {
-                tracing::error!("Failed to ingest homeserver: {e}");
-            }
-
             let key = RetryEvent::generate_index_key_from_uri(&tagged_user_id.to_uri());
             let dependency = vec![key];
             Err(EventProcessorError::MissingDependency { dependency })
         }
         OperationOutcome::CreatedOrDeleted => {
             hook.at(TagWriteStep::GraphWritten).await?;
-
-            // SAVE TO INDEX
-            let indexing_results = tokio::join!(
-                // Update user counts for the tagged user
-                UserCounts::increment(&tagged_user_id, "tags", None),
-                // Update user counts for the tagger user
-                UserCounts::increment(&tagger_user_id, "tagged", None),
-                async {
-                    // Increase unique_tags if the tag does not exist already
-                    // NOTE: To update that field, it cannot exist in TagUser SORTED SET the tag. Thats why it has to be executed
-                    // before TagUser operation
-                    UserCounts::increment(&tagged_user_id, "unique_tags", Some(tag_label)).await?;
-                    // Add label count to the user profile tag
-                    TagUser::update_index_score(
-                        &tagged_user_id,
-                        None,
-                        tag_label,
-                        ScoreAction::Increment(1.0),
-                    )
-                    .await?;
-                    Ok::<(), EventProcessorError>(())
-                },
-                // Add tagger to the user taggers list
-                TagUser::add_tagger_to_index(&tagged_user_id, None, &tagger_user_id, tag_label),
-                // Save new notification
-                Notification::new_user_tag(&tagger_user_id, &tagged_user_id, tag_label)
-            );
-
-            indexing_results.0?;
-            indexing_results.1?;
-            indexing_results.2?;
-            indexing_results.3?;
-            indexing_results.4?;
-
-            Ok(())
+            let target = Target::User {
+                user_id: &tagged_user_id,
+            };
+            // Update user counts for the tagged user
+            log.user_counter(hook, &tagged_user_id, "tags", true)
+                .await?;
+            // Update user counts for the tagger user
+            log.user_counter(hook, &tagger_user_id, "tagged", true)
+                .await?;
+            // Increase unique_tags if the tag does not exist already (before
+            // the label score, which it reads)
+            log.unique_tags(hook, target, tag_label, true).await?;
+            // Add label count to the user profile tag
+            log.score(hook, target, tag_label, ScoreAction::Increment(1.0))
+                .await?;
+            // Add tagger to the user taggers list
+            log.tagger(hook, target, &tagger_user_id, tag_label, true)
+                .await?;
+            Ok(Notify::UserTag {
+                tagger_id: tagger_user_id.to_string(),
+                tagged_id: tagged_user_id.to_string(),
+                label: tag_label.to_string(),
+            })
         }
     }
 }
@@ -362,6 +462,7 @@ async fn put_sync_user(
 async fn put_sync_listing(
     txn: &mut GraphTxn,
     hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_user_id: PubkyId,
     seller_id: PubkyId,
     listing_id: &str,
@@ -369,7 +470,7 @@ async fn put_sync_listing(
     tag_label: &str,
     dependency_key: String,
     indexed_at: i64,
-) -> Result<(), EventProcessorError> {
+) -> Result<Notify, EventProcessorError> {
     match TagListing::put_to_graph(
         txn,
         &tagger_user_id,
@@ -381,40 +482,28 @@ async fn put_sync_listing(
     )
     .await?
     {
-        OperationOutcome::Updated => Ok(()),
+        OperationOutcome::Updated => Ok(Notify::None),
         OperationOutcome::MissingDependency => Err(EventProcessorError::MissingDependency {
             dependency: vec![dependency_key],
         }),
         OperationOutcome::CreatedOrDeleted => {
             hook.at(TagWriteStep::GraphWritten).await?;
-
-            let indexing_results = tokio::join!(
-                // Update user counts for tagger
-                UserCounts::increment(&tagger_user_id, "tagged", None),
-                // Increment the label count on the listing
-                TagListing::update_index_score(
-                    &seller_id,
-                    Some(listing_id),
-                    tag_label,
-                    ScoreAction::Increment(1.0),
-                ),
-                // Add user tag in listing
-                TagListing::add_tagger_to_index(
-                    &seller_id,
-                    Some(listing_id),
-                    &tagger_user_id,
-                    tag_label
-                ),
-                // Add listing to the global label timeline
-                ListingsByTagSearch::put_to_index(&seller_id, listing_id, tag_label)
-            );
-
-            indexing_results.0?;
-            indexing_results.1?;
-            indexing_results.2?;
-            indexing_results.3?;
-
-            Ok(())
+            let target = Target::Listing {
+                owner_id: &seller_id,
+                listing_id,
+            };
+            // Update user counts for tagger
+            log.user_counter(hook, &tagger_user_id, "tagged", true)
+                .await?;
+            // Increment the label count on the listing
+            log.score(hook, target, tag_label, ScoreAction::Increment(1.0))
+                .await?;
+            // Add user tag in listing
+            log.tagger(hook, target, &tagger_user_id, tag_label, true)
+                .await?;
+            // Add listing to the global label timeline
+            log.timeline(hook, target, tag_label, true).await?;
+            Ok(Notify::None)
         }
     }
 }
@@ -435,13 +524,14 @@ async fn put_sync_listing(
 async fn put_sync_shop(
     txn: &mut GraphTxn,
     hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_user_id: PubkyId,
     owner_id: PubkyId,
     tag_id: &str,
     tag_label: &str,
     dependency_key: String,
     indexed_at: i64,
-) -> Result<(), EventProcessorError> {
+) -> Result<Notify, EventProcessorError> {
     match TagShop::put_to_graph(
         txn,
         &tagger_user_id,
@@ -453,32 +543,25 @@ async fn put_sync_shop(
     )
     .await?
     {
-        OperationOutcome::Updated => Ok(()),
+        OperationOutcome::Updated => Ok(Notify::None),
         OperationOutcome::MissingDependency => Err(EventProcessorError::MissingDependency {
             dependency: vec![dependency_key],
         }),
         OperationOutcome::CreatedOrDeleted => {
             hook.at(TagWriteStep::GraphWritten).await?;
-
-            let indexing_results = tokio::join!(
-                // Update user counts for tagger
-                UserCounts::increment(&tagger_user_id, "tagged", None),
-                // Increment the label count on the shop
-                TagShop::update_index_score(
-                    &owner_id,
-                    None,
-                    tag_label,
-                    ScoreAction::Increment(1.0)
-                ),
-                // Add tagger to the shop taggers list
-                TagShop::add_tagger_to_index(&owner_id, None, &tagger_user_id, tag_label)
-            );
-
-            indexing_results.0?;
-            indexing_results.1?;
-            indexing_results.2?;
-
-            Ok(())
+            let target = Target::Shop {
+                owner_id: &owner_id,
+            };
+            // Update user counts for tagger
+            log.user_counter(hook, &tagger_user_id, "tagged", true)
+                .await?;
+            // Increment the label count on the shop
+            log.score(hook, target, tag_label, ScoreAction::Increment(1.0))
+                .await?;
+            // Add tagger to the shop taggers list
+            log.tagger(hook, target, &tagger_user_id, tag_label, true)
+                .await?;
+            Ok(Notify::None)
         }
     }
 }
@@ -487,8 +570,10 @@ async fn put_sync_shop(
 ///
 /// Like [`sync_put`], the edge deletion and every Redis index change run in
 /// one graph transaction holding the target's write lock, so a deletion of
-/// the target cannot interleave: it waits for the
-/// untag, or it finished first and the untag finds no edge.
+/// the target cannot interleave: it waits for the untag, or it finished first
+/// and the untag finds no edge. Every Redis change is recorded with its undo
+/// and undone if a later one, or the commit, fails, so the retried untag
+/// starts from the state before the first attempt.
 pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorError> {
     del_with_hook(user_id, tag_id, &NoopTagWriteHook).await
 }
@@ -503,54 +588,66 @@ pub async fn del_with_hook(
 ) -> Result<(), EventProcessorError> {
     debug!("Deleting tag: {} -> {}", user_id, tag_id);
     let mut txn = start_graph_txn().await?;
-    let result = del_in_txn(&mut txn, hook, user_id, tag_id).await;
-    finish_txn(txn, result).await
+    let mut log = WriteLog::new();
+    let result = del_in_txn(&mut txn, hook, &mut log, user_id, tag_id).await;
+    let notify = end_tag_write(txn, &mut log, hook, result).await?;
+    notify.send().await;
+    Ok(())
 }
 
 async fn del_in_txn(
     txn: &mut GraphTxn,
     hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     user_id: PubkyId,
     tag_id: String,
-) -> Result<(), EventProcessorError> {
+) -> Result<Notify, EventProcessorError> {
     let tag_details = TagUser::del_from_graph(txn, &user_id, &tag_id).await?;
     // CHOOSE THE EVENT TYPE
-    if let Some(target) = tag_details {
-        hook.at(TagWriteStep::EdgeDeleted).await?;
-        let label = target.label.clone();
-        match (
-            target.user_id,
-            target.post_id,
-            target.author_id,
-            target.listing_id,
-            target.listing_owner_id,
-            target.shop_owner_id,
-        ) {
-            // Delete user related indexes
-            (Some(tagged_id), None, None, None, None, None) => {
-                del_sync_user(txn, user_id, &tagged_id, &label).await?;
-            }
-            // Delete post related indexes
-            (None, Some(post_id), Some(author_id), None, None, None) => {
-                del_sync_post(txn, user_id, &post_id, &author_id, &label).await?;
-            }
-            // Delete marketplace listing related indexes
-            (None, None, None, Some(listing_id), Some(listing_owner_id), None) => {
-                del_sync_listing(txn, user_id, &listing_id, &listing_owner_id, &label).await?;
-            }
-            // Delete marketplace shop related indexes
-            (None, None, None, None, None, Some(shop_owner_id)) => {
-                del_sync_shop(txn, user_id, &shop_owner_id, &label).await?;
-            }
-            // Handle other unexpected cases
-            _ => {
-                debug!("DEL-Tag: Unexpected combination of tag details");
-            }
-        }
-    } else {
+    let Some(target) = tag_details else {
         return Err(EventProcessorError::SkipIndexing);
+    };
+    hook.at(TagWriteStep::EdgeDeleted).await?;
+    let label = target.label.clone();
+    match (
+        target.user_id,
+        target.post_id,
+        target.author_id,
+        target.listing_id,
+        target.listing_owner_id,
+        target.shop_owner_id,
+    ) {
+        // Delete user related indexes
+        (Some(tagged_id), None, None, None, None, None) => {
+            del_sync_user(txn, hook, log, user_id, &tagged_id, &label).await
+        }
+        // Delete post related indexes
+        (None, Some(post_id), Some(author_id), None, None, None) => {
+            del_sync_post(txn, hook, log, user_id, &post_id, &author_id, &label).await
+        }
+        // Delete marketplace listing related indexes
+        (None, None, None, Some(listing_id), Some(listing_owner_id), None) => {
+            del_sync_listing(
+                txn,
+                hook,
+                log,
+                user_id,
+                &listing_id,
+                &listing_owner_id,
+                &label,
+            )
+            .await
+        }
+        // Delete marketplace shop related indexes
+        (None, None, None, None, None, Some(shop_owner_id)) => {
+            del_sync_shop(txn, hook, log, user_id, &shop_owner_id, &label).await
+        }
+        // Handle other unexpected cases
+        _ => {
+            debug!("DEL-Tag: Unexpected combination of tag details");
+            Ok(Notify::None)
+        }
     }
-    Ok(())
 }
 
 /// A marketplace target whose own DEL is removing its community tags.
@@ -1045,45 +1142,33 @@ pub async fn purge_deleted_user_tags(
 
 async fn del_sync_user(
     txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_id: PubkyId,
     tagged_id: &str,
     tag_label: &str,
-) -> Result<(), EventProcessorError> {
-    let indexing_results = tokio::join!(
-        // Update user counts in the tagged
-        UserCounts::decrement(tagged_id, "tags", None),
-        // Update user counts in the tagger
-        UserCounts::decrement(&tagger_id, "tagged", None),
-        async {
-            // Decrement label count to the user profile tag
-            TagUser::update_index_score(tagged_id, None, tag_label, ScoreAction::Decrement(1.0))
-                .await?;
-            // Decrease unique_tags
-            // NOTE: To update that field, we first need to decrement the value in the TagUser SORTED SET associated with that tag
-            UserCounts::decrement(tagged_id, "unique_tags", Some(tag_label)).await?;
-            Ok::<(), EventProcessorError>(())
-        },
-        async {
-            // Remove tagger to the user taggers list
-            TagUser(vec![tagger_id.to_string()])
-                .del_from_index(tagged_id, None, tag_label)
-                .await?;
-            Ok::<(), EventProcessorError>(())
-        },
-        // Save new notification
-        Notification::new_user_untag(&tagger_id, tagged_id, tag_label),
-        // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused_in(txn, tag_label)
-    );
-
-    indexing_results.0?;
-    indexing_results.1?;
-    indexing_results.2?;
-    indexing_results.3?;
-    indexing_results.4?;
-    indexing_results.5?;
-
-    Ok(())
+) -> Result<Notify, EventProcessorError> {
+    let target = Target::User { user_id: tagged_id };
+    // Update user counts in the tagged
+    log.user_counter(hook, tagged_id, "tags", false).await?;
+    // Update user counts in the tagger
+    log.user_counter(hook, &tagger_id, "tagged", false).await?;
+    // Decrement label count to the user profile tag
+    log.score(hook, target, tag_label, ScoreAction::Decrement(1.0))
+        .await?;
+    // Decrease unique_tags. It has to come after the label score above, which
+    // it reads.
+    log.unique_tags(hook, target, tag_label, false).await?;
+    // Remove tagger to the user taggers list
+    log.tagger(hook, target, &tagger_id, tag_label, false)
+        .await?;
+    // Drop the label from autocomplete once no target uses it
+    log.prune_label(hook, txn, tag_label).await?;
+    Ok(Notify::UserUntag {
+        tagger_id: tagger_id.to_string(),
+        tagged_id: tagged_id.to_string(),
+        label: tag_label.to_string(),
+    })
 }
 
 /// Removes a deleted listing tag from the Redis indexes: the tagger's global
@@ -1093,148 +1178,106 @@ async fn del_sync_user(
 /// engagement scoring, and notifications.
 async fn del_sync_listing(
     txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_id: PubkyId,
     listing_id: &str,
     owner_id: &str,
     tag_label: &str,
-) -> Result<(), EventProcessorError> {
-    let indexing_results = tokio::join!(
-        // Update user counts for tagger
-        UserCounts::decrement(&tagger_id, "tagged", None),
-        // Decrement label score in the listing
-        TagListing::update_index_score(
-            owner_id,
-            Some(listing_id),
-            tag_label,
-            ScoreAction::Decrement(1.0),
-        ),
-        async {
-            // Delete the tagger from the tag list
-            TagListing(vec![tagger_id.to_string()])
-                .del_from_index(owner_id, Some(listing_id), tag_label)
-                .await?;
-            // NOTE: The by-tag timeline depends on the listing taggers collection to delete
-            // Delete listing from the global label timeline
-            ListingsByTagSearch::del_from_index(owner_id, listing_id, tag_label).await?;
-            Ok::<(), EventProcessorError>(())
-        },
-        // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused_in(txn, tag_label)
-    );
-
-    indexing_results.0?;
-    indexing_results.1?;
-    indexing_results.2?;
-    indexing_results.3?;
-
-    Ok(())
+) -> Result<Notify, EventProcessorError> {
+    let target = Target::Listing {
+        owner_id,
+        listing_id,
+    };
+    // Update user counts for tagger
+    log.user_counter(hook, &tagger_id, "tagged", false).await?;
+    // Decrement label score in the listing
+    log.score(hook, target, tag_label, ScoreAction::Decrement(1.0))
+        .await?;
+    // Delete the tagger from the tag list
+    log.tagger(hook, target, &tagger_id, tag_label, false)
+        .await?;
+    // NOTE: The by-tag timeline depends on the listing taggers collection to delete
+    // Delete listing from the global label timeline
+    log.timeline(hook, target, tag_label, false).await?;
+    // Drop the label from autocomplete once no target uses it
+    log.prune_label(hook, txn, tag_label).await?;
+    Ok(Notify::None)
 }
 
 /// Removes a deleted shop tag from the Redis indexes. Mirrors
 /// [`del_sync_user`] minus per-target counts and notifications.
 async fn del_sync_shop(
     txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_id: PubkyId,
     owner_id: &str,
     tag_label: &str,
-) -> Result<(), EventProcessorError> {
-    let indexing_results = tokio::join!(
-        // Update user counts for tagger
-        UserCounts::decrement(&tagger_id, "tagged", None),
-        // Decrement label score on the shop
-        TagShop::update_index_score(owner_id, None, tag_label, ScoreAction::Decrement(1.0)),
-        async {
-            // Remove tagger from the shop taggers list
-            TagShop(vec![tagger_id.to_string()])
-                .del_from_index(owner_id, None, tag_label)
-                .await?;
-            Ok::<(), EventProcessorError>(())
-        },
-        // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused_in(txn, tag_label)
-    );
-
-    indexing_results.0?;
-    indexing_results.1?;
-    indexing_results.2?;
-    indexing_results.3?;
-
-    Ok(())
+) -> Result<Notify, EventProcessorError> {
+    let target = Target::Shop { owner_id };
+    // Update user counts for tagger
+    log.user_counter(hook, &tagger_id, "tagged", false).await?;
+    // Decrement label score on the shop
+    log.score(hook, target, tag_label, ScoreAction::Decrement(1.0))
+        .await?;
+    // Remove tagger from the shop taggers list
+    log.tagger(hook, target, &tagger_id, tag_label, false)
+        .await?;
+    // Drop the label from autocomplete once no target uses it
+    log.prune_label(hook, txn, tag_label).await?;
+    Ok(Notify::None)
 }
 
 async fn del_sync_post(
     txn: &mut GraphTxn,
+    hook: &dyn TagWriteHook,
+    log: &mut WriteLog,
     tagger_id: PubkyId,
     post_id: &str,
     author_id: &str,
     tag_label: &str,
-) -> Result<(), EventProcessorError> {
-    // SAVE TO INDEXES
-    let post_key_slice: &[&str] = &[author_id, post_id];
-    let tag_post = TagPost(vec![tagger_id.to_string()]);
+) -> Result<Notify, EventProcessorError> {
     let post_uri = post_uri_builder(author_id.to_string(), post_id.to_string());
-
-    let indexing_results = tokio::join!(
-        // Update user counts for tagger
-        UserCounts::decrement(&tagger_id, "tagged", None),
-        // Decrement in one the post tags
-        PostCounts::decrement_index_field(post_key_slice, "tags", None),
-        async {
-            // Decrement label score in the post
-            TagPost::update_index_score(
-                author_id,
-                Some(post_id),
-                tag_label,
-                ScoreAction::Decrement(1.0),
-            )
-            .await?;
-            // Decrease unique_tag
-            // NOTE: To update that field, we first need to decrement the value in the SORTED SET associated with that tag
-            PostCounts::decrement_index_field(post_key_slice, "unique_tags", Some(tag_label))
-                .await?;
-            Ok::<(), EventProcessorError>(())
-        },
-        // Decrease post from label total engagement
-        PostsByTagSearch::update_index_score(
-            author_id,
-            post_id,
-            tag_label,
-            ScoreAction::Decrement(1.0),
-        ),
-        async {
-            // Post replies cannot be included in the total engagement index once the tag have been deleted
-            if !post_relationships_is_reply(author_id, post_id).await? {
-                // Decrement in one post global engagement
-                PostStream::update_index_score(author_id, post_id, ScoreAction::Decrement(1.0))
-                    .await
-                    .map_err(EventProcessorError::index_operation_failed)?;
-            }
-            Ok::<(), EventProcessorError>(())
-        },
-        async {
-            // Delete the tagger from the tag list
-            tag_post
-                .del_from_index(author_id, Some(post_id), tag_label)
-                .await?;
-            // NOTE: The tag search index, depends on the post taggers collection to delete
-            // Delete post from global label timeline
-            PostsByTagSearch::del_from_index(author_id, post_id, tag_label).await?;
-            Ok::<(), EventProcessorError>(())
-        },
-        // Save new notification
-        Notification::new_post_untag(&tagger_id, author_id, tag_label, &post_uri),
-        // Drop the label from autocomplete once no target uses it
-        TagSearch::del_from_index_if_unused_in(txn, tag_label)
-    );
-
-    indexing_results.0?;
-    indexing_results.1?;
-    indexing_results.2?;
-    indexing_results.3?;
-    indexing_results.4?;
-    indexing_results.5?;
-    indexing_results.6?;
-    indexing_results.7?;
-
-    Ok(())
+    // Post replies cannot be included in the total engagement index once the tag have been deleted
+    let is_reply = post_relationships_is_reply_in(txn, author_id, post_id).await?;
+    let target = Target::Post { author_id, post_id };
+    // Update user counts for tagger
+    log.user_counter(hook, &tagger_id, "tagged", false).await?;
+    // Decrement in one the post tags
+    log.post_counter(hook, author_id, post_id, "tags", false)
+        .await?;
+    // Decrement label score in the post
+    log.score(hook, target, tag_label, ScoreAction::Decrement(1.0))
+        .await?;
+    // Decrease unique_tag. It has to come after the label score above, which
+    // it reads.
+    log.unique_tags(hook, target, tag_label, false).await?;
+    // Decrease post from label total engagement
+    log.label_engagement(
+        hook,
+        author_id,
+        post_id,
+        tag_label,
+        ScoreAction::Decrement(1.0),
+    )
+    .await?;
+    if !is_reply {
+        // Decrement in one post global engagement
+        log.post_engagement(hook, author_id, post_id, false).await?;
+    }
+    // Delete the tagger from the tag list
+    log.tagger(hook, target, &tagger_id, tag_label, false)
+        .await?;
+    // NOTE: The tag search index, depends on the post taggers collection to delete
+    // Delete post from global label timeline
+    log.timeline(hook, target, tag_label, false).await?;
+    // Drop the label from autocomplete once no target uses it
+    log.prune_label(hook, txn, tag_label).await?;
+    Ok(Notify::PostUntag {
+        tagger_id: tagger_id.to_string(),
+        author_id: author_id.to_string(),
+        label: tag_label.to_string(),
+        post_uri,
+    })
 }

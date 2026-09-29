@@ -594,6 +594,36 @@ pub trait RedisOps: Serialize + DeserializeOwned + Send + Sync {
         sorted_sets::put_score(SORTED_PREFIX, &key, &member_key, score_mutation).await
     }
 
+    /// Puts a sorted-set member back to the score it had before a write that
+    /// is being undone (`None` removes it). Without `recreate`, a member that
+    /// is absent now stays absent.
+    async fn restore_sorted_set_member(
+        key_parts: &[&str],
+        member: &[&str],
+        before: Option<isize>,
+        recreate: bool,
+    ) -> RedisResult<()> {
+        let key = key_parts.join(":");
+        sorted_sets::restore(SORTED_PREFIX, &key, &member.join(":"), before, recreate).await
+    }
+
+    /// Adds `delta` to a sorted-set member's score only if the member exists.
+    async fn put_score_index_sorted_set_if_present(
+        key_parts: &[&str],
+        member: &[&str],
+        delta: f64,
+    ) -> RedisResult<()> {
+        let key = key_parts.join(":");
+        sorted_sets::put_score_if_present(SORTED_PREFIX, &key, &member.join(":"), delta).await
+    }
+
+    /// Sets a numeric field of an existing JSON document to `value`.
+    async fn set_json_field(key_parts: &[&str], field: &str, value: i64) -> RedisResult<()> {
+        let prefix = Self::prefix().await;
+        let key = key_parts.join(":");
+        json::set_field(&prefix, &key, field, value).await
+    }
+
     /// Increments the score of a member in a Redis sorted set by 1.0.
     async fn increment_score_index_sorted_set(
         key_parts: &[&str],

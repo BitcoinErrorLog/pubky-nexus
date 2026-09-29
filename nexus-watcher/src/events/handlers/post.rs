@@ -16,8 +16,8 @@ use pubky_app_specs::{
 use tracing::debug;
 
 use super::utils::{
-    finish_txn, post_relationships_is_reply, NoopTargetDeleteHook, TargetDeleteHook,
-    TargetDeleteStep,
+    finish_txn, post_relationships_is_reply, post_relationships_is_reply_in, NoopTargetDeleteHook,
+    TargetDeleteHook, TargetDeleteStep,
 };
 
 pub async fn sync_put(
@@ -418,7 +418,7 @@ async fn sync_del_in_txn(
     let untagged_by = super::tag::purge_deleted_post_tags(txn, &author_id, &post_id).await?;
     let deleted_uri = post_uri_builder(author_id.to_string(), post_id.clone());
 
-    let post_relationships = PostRelationships::get_by_id(&author_id, &post_id).await?;
+    let post_relationships = PostRelationships::get_by_id_in(txn, &author_id, &post_id).await?;
     // If the post is reply, cannot delete from the main feeds
     // In the main feed, we just include the root posts and reposts
     // It could be a situation that relationship would not exist and we will treat the post as a not reply
@@ -469,7 +469,9 @@ async fn sync_del_in_txn(
                 PostCounts::decrement_index_field(&parent_post_key_parts, "replies", None),
                 async {
                     // Post replies cannot be included in the total engagement index after the reply is deleted
-                    if !post_relationships_is_reply(&parent_user_id, &parent_post_id).await? {
+                    if !post_relationships_is_reply_in(txn, &parent_user_id, &parent_post_id)
+                        .await?
+                    {
                         PostStream::decrement_score_index_sorted_set(
                             &POST_TOTAL_ENGAGEMENT_KEY_PARTS,
                             &parent_post_key_parts,
@@ -515,7 +517,9 @@ async fn sync_del_in_txn(
                 PostCounts::decrement_index_field(parent_post_key_parts, "reposts", None),
                 async {
                     // Post replies cannot be included in the total engagement index after the repost is deleted
-                    if !post_relationships_is_reply(&reposted_uri.user_id, &parent_post_id).await? {
+                    if !post_relationships_is_reply_in(txn, &reposted_uri.user_id, &parent_post_id)
+                        .await?
+                    {
                         PostStream::decrement_score_index_sorted_set(
                             &POST_TOTAL_ENGAGEMENT_KEY_PARTS,
                             parent_post_key_parts,

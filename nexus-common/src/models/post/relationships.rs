@@ -1,5 +1,5 @@
 use crate::db::kv::RedisResult;
-use crate::db::{fetch_row_from_graph, queries, GraphResult, RedisOps};
+use crate::db::{fetch_row_from_graph, queries, GraphResult, GraphTxn, RedisOps};
 use crate::models::error::ModelResult;
 use pubky_app_specs::{post_uri_builder, ParsedUri, PubkyAppPost, PubkyAppPostKind, PubkyId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -80,15 +80,33 @@ impl PostRelationships {
         let query = queries::get::post_relationships(author_id, post_id);
         let maybe_row = fetch_row_from_graph(query).await?;
 
-        let Some(row) = maybe_row else {
-            return Ok(None);
-        };
+        Ok(maybe_row.map(|row| Self::from_row(&row)))
+    }
 
+    /// Like [`Self::get_by_id`], but a Redis miss is read through `txn`, on
+    /// the transaction's own connection, and not written back to Redis. For
+    /// code that holds a target's lock and must not take a second graph
+    /// connection.
+    pub async fn get_by_id_in(
+        txn: &mut GraphTxn,
+        author_id: &str,
+        post_id: &str,
+    ) -> ModelResult<Option<PostRelationships>> {
+        if let Some(relationships) = Self::get_from_index(author_id, post_id).await? {
+            return Ok(Some(relationships));
+        }
+        let row = txn
+            .fetch_row(queries::get::post_relationships(author_id, post_id))
+            .await?;
+        Ok(row.map(|row| Self::from_row(&row)))
+    }
+
+    fn from_row(row: &neo4rs::Row) -> Self {
         let replied_post_id: Option<String> = row.get("replied_post_id").unwrap_or(None);
         let replied_author_id: Option<String> = row.get("replied_author_id").unwrap_or(None);
         let reposted_post_id: Option<String> = row.get("reposted_post_id").unwrap_or(None);
         let reposted_author_id: Option<String> = row.get("reposted_author_id").unwrap_or(None);
-        let mentioned: Vec<PubkyId> = row.get("mentioned_user_ids").unwrap_or(Vec::new());
+        let mentioned: Vec<PubkyId> = row.get("mentioned_user_ids").unwrap_or_default();
 
         let replied = replied_author_id
             .zip(replied_post_id)
@@ -99,11 +117,11 @@ impl PostRelationships {
             .map(|(author_id, post_id)| post_uri_builder(author_id, post_id))
             .and_then(|uri| ParsedUri::try_from(uri).ok());
 
-        Ok(Some(Self {
+        Self {
             replied,
             reposted,
             mentioned,
-        }))
+        }
     }
 
     /// Constructs a `Self` instance by extracting relationships from a `PubkyAppPost` object

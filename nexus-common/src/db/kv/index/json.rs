@@ -161,6 +161,21 @@ pub async fn modify_json_field(
     Ok(())
 }
 
+/// Sets a numeric field of an existing JSON document to `value`. A missing
+/// document is left missing.
+pub async fn set_field(prefix: &str, key: &str, field: &str, value: i64) -> RedisResult<()> {
+    let index_key = format!("{prefix}:{key}");
+    let mut redis_conn = get_redis_conn().await?;
+    deadpool_redis::redis::cmd("JSON.SET")
+        .arg(index_key)
+        .arg(format!("$.{field}"))
+        .arg(value)
+        .arg("XX")
+        .exec_async(&mut redis_conn)
+        .await?;
+    Ok(())
+}
+
 /// [`modify_json_field`] applied at most once per `claim_member` of the
 /// `claim_key` set. The claim and the field update run in one Lua script, so
 /// a caller retried after a failure can neither skip nor repeat the update.

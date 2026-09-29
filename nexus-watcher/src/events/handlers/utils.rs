@@ -44,6 +44,20 @@ pub async fn post_relationships_is_reply(
     }
 }
 
+/// [`post_relationships_is_reply`] for code that holds a transaction's locks:
+/// a Redis miss is read through `txn`, not through a second graph connection.
+pub async fn post_relationships_is_reply_in(
+    txn: &mut GraphTxn,
+    author_id: &str,
+    post_id: &str,
+) -> Result<bool, EventProcessorError> {
+    match PostRelationships::get_by_id_in(txn, author_id, post_id).await? {
+        Some(relationship) => Ok(relationship.replied.is_some()),
+        // If the post does not exist, it is treated as a reply to avoid incorrect assumptions
+        None => Ok(true),
+    }
+}
+
 /// Ends the transaction a handler ran its graph and Redis writes in: commits
 /// it when `result` is `Ok`, rolls it back otherwise and hands back the
 /// handler's error. The write locks the handler took are released either

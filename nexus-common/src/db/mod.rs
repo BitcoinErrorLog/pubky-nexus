@@ -15,5 +15,7 @@ pub use graph::error::{GraphError, GraphResult};
 pub use graph::exec::*;
 pub use graph::queries;
 pub use graph::setup;
-pub use graph::{GraphOps, GraphTxn};
+#[doc(hidden)]
+pub use graph::{autocommit_statement_count, fail_next_commit, open_txn_count};
+pub use graph::{GraphOps, GraphTxn, MAX_OPEN_TXNS};
 pub use kv::RedisOps;

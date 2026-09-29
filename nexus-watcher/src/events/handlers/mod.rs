@@ -10,3 +10,4 @@ pub mod shop;
 pub mod tag;
 pub mod user;
 pub mod utils;
+mod write_log;

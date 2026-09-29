@@ -42,6 +42,56 @@ pub async fn check_member(prefix: &str, key: &str, member: &str) -> RedisResult<
     Ok(rank)
 }
 
+/// Puts a member back to the score it had before a write that is being
+/// undone: `None` removes it. When the write being undone added a member, an
+/// undo that runs after the member was purged must not bring it back; when it
+/// removed one (`recreate`), the undo must.
+pub async fn restore(
+    prefix: &str,
+    key: &str,
+    member: &str,
+    before: Option<isize>,
+    recreate: bool,
+) -> RedisResult<()> {
+    let Some(score) = before else {
+        return del(prefix, key, &[member]).await;
+    };
+    let index_key = format!("{prefix}:{key}");
+    let mut redis_conn = get_redis_conn().await?;
+    let mut command = deadpool_redis::redis::cmd("ZADD");
+    command.arg(index_key);
+    if !recreate {
+        command.arg("XX");
+    }
+    command
+        .arg(score as f64)
+        .arg(member)
+        .exec_async(&mut redis_conn)
+        .await?;
+    Ok(())
+}
+
+/// Adds `delta` to a member's score only if the member exists, and never
+/// creates it.
+pub async fn put_score_if_present(
+    prefix: &str,
+    key: &str,
+    member: &str,
+    delta: f64,
+) -> RedisResult<()> {
+    let index_key = format!("{prefix}:{key}");
+    let mut redis_conn = get_redis_conn().await?;
+    deadpool_redis::redis::cmd("ZADD")
+        .arg(index_key)
+        .arg("XX")
+        .arg("INCR")
+        .arg(delta)
+        .arg(member)
+        .exec_async(&mut redis_conn)
+        .await?;
+    Ok(())
+}
+
 /// Adds elements to a Redis sorted set.
 ///
 /// This function adds elements to the specified Redis sorted set. If the set doesn't exist,
