@@ -907,7 +907,7 @@ async fn test_auction_terms_backfill_reports_missing_record_as_gone() -> Result<
     legacy_details.put_to_index(true).await?;
     delete_homeserver_record_without_event(&user_kp, &listing_path).await?;
 
-    let summary = backfill_missing_auction_terms().await?;
+    let summary = backfill_missing_auction_terms().await.unwrap();
     assert_eq!(summary.reindexed, 0, "missing records cannot be reindexed");
     assert_eq!(summary.gone, 1, "the missing record must be reported gone");
     assert_eq!(
@@ -915,8 +915,11 @@ async fn test_auction_terms_backfill_reports_missing_record_as_gone() -> Result<
         "a definitive homeserver 404 is not a backfill failure"
     );
 
-    nexus_watcher::events::handlers::listing::del(PubkyId::try_from(user_id.as_str())?, listing_id)
-        .await?;
+    nexus_watcher::events::handlers::listing::del(
+        PubkyId::try_from(user_id.as_str()).unwrap(),
+        listing_id,
+    )
+    .await?;
     test.cleanup_user(&user_kp).await?;
     Ok(())
 }
