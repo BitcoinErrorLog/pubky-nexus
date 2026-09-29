@@ -43,6 +43,9 @@ pub struct ListingDetails {
     pub uri: String,
     pub owner_id: String,
     pub indexed_at: i64,
+    /// Lifecycle state as served by the index. Stored records carry the state
+    /// the seller published; reads report an `active` auction whose
+    /// `auction_ends_at` has passed as `ended` (see [`Self::effective_state_at`]).
     pub state: PubkyAppListingState,
     pub title: String,
     pub description: String,
@@ -145,23 +148,59 @@ impl ListingDetails {
             .map(|datetime| datetime.timestamp_millis())
     }
 
+    /// The lifecycle state a reader sees at `now_ms` (epoch milliseconds).
+    ///
+    /// An auction is closed to bidding once its end time is reached, but the
+    /// seller's record keeps `active` until the seller edits it. The stored
+    /// state is left alone (only the seller can change it, and the index
+    /// cannot rewrite it); an `active` auction whose end time is at or before
+    /// `now_ms` reads as `ended`. `paused` and `removed` are the seller's
+    /// explicit choices and are never overridden.
+    pub fn effective_state_at(&self, now_ms: i64) -> PubkyAppListingState {
+        match (self.state, self.auction_ends_at_ms()) {
+            (PubkyAppListingState::Active, Some(ends_at_ms)) if ends_at_ms <= now_ms => {
+                PubkyAppListingState::Ended
+            }
+            (state, _) => state,
+        }
+    }
+
+    /// Returns the details with [`Self::effective_state_at`] applied. Only for
+    /// values on their way out to a reader; never write the result back to
+    /// the graph or the Redis cache.
+    pub fn with_effective_state_at(mut self, now_ms: i64) -> Self {
+        self.state = self.effective_state_at(now_ms);
+        self
+    }
+
     /// Retrieves listing details by seller ID and listing ID, first trying Redis,
-    /// then falling back to Neo4j.
+    /// then falling back to Neo4j. The returned state is the effective state at
+    /// the current time.
     pub async fn get_by_id(
         owner_id: &str,
         listing_id: &str,
     ) -> ModelResult<Option<ListingDetails>> {
-        match Self::get_from_index(owner_id, listing_id).await? {
-            Some(details) => Ok(Some(details)),
+        Self::get_by_id_at(owner_id, listing_id, Utc::now().timestamp_millis()).await
+    }
+
+    /// Like [`Self::get_by_id`], with the effective state evaluated at `now_ms`
+    /// so a caller that also filtered by state uses one clock for both.
+    pub async fn get_by_id_at(
+        owner_id: &str,
+        listing_id: &str,
+        now_ms: i64,
+    ) -> ModelResult<Option<ListingDetails>> {
+        let stored = match Self::get_from_index(owner_id, listing_id).await? {
+            Some(details) => Some(details),
             None => {
                 let maybe_details = Self::get_from_graph(owner_id, listing_id).await?;
-                if let Some(details) = maybe_details {
+                if let Some(details) = &maybe_details {
                     details.put_to_index(false).await?;
-                    return Ok(Some(details));
                 }
-                Ok(None)
+                maybe_details
             }
-        }
+        };
+        Ok(stored.map(|details| details.with_effective_state_at(now_ms)))
     }
 
     pub async fn get_from_index(
@@ -232,6 +271,7 @@ impl ListingDetails {
 mod tests {
     use super::ListingDetails;
     use crate::models::marketplace::ListingStream;
+    use pubky_app_specs::PubkyAppListingState;
     use serde_json::Value;
 
     const PRODUCTION_DETAIL_BEFORE_CLOSE: &str = include_str!(
@@ -267,6 +307,81 @@ mod tests {
             Value::Array(array) => array.iter().any(contains_forbidden_reserve_key),
             _ => false,
         }
+    }
+
+    fn captured_ended_auction() -> ListingDetails {
+        let mut detail: ListingDetails =
+            serde_json::from_value(captured_response_body(PRODUCTION_DETAIL_BEFORE_CLOSE))
+                .expect("captured detail shape");
+        detail.state = PubkyAppListingState::Active;
+        detail
+    }
+
+    #[test]
+    fn captured_production_auction_reads_as_ended_after_its_end_time() {
+        // Production listing 7dd7e427…: state `active` in the record, auction
+        // ended 2026-09-20T14:34:39.384Z.
+        let detail = captured_ended_auction();
+        assert_eq!(detail.state, PubkyAppListingState::Active);
+        let ends_at_ms = detail.auction_ends_at_ms().expect("auction end time");
+        assert_eq!(ends_at_ms, 1_789_914_879_384);
+
+        let now_ms = 1_790_640_000_000; // 2026-09-29T00:00:00Z
+        assert_eq!(
+            detail.effective_state_at(now_ms),
+            PubkyAppListingState::Ended
+        );
+        let served = detail.clone().with_effective_state_at(now_ms);
+        assert_eq!(
+            serde_json::to_value(&served).expect("serialized detail")["state"],
+            "ended"
+        );
+        // The stored value is untouched by the read-side derivation.
+        assert_eq!(detail.state, PubkyAppListingState::Active);
+    }
+
+    #[test]
+    fn auction_state_flips_exactly_at_the_end_time() {
+        let detail = captured_ended_auction();
+        let ends_at_ms = detail.auction_ends_at_ms().expect("auction end time");
+
+        assert_eq!(
+            detail.effective_state_at(ends_at_ms - 1),
+            PubkyAppListingState::Active,
+            "one millisecond before the end time the auction is still open"
+        );
+        assert_eq!(
+            detail.effective_state_at(ends_at_ms),
+            PubkyAppListingState::Ended,
+            "at the end time the auction is ended"
+        );
+        assert_eq!(
+            detail.effective_state_at(ends_at_ms + 1),
+            PubkyAppListingState::Ended
+        );
+    }
+
+    #[test]
+    fn seller_choices_and_fixed_price_listings_are_never_overridden() {
+        let mut detail = captured_ended_auction();
+        let after_end = detail.auction_ends_at_ms().expect("auction end time") + 1;
+
+        for state in [
+            PubkyAppListingState::Paused,
+            PubkyAppListingState::Removed,
+            PubkyAppListingState::Ended,
+        ] {
+            detail.state = state;
+            assert_eq!(detail.effective_state_at(after_end), state);
+        }
+
+        detail.state = PubkyAppListingState::Active;
+        detail.auction_ends_at = None;
+        assert_eq!(
+            detail.effective_state_at(i64::MAX),
+            PubkyAppListingState::Active,
+            "a listing without an auction end time never expires"
+        );
     }
 
     #[test]

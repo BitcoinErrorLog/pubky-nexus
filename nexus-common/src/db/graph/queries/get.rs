@@ -10,7 +10,7 @@ use crate::types::Pagination;
 use crate::types::StreamReach;
 use crate::types::StreamSorting;
 use crate::types::Timeframe;
-use pubky_app_specs::PubkyAppPostKind;
+use pubky_app_specs::{PubkyAppListingState, PubkyAppPostKind};
 
 // Retrieve post node by post id and author id
 pub fn get_post_by_id(author_id: &str, post_id: &str) -> Query {
@@ -1100,6 +1100,7 @@ pub fn listing_stream(
     pagination: Pagination,
     order: SortOrder,
     sorting: ListingStreamSorting,
+    now_ms: i64,
 ) -> GraphResult<Query> {
     let mut cypher = String::new();
     let mut where_clause_applied = false;
@@ -1147,10 +1148,10 @@ pub fn listing_stream(
             &mut where_clause_applied,
         );
     }
-    if filters.state.is_some() {
+    if let Some(state) = filters.state {
         append_condition(
             &mut cypher,
-            "listing.state = $state",
+            listing_state_condition(state),
             &mut where_clause_applied,
         );
     }
@@ -1239,6 +1240,7 @@ pub fn listing_stream(
     }
     if let Some(state) = &filters.state {
         query = query.param("state", enum_query_param(state)?);
+        query = query.param("now_ms", now_ms);
     }
     if let Some(currency) = &filters.currency {
         query = query.param("currency", currency.to_string());
@@ -1263,6 +1265,30 @@ pub fn listing_stream(
     }
 
     Ok(query)
+}
+
+/// The Cypher condition matching listings whose *effective* state is `state`
+/// (see `ListingDetails::effective_state_at`), evaluated at `$now_ms`.
+///
+/// Stored nodes keep the state the seller published, so an auction whose end
+/// time has passed is still stored as `active`. It is excluded from `active`
+/// and included in `ended`, without rewriting the node. An auction ending
+/// exactly at `$now_ms` is already ended. Fixed-price listings have no
+/// `auction_ends_at_ms` and follow their stored state.
+fn listing_state_condition(state: PubkyAppListingState) -> &'static str {
+    match state {
+        PubkyAppListingState::Active => {
+            "(listing.state = $state \
+             AND (listing.auction_ends_at_ms IS NULL OR listing.auction_ends_at_ms > $now_ms))"
+        }
+        PubkyAppListingState::Ended => {
+            "(listing.state = $state \
+             OR (listing.state = 'active' \
+                 AND listing.auction_ends_at_ms IS NOT NULL \
+                 AND listing.auction_ends_at_ms <= $now_ms))"
+        }
+        PubkyAppListingState::Paused | PubkyAppListingState::Removed => "listing.state = $state",
+    }
 }
 
 /// Appends a condition to the Cypher query, using `WHERE` if no `WHERE` clause
@@ -1461,4 +1487,62 @@ pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
     Query::new("listing_reputation", &cypher)
         .param("listing_owner_id", listing_owner_id.to_string())
         .param("listing_id", listing_id.to_string())
+}
+
+#[cfg(test)]
+mod listing_stream_state_tests {
+    use super::*;
+
+    fn stream_cypher(state: Option<PubkyAppListingState>, now_ms: i64) -> String {
+        let filters = ListingStreamFilters {
+            state,
+            ..Default::default()
+        };
+        listing_stream(
+            &filters,
+            Pagination::default(),
+            SortOrder::Ascending,
+            ListingStreamSorting::EndsAt,
+            now_ms,
+        )
+        .expect("listing stream query")
+        .to_cypher_populated()
+    }
+
+    #[test]
+    fn active_filter_excludes_auctions_ending_at_or_before_now() {
+        let cypher = stream_cypher(Some(PubkyAppListingState::Active), 1_790_000_000_000);
+        assert!(
+            cypher.contains("listing.state = 'active'"),
+            "active filter keeps the stored-state match: {cypher}"
+        );
+        assert!(
+            cypher.contains(
+                "(listing.auction_ends_at_ms IS NULL OR listing.auction_ends_at_ms > 1790000000000)"
+            ),
+            "an auction ending exactly now is not active: {cypher}"
+        );
+    }
+
+    #[test]
+    fn ended_filter_includes_expired_active_auctions() {
+        let cypher = stream_cypher(Some(PubkyAppListingState::Ended), 1_790_000_000_000);
+        assert!(cypher.contains("listing.state = 'ended'"), "{cypher}");
+        assert!(
+            cypher.contains(
+                "listing.state = 'active' AND listing.auction_ends_at_ms IS NOT NULL AND listing.auction_ends_at_ms <= 1790000000000"
+            ),
+            "an auction ending exactly now is ended: {cypher}"
+        );
+    }
+
+    #[test]
+    fn seller_chosen_states_and_unfiltered_streams_ignore_the_clock() {
+        for state in [PubkyAppListingState::Paused, PubkyAppListingState::Removed] {
+            let cypher = stream_cypher(Some(state), 1_790_000_000_000);
+            assert!(!cypher.contains("1790000000000"), "{cypher}");
+        }
+        let cypher = stream_cypher(None, 1_790_000_000_000);
+        assert!(!cypher.contains("1790000000000"), "{cypher}");
+    }
 }

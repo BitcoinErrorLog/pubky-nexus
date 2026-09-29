@@ -5,6 +5,7 @@ use crate::db::kv::{RedisResult, SortOrder};
 use crate::db::{get_neo4j_graph, queries, GraphError, GraphResult, RedisOps};
 use crate::models::error::{ModelError, ModelResult};
 use crate::types::Pagination;
+use chrono::Utc;
 use futures::TryStreamExt;
 use pubky_app_specs::{PubkyAppListingCondition, PubkyAppListingState};
 use serde::{Deserialize, Serialize};
@@ -151,13 +152,35 @@ impl ListingStream {
         order: SortOrder,
         sorting: ListingStreamSorting,
     ) -> ModelResult<Option<Self>> {
-        let listing_keys = Self::collect_listing_keys(filters, pagination, order, sorting).await?;
+        Self::get_listings_at(
+            filters,
+            pagination,
+            order,
+            sorting,
+            Utc::now().timestamp_millis(),
+        )
+        .await
+    }
+
+    /// Like [`Self::get_listings`], evaluating listing state at `now_ms`
+    /// (epoch milliseconds). The `state` filter and the `state` of every
+    /// returned entry use this one instant, so a page never contains an entry
+    /// whose state contradicts the filter that selected it.
+    pub async fn get_listings_at(
+        filters: ListingStreamFilters,
+        pagination: Pagination,
+        order: SortOrder,
+        sorting: ListingStreamSorting,
+        now_ms: i64,
+    ) -> ModelResult<Option<Self>> {
+        let listing_keys =
+            Self::collect_listing_keys(filters, pagination, order, sorting, now_ms).await?;
 
         if listing_keys.is_empty() {
             return Ok(None);
         }
 
-        Self::from_listed_listing_keys(&listing_keys).await
+        Self::from_listed_listing_keys(&listing_keys, now_ms).await
     }
 
     async fn collect_listing_keys(
@@ -165,6 +188,7 @@ impl ListingStream {
         pagination: Pagination,
         order: SortOrder,
         sorting: ListingStreamSorting,
+        now_ms: i64,
     ) -> ModelResult<Vec<String>> {
         match sorting {
             // A single community tag on its own is served by the by-tag index
@@ -175,7 +199,9 @@ impl ListingStream {
             ListingStreamSorting::Timeline => {
                 match filters.has_graph_only_filters() || filters.tags.is_some() {
                     false => Ok(Self::get_from_index(&filters, pagination, order).await?),
-                    true => Ok(Self::get_from_graph(&filters, pagination, order, sorting).await?),
+                    true => Ok(
+                        Self::get_from_graph(&filters, pagination, order, sorting, now_ms).await?,
+                    ),
                 }
             }
             // The auction end-time sorted set is global, so any filter
@@ -186,7 +212,9 @@ impl ListingStream {
                     && filters.tags.is_none()
                 {
                     true => Ok(Self::get_auction_keys_from_index(pagination, order).await?),
-                    false => Ok(Self::get_from_graph(&filters, pagination, order, sorting).await?),
+                    false => Ok(
+                        Self::get_from_graph(&filters, pagination, order, sorting, now_ms).await?,
+                    ),
                 }
             }
         }
@@ -281,11 +309,12 @@ impl ListingStream {
         pagination: Pagination,
         order: SortOrder,
         sorting: ListingStreamSorting,
+        now_ms: i64,
     ) -> GraphResult<Vec<String>> {
         let mut result;
         {
             let graph = get_neo4j_graph()?;
-            let query = queries::get::listing_stream(filters, pagination, order, sorting)?;
+            let query = queries::get::listing_stream(filters, pagination, order, sorting, now_ms)?;
 
             // Set a 10-second timeout for the query execution
             result = match timeout(Duration::from_secs(10), graph.execute(query)).await {
@@ -305,7 +334,10 @@ impl ListingStream {
         Ok(listing_keys)
     }
 
-    pub async fn from_listed_listing_keys(listing_keys: &[String]) -> ModelResult<Option<Self>> {
+    pub async fn from_listed_listing_keys(
+        listing_keys: &[String],
+        now_ms: i64,
+    ) -> ModelResult<Option<Self>> {
         let mut handles = Vec::with_capacity(listing_keys.len());
 
         for listing_key in listing_keys {
@@ -315,8 +347,9 @@ impl ListingStream {
             };
             let owner_id = owner_id.to_string();
             let listing_id = listing_id.to_string();
-            let handle =
-                spawn(async move { ListingDetails::get_by_id(&owner_id, &listing_id).await });
+            let handle = spawn(async move {
+                ListingDetails::get_by_id_at(&owner_id, &listing_id, now_ms).await
+            });
             handles.push(handle);
         }
 

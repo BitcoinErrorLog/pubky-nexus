@@ -48,7 +48,7 @@ impl ListingStreamQuery {
         ("category" = Option<String>, Query, description = "Filter listings by their kebab-case category identifier. E.g., `apparel-shoes`"),
         ("condition" = Option<PubkyAppListingCondition>, Query, description = "Filter listings by item condition: new, like_new, excellent, good, fair or for_parts"),
         ("sale_format" = Option<ListingSaleFormat>, Query, description = "Filter listings by sale format: fixed_price or auction"),
-        ("state" = Option<PubkyAppListingState>, Query, description = "Filter listings by lifecycle state: active, paused, ended or removed"),
+        ("state" = Option<PubkyAppListingState>, Query, description = "Filter listings by lifecycle state: active, paused, ended or removed. An auction whose end time has been reached counts as ended even when the seller's record still says active, so state=active returns only listings open right now"),
         ("min_price" = Option<f64>, Query, description = "Filter listings with a price greater than or equal to this value, expressed in major units of `currency`. Requires the currency parameter"),
         ("max_price" = Option<f64>, Query, description = "Filter listings with a price less than or equal to this value, expressed in major units of `currency`. Requires the currency parameter"),
         ("currency" = Option<String>, Query, description = "Filter listings by their uppercase asset code. E.g., `USD` or `BTC`"),
@@ -69,6 +69,7 @@ impl ListingStreamQuery {
     description = r#"Stream Listings: Retrieve a stream of marketplace listings sorted by indexing timeline or by auction end time.
 
 Listings can be filtered by seller, category, condition, sale format, lifecycle state and price range.
+The lifecycle state is evaluated when the request is served: an `active` auction whose `auction_ends_at` is at or before the current time is served as `ended`, in the `state` filter and in the `state` field of each entry. `paused` and `removed` are never overridden.
 The price range filters (`min_price`, `max_price`) are expressed in major units and require the `currency` parameter.
 Sorting by `ends_at` returns only auction listings; use `order=ascending` for an "ending soon" stream."#
 )]
