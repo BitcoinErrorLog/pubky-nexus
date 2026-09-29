@@ -1,6 +1,7 @@
 pub mod error;
 pub mod exec;
 mod instrumented;
+pub mod lock;
 mod ops;
 pub mod queries;
 mod query;

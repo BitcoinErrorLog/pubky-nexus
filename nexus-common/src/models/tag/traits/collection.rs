@@ -1,3 +1,4 @@
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::graph::Query;
 use crate::db::kv::{RedisResult, ScoreAction, SortOrder};
 use crate::db::{
@@ -33,6 +34,32 @@ pub struct DeletedTagTarget {
     pub listing_owner_id: Option<String>,
     pub shop_owner_id: Option<String>,
     pub label: String,
+}
+
+impl DeletedTagTarget {
+    /// Names the target node in the registry of held locks.
+    pub fn lock_key(&self) -> Option<String> {
+        let target = match (
+            &self.user_id,
+            &self.post_id,
+            &self.author_id,
+            &self.listing_id,
+            &self.listing_owner_id,
+            &self.shop_owner_id,
+        ) {
+            (Some(user_id), None, None, None, None, None) => LockTarget::User(user_id),
+            (None, Some(post_id), Some(author_id), None, None, None) => {
+                LockTarget::Post { author_id, post_id }
+            }
+            (None, None, None, Some(listing_id), Some(owner_id), None) => LockTarget::Listing {
+                owner_id,
+                listing_id,
+            },
+            (None, None, None, None, None, Some(owner_id)) => LockTarget::Shop { owner_id },
+            _ => return None,
+        };
+        Some(target.key())
+    }
 }
 
 /// Trait for managing a collection of tags
@@ -87,13 +114,16 @@ where
                 Some(tag_details) => return Ok(Some(tag_details)),
                 None => {
                     let depth = depth.unwrap_or(1);
-                    let graph_response =
-                        Self::get_from_graph(user_id, viewer_id, Some(depth)).await?;
-                    if let Some(tag_details) = graph_response {
-                        Self::put_to_index(user_id, viewer_id, &tag_details, true).await?;
-                        return Ok(Some(tag_details));
-                    }
-                    return Ok(None);
+                    return under_target_lock(Self::lock_target(user_id, extra_param), async {
+                        let graph_response =
+                            Self::get_from_graph(user_id, viewer_id, Some(depth)).await?;
+                        if let Some(tag_details) = graph_response {
+                            Self::put_to_index(user_id, viewer_id, &tag_details, true).await?;
+                            return Ok(Some(tag_details));
+                        }
+                        Ok(None)
+                    })
+                    .await;
                 }
             }
         }
@@ -111,12 +141,15 @@ where
         {
             Some(tag_details) => Ok(Some(tag_details)),
             None => {
-                let graph_response = Self::get_from_graph(user_id, extra_param, None).await?;
-                if let Some(tag_details) = graph_response {
-                    Self::put_to_index(user_id, extra_param, &tag_details, false).await?;
-                    return Ok(Some(tag_details));
-                }
-                Ok(None)
+                under_target_lock(Self::lock_target(user_id, extra_param), async {
+                    let graph_response = Self::get_from_graph(user_id, extra_param, None).await?;
+                    if let Some(tag_details) = graph_response {
+                        Self::put_to_index(user_id, extra_param, &tag_details, false).await?;
+                        return Ok(Some(tag_details));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }
@@ -368,7 +401,12 @@ where
                 indexed_at,
             ),
         };
-        execute_graph_operation_in(txn, query).await
+        let outcome = execute_graph_operation_in(txn, query).await?;
+        if !matches!(outcome, OperationOutcome::MissingDependency) {
+            txn.hold(&Self::lock_target(tagged_user_id, extra_param).key());
+            txn.hold(&LockTarget::User(tagger_user_id).key());
+        }
+        Ok(outcome)
     }
 
     /// Reindexes tags for a given author by retrieving data from the graph database and updating the index.
@@ -380,14 +418,20 @@ where
     ///   If `Some`, the function retrieves and reindexes tags specific to the post;
     ///   if `None`, it reindexes tags globally for the author.
     async fn reindex(author_id: &str, extra_param: Option<&str>) -> ModelResult<()> {
-        match Self::get_from_graph(author_id, extra_param, None).await? {
-            Some(tag_user) => Self::put_to_index(author_id, extra_param, &tag_user, false).await?,
-            None => error!(
-                "{}:{} Could not found tags in the graph",
-                author_id,
-                extra_param.unwrap_or_default()
-            ),
-        }
+        under_target_lock(Self::lock_target(author_id, extra_param), async {
+            match Self::get_from_graph(author_id, extra_param, None).await? {
+                Some(tag_user) => {
+                    Self::put_to_index(author_id, extra_param, &tag_user, false).await?
+                }
+                None => error!(
+                    "{}:{} Could not found tags in the graph",
+                    author_id,
+                    extra_param.unwrap_or_default()
+                ),
+            }
+            Ok::<_, crate::models::error::ModelError>(Some(()))
+        })
+        .await?;
         Ok(())
     }
 
@@ -433,7 +477,8 @@ where
         };
 
         let label: String = row.get("label").expect("Query should return tag label");
-        Ok(Some(DeletedTagTarget {
+        txn.hold(&LockTarget::User(user_id).key());
+        let deleted = DeletedTagTarget {
             user_id: row.get("user_id").unwrap_or(None),
             post_id: row.get("post_id").unwrap_or(None),
             author_id: row.get("author_id").unwrap_or(None),
@@ -441,7 +486,24 @@ where
             listing_owner_id: row.get("listing_owner_id").unwrap_or(None),
             shop_owner_id: row.get("shop_owner_id").unwrap_or(None),
             label,
-        }))
+        };
+        if let Some(key) = deleted.lock_key() {
+            txn.hold(&key);
+        }
+        Ok(Some(deleted))
+    }
+
+    /// The node whose write lock serializes this collection's Redis writes
+    /// against the target's deletion. Posts and users by default; listings
+    /// and shops override it.
+    fn lock_target<'a>(user_id: &'a str, extra_param: Option<&'a str>) -> LockTarget<'a> {
+        match extra_param {
+            Some(post_id) => LockTarget::Post {
+                author_id: user_id,
+                post_id,
+            },
+            None => LockTarget::User(user_id),
+        }
     }
 
     /// Returns the unique key parts used to identify a tag in the Redis database

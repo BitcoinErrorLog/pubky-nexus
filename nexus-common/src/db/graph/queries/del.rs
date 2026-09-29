@@ -40,6 +40,87 @@ pub fn lock_post(author_id: &str, post_id: &str) -> Query {
     .param("post_id", post_id.to_string())
 }
 
+/// Takes a user's write lock and returns one row when the user exists. Run it
+/// in the deletion's or the cache fill's transaction; see [`lock_listing`].
+pub fn lock_user(user_id: &str) -> Query {
+    Query::new(
+        "lock_user",
+        "MATCH (user:User {id: $user_id})
+         SET user.tag_cleanup_lock = true
+         REMOVE user.tag_cleanup_lock
+         RETURN true AS locked",
+    )
+    .param("user_id", user_id.to_string())
+}
+
+/// [`lock_user`] for a batch: takes the write lock of every existing user in
+/// `user_ids` and returns the id of each.
+pub fn lock_users(user_ids: &[&str]) -> Query {
+    Query::new(
+        "lock_users",
+        "MATCH (user:User)
+         WHERE user.id IN $user_ids
+         SET user.tag_cleanup_lock = true
+         REMOVE user.tag_cleanup_lock
+         RETURN user.id AS id",
+    )
+    .param(
+        "user_ids",
+        user_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<String>>(),
+    )
+}
+
+/// Takes a drop's write lock and returns one row when the drop exists. See
+/// [`lock_listing`].
+pub fn lock_drop(owner_id: &str, drop_id: &str) -> Query {
+    Query::new(
+        "lock_drop",
+        "MATCH (drop:Drop {id: $drop_id, owner_id: $owner_id})
+         SET drop.tag_cleanup_lock = true
+         REMOVE drop.tag_cleanup_lock
+         RETURN true AS locked",
+    )
+    .param("owner_id", owner_id.to_string())
+    .param("drop_id", drop_id.to_string())
+}
+
+/// Takes a file's write lock and returns one row when the file exists. See
+/// [`lock_listing`].
+pub fn lock_file(owner_id: &str, file_id: &str) -> Query {
+    Query::new(
+        "lock_file",
+        "MATCH (file:File {id: $file_id, owner_id: $owner_id})
+         SET file.tag_cleanup_lock = true
+         REMOVE file.tag_cleanup_lock
+         RETURN true AS locked",
+    )
+    .param("owner_id", owner_id.to_string())
+    .param("file_id", file_id.to_string())
+}
+
+/// [`lock_users`] for files: `file_keys` are `owner_id:file_id`; returns the
+/// key of each existing file.
+pub fn lock_files(file_keys: &[&str]) -> Query {
+    Query::new(
+        "lock_files",
+        "MATCH (file:File)
+         WHERE file.owner_id + ':' + file.id IN $file_keys
+         SET file.tag_cleanup_lock = true
+         REMOVE file.tag_cleanup_lock
+         RETURN file.owner_id + ':' + file.id AS id",
+    )
+    .param(
+        "file_keys",
+        file_keys
+            .iter()
+            .map(|key| key.to_string())
+            .collect::<Vec<String>>(),
+    )
+}
+
 /// Deletes a "follows" relationship between two users
 /// # Arguments
 /// * `follower_id` - The unique identifier of the user who is following another user.

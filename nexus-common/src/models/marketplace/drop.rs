@@ -1,6 +1,7 @@
+use crate::db::graph::lock::{finish_txn, under_target_lock, LockTarget};
 use crate::db::kv::{RedisResult, SortOrder};
 use crate::db::{
-    exec_single_row, execute_graph_operation, fetch_row_from_graph, get_neo4j_graph, queries,
+    execute_graph_operation, fetch_row_from_graph, get_neo4j_graph, queries, start_graph_txn,
     GraphError, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::{ModelError, ModelResult};
@@ -104,12 +105,15 @@ impl DropDetails {
         match Self::get_from_index(owner_id, drop_id).await? {
             Some(details) => Ok(Some(details)),
             None => {
-                let maybe_details = Self::get_from_graph(owner_id, drop_id).await?;
-                if let Some(details) = maybe_details {
-                    details.put_to_index().await?;
-                    return Ok(Some(details));
-                }
-                Ok(None)
+                under_target_lock(LockTarget::Drop { owner_id, drop_id }, async {
+                    let maybe_details = Self::get_from_graph(owner_id, drop_id).await?;
+                    if let Some(details) = maybe_details {
+                        details.put_to_index().await?;
+                        return Ok(Some(details));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }
@@ -147,14 +151,26 @@ impl DropDetails {
         Ok(())
     }
 
+    /// Deletes the drop from the graph and Redis in one transaction holding
+    /// the drop's write lock, so a cache fill of the drop waits for the
+    /// deletion and then finds no drop.
     pub async fn delete(owner_id: &str, drop_id: &str) -> ModelResult<()> {
-        // Delete drop graph node
-        exec_single_row(queries::del::delete_drop(owner_id, drop_id)).await?;
-        // Delete drop details on Redis
-        Self::remove_from_index_multiple_json(&[&[owner_id, drop_id]]).await?;
-        // Remove from stream sorted sets
-        DropStream::remove_from_sorted_sets(owner_id, drop_id).await?;
-        Ok(())
+        let target = LockTarget::Drop { owner_id, drop_id };
+        let mut txn = start_graph_txn().await?;
+        let result = async {
+            txn.fetch_row(target.lock_query()).await?;
+            txn.hold(&target.key());
+            // Delete drop graph node
+            txn.run(queries::del::delete_drop(owner_id, drop_id))
+                .await?;
+            // Delete drop details on Redis
+            Self::remove_from_index_multiple_json(&[&[owner_id, drop_id]]).await?;
+            // Remove from stream sorted sets
+            DropStream::remove_from_sorted_sets(owner_id, drop_id).await?;
+            Ok::<(), ModelError>(())
+        }
+        .await;
+        finish_txn(txn, result).await
     }
 }
 

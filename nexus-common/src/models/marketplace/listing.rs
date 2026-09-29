@@ -1,4 +1,5 @@
 use super::ListingStream;
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::kv::RedisResult;
 use crate::db::{
     exec_single_row, execute_graph_operation, fetch_row_from_graph, queries, GraphResult,
@@ -154,12 +155,19 @@ impl ListingDetails {
         match Self::get_from_index(owner_id, listing_id).await? {
             Some(details) => Ok(Some(details)),
             None => {
-                let maybe_details = Self::get_from_graph(owner_id, listing_id).await?;
-                if let Some(details) = maybe_details {
-                    details.put_to_index(false).await?;
-                    return Ok(Some(details));
-                }
-                Ok(None)
+                let target = LockTarget::Listing {
+                    owner_id,
+                    listing_id,
+                };
+                under_target_lock(target, async {
+                    let maybe_details = Self::get_from_graph(owner_id, listing_id).await?;
+                    if let Some(details) = maybe_details {
+                        details.put_to_index(false).await?;
+                        return Ok(Some(details));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }

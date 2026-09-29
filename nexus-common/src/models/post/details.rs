@@ -1,4 +1,5 @@
 use super::{PostRelationships, PostStream};
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::kv::RedisResult;
 use crate::db::{
     execute_graph_operation, fetch_row_from_graph, queries, GraphResult, GraphTxn,
@@ -32,12 +33,15 @@ impl PostDetails {
         match Self::get_from_index(author_id, post_id).await? {
             Some(details) => Ok(Some(details)),
             None => {
-                let graph_response = Self::get_from_graph(author_id, post_id).await?;
-                if let Some((post_details, reply)) = graph_response {
-                    post_details.put_to_index(author_id, reply, false).await?;
-                    return Ok(Some(post_details));
-                }
-                Ok(None)
+                under_target_lock(LockTarget::Post { author_id, post_id }, async {
+                    let graph_response = Self::get_from_graph(author_id, post_id).await?;
+                    if let Some((post_details, reply)) = graph_response {
+                        post_details.put_to_index(author_id, reply, false).await?;
+                        return Ok(Some(post_details));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }
@@ -119,12 +123,16 @@ impl PostDetails {
     }
 
     pub async fn reindex(author_id: &str, post_id: &str) -> ModelResult<()> {
-        match Self::get_from_graph(author_id, post_id).await? {
-            Some((details, reply)) => details.put_to_index(author_id, reply, false).await?,
-            None => {
-                tracing::error!("{author_id}:{post_id} Could not find post counts in the graph")
+        under_target_lock(LockTarget::Post { author_id, post_id }, async {
+            match Self::get_from_graph(author_id, post_id).await? {
+                Some((details, reply)) => details.put_to_index(author_id, reply, false).await?,
+                None => {
+                    tracing::error!("{author_id}:{post_id} Could not find post counts in the graph")
+                }
             }
-        }
+            Ok::<_, crate::models::error::ModelError>(Some(()))
+        })
+        .await?;
         Ok(())
     }
 

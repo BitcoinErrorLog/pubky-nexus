@@ -34,6 +34,25 @@ pub enum GraphError {
     Generic(String),
 }
 
+impl GraphError {
+    /// Whether a statement failed because a node or relationship it had
+    /// matched was deleted before the statement could write to it: a
+    /// concurrent deletion won the race, and the dependency the statement
+    /// needs is gone.
+    pub fn is_entity_not_found(&self) -> bool {
+        const CODE: &str = "Neo.ClientError.Statement.EntityNotFound";
+        match self {
+            GraphError::QueryFailed(neo4rs::Error::Neo4j(error)) => error.code() == CODE,
+            // The driver reports a failure of the result stream as an
+            // unexpected-message error that carries the server's code.
+            GraphError::QueryFailed(neo4rs::Error::UnexpectedMessage(message)) => {
+                message.contains(CODE)
+            }
+            _ => false,
+        }
+    }
+}
+
 impl From<neo4rs::DeError> for GraphError {
     fn from(e: neo4rs::DeError) -> Self {
         GraphError::DeserializationFailed(Box::new(e))

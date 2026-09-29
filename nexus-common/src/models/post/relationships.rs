@@ -1,3 +1,4 @@
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::kv::RedisResult;
 use crate::db::{fetch_row_from_graph, queries, GraphResult, RedisOps};
 use crate::models::error::ModelResult;
@@ -55,12 +56,15 @@ impl PostRelationships {
         match Self::get_from_index(author_id, post_id).await? {
             Some(counts) => Ok(Some(counts)),
             None => {
-                let graph_response = Self::get_from_graph(author_id, post_id).await?;
-                if let Some(post_relationships) = graph_response {
-                    post_relationships.put_to_index(author_id, post_id).await?;
-                    return Ok(Some(post_relationships));
-                }
-                Ok(None)
+                under_target_lock(LockTarget::Post { author_id, post_id }, async {
+                    let graph_response = Self::get_from_graph(author_id, post_id).await?;
+                    if let Some(post_relationships) = graph_response {
+                        post_relationships.put_to_index(author_id, post_id).await?;
+                        return Ok(Some(post_relationships));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }
@@ -131,14 +135,18 @@ impl PostRelationships {
     }
 
     pub async fn reindex(author_id: &str, post_id: &str) -> ModelResult<()> {
-        match Self::get_from_graph(author_id, post_id).await? {
-            Some(relationships) => relationships.put_to_index(author_id, post_id).await?,
-            None => tracing::error!(
-                "{}:{} Could not found post relationships in the graph",
-                author_id,
-                post_id
-            ),
-        }
+        under_target_lock(LockTarget::Post { author_id, post_id }, async {
+            match Self::get_from_graph(author_id, post_id).await? {
+                Some(relationships) => relationships.put_to_index(author_id, post_id).await?,
+                None => tracing::error!(
+                    "{}:{} Could not found post relationships in the graph",
+                    author_id,
+                    post_id
+                ),
+            }
+            Ok::<_, crate::models::error::ModelError>(Some(()))
+        })
+        .await?;
         Ok(())
     }
 }

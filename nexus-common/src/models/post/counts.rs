@@ -1,3 +1,4 @@
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::kv::{JsonAction, RedisResult};
 use crate::db::{fetch_row_from_graph, queries, GraphResult, RedisOps};
 use crate::models::error::ModelResult;
@@ -26,14 +27,17 @@ impl PostCounts {
         match Self::get_from_index(author_id, post_id).await? {
             Some(counts) => Ok(Some(counts)),
             None => {
-                let graph_response = Self::get_from_graph(author_id, post_id).await?;
-                if let Some((post_counts, is_reply)) = graph_response {
-                    post_counts
-                        .put_to_index(author_id, post_id, !is_reply)
-                        .await?;
-                    return Ok(Some(post_counts));
-                }
-                Ok(None)
+                under_target_lock(LockTarget::Post { author_id, post_id }, async {
+                    let graph_response = Self::get_from_graph(author_id, post_id).await?;
+                    if let Some((post_counts, is_reply)) = graph_response {
+                        post_counts
+                            .put_to_index(author_id, post_id, !is_reply)
+                            .await?;
+                        return Ok(Some(post_counts));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }
@@ -112,14 +116,20 @@ impl PostCounts {
     }
 
     pub async fn reindex(author_id: &str, post_id: &str) -> ModelResult<()> {
-        match Self::get_from_graph(author_id, post_id).await? {
-            Some((counts, is_reply)) => counts.put_to_index(author_id, post_id, is_reply).await?,
-            None => tracing::error!(
-                "{}:{} Could not found post counts in the graph",
-                author_id,
-                post_id
-            ),
-        }
+        under_target_lock(LockTarget::Post { author_id, post_id }, async {
+            match Self::get_from_graph(author_id, post_id).await? {
+                Some((counts, is_reply)) => {
+                    counts.put_to_index(author_id, post_id, is_reply).await?
+                }
+                None => tracing::error!(
+                    "{}:{} Could not found post counts in the graph",
+                    author_id,
+                    post_id
+                ),
+            }
+            Ok::<_, crate::models::error::ModelError>(Some(()))
+        })
+        .await?;
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::kv::RedisResult;
 use crate::db::{
     execute_graph_operation, fetch_all_rows_from_graph, fetch_key_from_graph, queries, GraphResult,
@@ -51,12 +52,16 @@ impl Bookmark {
         match Self::get_from_index(author_id, post_id, viewer_id).await? {
             Some(counts) => Ok(Some(counts)),
             None => {
-                let graph_response = Self::get_from_graph(author_id, post_id, viewer_id).await?;
-                if let Some(bookmark) = graph_response {
-                    bookmark.put_to_index(author_id, post_id, viewer_id).await?;
-                    return Ok(Some(bookmark));
-                }
-                Ok(None)
+                under_target_lock(LockTarget::Post { author_id, post_id }, async {
+                    let graph_response =
+                        Self::get_from_graph(author_id, post_id, viewer_id).await?;
+                    if let Some(bookmark) = graph_response {
+                        bookmark.put_to_index(author_id, post_id, viewer_id).await?;
+                        return Ok(Some(bookmark));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }
@@ -102,9 +107,13 @@ impl Bookmark {
                     id: relation.get("id").unwrap_or_default(),
                     indexed_at: relation.get("indexed_at").unwrap_or_default(),
                 };
-                let author_id = row.get("author_id")?;
-                let post_id = row.get("post_id")?;
-                bookmark.put_to_index(author_id, post_id, user_id).await?;
+                let author_id: &str = row.get("author_id")?;
+                let post_id: &str = row.get("post_id")?;
+                under_target_lock(LockTarget::Post { author_id, post_id }, async {
+                    bookmark.put_to_index(author_id, post_id, user_id).await?;
+                    Ok::<_, crate::models::error::ModelError>(Some(()))
+                })
+                .await?;
             }
         }
         Ok(())

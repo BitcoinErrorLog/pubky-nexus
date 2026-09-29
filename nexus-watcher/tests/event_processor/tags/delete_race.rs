@@ -41,17 +41,17 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-type OpResult = Result<(), EventProcessorError>;
+pub(super) type OpResult = Result<(), EventProcessorError>;
 
 /// Holds one side of an interleaving until the test releases it.
-struct Gate {
-    reached: Notify,
-    release: Notify,
-    fired: AtomicBool,
+pub(super) struct Gate {
+    pub(super) reached: Notify,
+    pub(super) release: Notify,
+    pub(super) fired: AtomicBool,
 }
 
 impl Gate {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             reached: Notify::new(),
             release: Notify::new(),
@@ -59,7 +59,7 @@ impl Gate {
         })
     }
 
-    async fn hold_once(&self) {
+    pub(super) async fn hold_once(&self) {
         if !self.fired.swap(true, Ordering::SeqCst) {
             self.reached.notify_one();
             self.release.notified().await;
@@ -84,7 +84,7 @@ impl TagWriteHook for PauseWrite {
 
 struct FailWrite {
     step: TagWriteStep,
-    fired: AtomicBool,
+    pub(super) fired: AtomicBool,
 }
 
 #[async_trait]
@@ -128,7 +128,7 @@ impl TargetTagCleanupHook for PauseCleanup {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Post,
     User,
     Listing,
@@ -136,9 +136,9 @@ enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [Kind::Post, Kind::User, Kind::Listing, Kind::Shop];
+    pub(super) const ALL: [Kind; 4] = [Kind::Post, Kind::User, Kind::Listing, Kind::Shop];
 
-    fn code(self) -> &'static str {
+    pub(super) fn code(self) -> &'static str {
         match self {
             Kind::Post => "p",
             Kind::User => "u",
@@ -149,28 +149,28 @@ impl Kind {
 
     /// A post or a user that has an edge is kept as a `[DELETED]` record;
     /// a listing or a shop is deleted together with its tags.
-    fn keeps_tagged_target(self) -> bool {
+    pub(super) fn keeps_tagged_target(self) -> bool {
         matches!(self, Kind::Post | Kind::User)
     }
 }
 
 /// A target, its owner, a tagger with one unrelated tag, and the tag the
 /// tests write and delete.
-struct World {
-    kind: Kind,
-    owner_kp: Keypair,
-    owner_id: String,
+pub(super) struct World {
+    pub(super) kind: Kind,
+    pub(super) owner_kp: Keypair,
+    pub(super) owner_id: String,
     /// Post or listing id; unused for user and shop targets.
-    target_id: String,
-    target_path: Option<ResourcePath>,
-    tagger_kp: Keypair,
-    tagger_id: String,
-    label: String,
-    tag: PubkyAppTag,
-    baseline_label: String,
+    pub(super) target_id: String,
+    pub(super) target_path: Option<ResourcePath>,
+    pub(super) tagger_kp: Keypair,
+    pub(super) tagger_id: String,
+    pub(super) label: String,
+    pub(super) tag: PubkyAppTag,
+    pub(super) baseline_label: String,
 }
 
-async fn new_user(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
+pub(super) async fn new_user(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
     let kp = Keypair::random();
     let id = test
         .create_user(
@@ -187,7 +187,7 @@ async fn new_user(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String
     Ok((kp, id))
 }
 
-async fn world(test: &mut WatcherTest, kind: Kind) -> Result<World> {
+pub(super) async fn world(test: &mut WatcherTest, kind: Kind) -> Result<World> {
     let (owner_kp, owner_id) = new_user(test, "Race:Owner").await?;
     let (tagger_kp, tagger_id) = new_user(test, "Race:Tagger").await?;
     let (bystander_kp, bystander_id) = new_user(test, "Race:Bystander").await?;
@@ -265,32 +265,32 @@ async fn world(test: &mut WatcherTest, kind: Kind) -> Result<World> {
 }
 
 impl World {
-    fn tagger(&self) -> PubkyId {
+    pub(super) fn tagger(&self) -> PubkyId {
         PubkyId::try_from(self.tagger_id.as_str()).expect("a valid pubky")
     }
 
-    fn owner(&self) -> PubkyId {
+    pub(super) fn owner(&self) -> PubkyId {
         PubkyId::try_from(self.owner_id.as_str()).expect("a valid pubky")
     }
 
-    fn tag_id(&self) -> String {
+    pub(super) fn tag_id(&self) -> String {
         self.tag.create_id()
     }
 
     /// The tag PUT handler, as a concurrently processed event runs it.
-    fn spawn_put(&self, hook: Arc<dyn TagWriteHook + Send>) -> JoinHandle<OpResult> {
+    pub(super) fn spawn_put(&self, hook: Arc<dyn TagWriteHook + Send>) -> JoinHandle<OpResult> {
         let (tag, tagger, tag_id) = (self.tag.clone(), self.tagger(), self.tag_id());
         tokio::spawn(async move { tag::sync_put_with_hook(tag, tagger, tag_id, &*hook).await })
     }
 
     /// The tag DEL handler.
-    fn spawn_untag(&self, hook: Arc<dyn TagWriteHook + Send>) -> JoinHandle<OpResult> {
+    pub(super) fn spawn_untag(&self, hook: Arc<dyn TagWriteHook + Send>) -> JoinHandle<OpResult> {
         let (tagger, tag_id) = (self.tagger(), self.tag_id());
         tokio::spawn(async move { tag::del_with_hook(tagger, tag_id, &*hook).await })
     }
 
     /// The target's DEL handler, paused where it holds the target's lock.
-    fn spawn_delete(&self, gate: Arc<Gate>) -> JoinHandle<OpResult> {
+    pub(super) fn spawn_delete(&self, gate: Arc<Gate>) -> JoinHandle<OpResult> {
         let (owner, target_id) = (self.owner(), self.target_id.clone());
         match self.kind {
             Kind::Post => tokio::spawn(async move {
@@ -310,7 +310,20 @@ impl World {
         }
     }
 
-    async fn delete_now(&self) -> OpResult {
+    /// The target's DEL handler, unpaused.
+    pub(super) fn spawn_delete_now(&self) -> JoinHandle<OpResult> {
+        let (owner, target_id, kind) = (self.owner(), self.target_id.clone(), self.kind);
+        tokio::spawn(async move {
+            match kind {
+                Kind::Post => post::del(owner, target_id).await,
+                Kind::User => user::del(owner).await,
+                Kind::Listing => listing::del(owner, target_id).await,
+                Kind::Shop => shop::del(owner).await,
+            }
+        })
+    }
+
+    pub(super) async fn delete_now(&self) -> OpResult {
         let (owner, target_id) = (self.owner(), self.target_id.clone());
         match self.kind {
             Kind::Post => post::del(owner, target_id).await,
@@ -320,11 +333,11 @@ impl World {
         }
     }
 
-    async fn put_now(&self) -> OpResult {
+    pub(super) async fn put_now(&self) -> OpResult {
         tag::sync_put(self.tag.clone(), self.tagger(), self.tag_id()).await
     }
 
-    async fn node_count(&self) -> Result<i64> {
+    pub(super) async fn node_count(&self) -> Result<i64> {
         let query = match self.kind {
             Kind::Post => Query::new(
                 "race_post_nodes",
@@ -349,7 +362,7 @@ impl World {
     }
 
     /// `TAGGED` edges of the tagger on the target that carry the label.
-    async fn edge_count(&self) -> Result<i64> {
+    pub(super) async fn edge_count(&self) -> Result<i64> {
         let query = match self.kind {
             Kind::Post => Query::new(
                 "race_post_edges",
@@ -376,7 +389,7 @@ impl World {
     }
 
     /// Redis keys that name the target's tag indexes.
-    async fn tag_index_keys(&self) -> Result<Vec<String>> {
+    pub(super) async fn tag_index_keys(&self) -> Result<Vec<String>> {
         let (owner, id) = (&self.owner_id, &self.target_id);
         let patterns = match self.kind {
             Kind::Post => vec![format!("*{owner}:{id}*")],
@@ -403,7 +416,7 @@ impl World {
 
     /// Whether the target still sits in a label's global timeline or
     /// engagement set.
-    async fn label_member_left(&self) -> Result<bool> {
+    pub(super) async fn label_member_left(&self) -> Result<bool> {
         let key = format!("{}:{}", self.owner_id, self.target_id);
         Ok(match self.kind {
             Kind::Post => {
@@ -435,7 +448,7 @@ impl World {
     /// Whether the target's write lock can be taken on a connection of its
     /// own, which no pool recycling of the cancelled writer's connection can
     /// release.
-    async fn target_lock_is_free(&self) -> Result<bool> {
+    pub(super) async fn target_lock_is_free(&self) -> Result<bool> {
         let lock = match self.kind {
             Kind::Post => "MATCH (:User {id: $owner})-[:AUTHORED]->(t:Post {id: $id})",
             Kind::User => "MATCH (t:User {id: $owner})",
@@ -456,12 +469,12 @@ impl World {
         )
     }
 
-    async fn tagged(&self) -> u32 {
+    pub(super) async fn tagged(&self) -> u32 {
         find_user_counts(&self.tagger_id).await.tagged
     }
 
     /// The target is gone and nothing indexes it or the tag.
-    async fn assert_deleted_and_clean(&self, context: &str) -> Result<()> {
+    pub(super) async fn assert_deleted_and_clean(&self, context: &str) -> Result<()> {
         assert_eq!(self.node_count().await?, 0, "{context}: node left");
         assert_eq!(self.edge_count().await?, 0, "{context}: edge left");
         // The cleanup's claim set is a ledger, not an index: it outlives the
@@ -510,7 +523,7 @@ impl World {
     }
 
     /// The target is kept with exactly one tag, and its indexes match it.
-    async fn assert_kept_with_tag(&self, context: &str) -> Result<()> {
+    pub(super) async fn assert_kept_with_tag(&self, context: &str) -> Result<()> {
         assert_eq!(self.node_count().await?, 1, "{context}: node lost");
         assert_eq!(self.edge_count().await?, 1, "{context}: edge lost");
         assert!(
@@ -532,7 +545,7 @@ impl World {
         Ok(())
     }
 
-    async fn cleanup(self, test: &mut WatcherTest) -> Result<()> {
+    pub(super) async fn cleanup(self, test: &mut WatcherTest) -> Result<()> {
         if let Some(path) = &self.target_path {
             test.del(&self.owner_kp, path).await.ok();
         }
@@ -542,13 +555,13 @@ impl World {
     }
 }
 
-async fn graph_count(query: Query) -> Result<i64> {
+pub(super) async fn graph_count(query: Query) -> Result<i64> {
     Ok(fetch_key_from_graph::<i64>(query, "n")
         .await?
         .unwrap_or_default())
 }
 
-async fn suggested(label: &str) -> Result<bool> {
+pub(super) async fn suggested(label: &str) -> Result<bool> {
     Ok(TagSearch::get_by_label(label, &Pagination::default())
         .await?
         .is_some_and(|found| {
@@ -560,11 +573,20 @@ async fn suggested(label: &str) -> Result<bool> {
 
 /// Waits until the operation is waiting on a write lock some other
 /// transaction holds, and asserts it has not finished.
-async fn wait_until_blocked<T>(operation: &JoinHandle<T>) -> Result<()> {
+pub(super) async fn wait_until_blocked<T>(operation: &JoinHandle<T>) -> Result<()> {
+    wait_until_blocked_n(&[operation], 1).await
+}
+
+/// Waits until at least `count` statements wait on a write lock, and asserts
+/// none of the operations has finished.
+pub(super) async fn wait_until_blocked_n<T>(
+    operations: &[&JoinHandle<T>],
+    count: i64,
+) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if operation.is_finished() {
-            bail!("the operation finished instead of waiting on the lock");
+        if operations.iter().any(|operation| operation.is_finished()) {
+            bail!("an operation finished instead of waiting on the lock");
         }
         let blocked = graph_count(Query::new(
             "race_blocked_on_lock",
@@ -574,17 +596,17 @@ async fn wait_until_blocked<T>(operation: &JoinHandle<T>) -> Result<()> {
              RETURN count(*) AS n",
         ))
         .await?;
-        if blocked >= 1 {
+        if blocked >= count {
             return Ok(());
         }
         if tokio::time::Instant::now() > deadline {
-            bail!("the operation never blocked on the lock");
+            bail!("the operations never blocked on the lock");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-async fn joined(operation: JoinHandle<OpResult>) -> Result<OpResult> {
+pub(super) async fn joined(operation: JoinHandle<OpResult>) -> Result<OpResult> {
     operation.await.map_err(|e| anyhow!("task failed: {e}"))
 }
 
@@ -645,8 +667,8 @@ async fn a_tag_put_after_a_deletion_writes_nothing() -> Result<()> {
         joined(delete).await??;
         let landed = joined(put).await?;
         assert!(
-            landed.is_err(),
-            "{kind:?}: a PUT after the deletion must not succeed"
+            matches!(landed, Err(EventProcessorError::MissingDependency { .. })),
+            "{kind:?}: a PUT that lost the race to the deletion must report a missing dependency: {landed:?}"
         );
         let again = w.put_now().await;
         assert!(

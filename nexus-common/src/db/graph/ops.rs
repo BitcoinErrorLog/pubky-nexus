@@ -32,11 +32,32 @@ pub trait GraphOps: Send + Sync {
 /// next hands out and resets that connection.
 pub struct GraphTxn {
     inner: Option<neo4rs::Txn>,
+    /// Locks the statements of this transaction hold, registered in the
+    /// enclosing [`super::lock::lock_scope`] so a cache fill of the same
+    /// code does not wait for its own transaction.
+    held: Vec<String>,
 }
 
 impl GraphTxn {
     fn new(inner: neo4rs::Txn) -> Self {
-        Self { inner: Some(inner) }
+        Self {
+            inner: Some(inner),
+            held: Vec::new(),
+        }
+    }
+
+    /// Records that this transaction holds the write lock named by `key`
+    /// (see [`super::lock::LockTarget::key`]) until it ends.
+    pub fn hold(&mut self, key: &str) {
+        if super::lock::register_held(key) {
+            self.held.push(key.to_string());
+        }
+    }
+
+    fn release_held(&mut self) {
+        for key in self.held.drain(..) {
+            super::lock::release_held(&key);
+        }
     }
 
     fn open(&mut self) -> &mut neo4rs::Txn {
@@ -69,17 +90,20 @@ impl GraphTxn {
 
     pub async fn commit(mut self) -> GraphResult<()> {
         let txn = self.inner.take().expect("transaction is open");
+        self.release_held();
         txn.commit().await.map_err(Into::into)
     }
 
     pub async fn rollback(mut self) -> GraphResult<()> {
         let txn = self.inner.take().expect("transaction is open");
+        self.release_held();
         txn.rollback().await.map_err(Into::into)
     }
 }
 
 impl Drop for GraphTxn {
     fn drop(&mut self) {
+        self.release_held();
         let Some(txn) = self.inner.take() else {
             return;
         };

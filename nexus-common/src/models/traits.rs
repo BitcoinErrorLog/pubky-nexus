@@ -1,9 +1,11 @@
+use crate::db::graph::lock::{under_batch_lock, BatchLock};
 use crate::db::graph::Query;
 use crate::db::kv::RedisResult;
 use crate::db::{exec_single_row, fetch_all_rows_from_graph, GraphResult, RedisOps};
-use crate::models::error::ModelResult;
+use crate::models::error::{ModelError, ModelResult};
 use async_trait::async_trait;
 use core::fmt;
+use std::collections::HashSet;
 use std::fmt::Debug;
 
 pub trait CollectionId {
@@ -58,13 +60,12 @@ where
 
         if !missing_ids.is_empty() {
             let flat_missing_ids: Vec<T> = missing_ids.iter().map(|&(_, id)| id).collect();
-            let fetched_details = Self::get_from_graph(&flat_missing_ids).await?;
+            let fetched_details = Self::fetch_and_index_locked(&flat_missing_ids).await?;
 
             if !fetched_details.is_empty() {
                 for (i, (original_index, _)) in missing_ids.iter().enumerate() {
                     collection[*original_index].clone_from(&fetched_details[i]);
                 }
-                Self::put_to_index(&flat_missing_ids, fetched_details).await?;
             }
         }
 
@@ -140,15 +141,52 @@ where
     }
 
     async fn reindex(collection_ids: &[T]) -> ModelResult<()> {
-        match Self::get_from_graph(collection_ids).await {
-            Ok(collection_details_list) => {
-                if !collection_details_list.is_empty() {
-                    Self::put_to_index(collection_ids, collection_details_list).await?;
-                }
+        match Self::fetch_and_index_locked(collection_ids).await {
+            Ok(_) => {}
+            Err(ModelError::GraphOperationFailed(e)) => {
+                tracing::error!("Error: Could not find any element of the collection: {}", e)
             }
-            Err(e) => tracing::error!("Error: Could not find any element of the collection: {}", e),
+            Err(e) => return Err(e),
         }
         Ok(())
+    }
+
+    /// The node locks that serialize this collection's Redis writes against
+    /// the deletion of its records (users, files), naming the records `ids`.
+    /// A deletion holds them until it has cleaned Redis.
+    fn locked_ids(_ids: &[T]) -> Option<BatchLock> {
+        None
+    }
+
+    /// Reads the records from the graph and writes them to Redis. For locked
+    /// records, both happen under their locks and only records that still
+    /// exist are written.
+    async fn fetch_and_index_locked(ids: &[T]) -> ModelResult<Vec<Option<Self>>> {
+        let Some(batch) = Self::locked_ids(ids) else {
+            return Self::fetch_and_index(ids, None).await;
+        };
+        under_batch_lock(batch, |present| async move {
+            Self::fetch_and_index(ids, Some(&present)).await
+        })
+        .await
+    }
+
+    async fn fetch_and_index(
+        ids: &[T],
+        present: Option<&HashSet<String>>,
+    ) -> ModelResult<Vec<Option<Self>>> {
+        let mut records = Self::get_from_graph(ids).await?;
+        if let Some(present) = present {
+            for (record, id) in records.iter_mut().zip(ids) {
+                if !present.contains(&id.to_string_id()) {
+                    *record = None;
+                }
+            }
+        }
+        if !records.is_empty() {
+            Self::put_to_index(ids, records.clone()).await?;
+        }
+        Ok(records)
     }
 
     /// Returns the neo4j query to return a list records by passing a list of ids.

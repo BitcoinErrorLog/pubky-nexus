@@ -1,5 +1,6 @@
 use crate::events::EventProcessorError;
 
+use nexus_common::db::graph::lock::{lock_scope, LockTarget};
 use nexus_common::db::queries::get::user_is_safe_to_delete;
 use nexus_common::db::{execute_graph_operation_in, start_graph_txn, OperationOutcome};
 use nexus_common::models::{
@@ -58,6 +59,13 @@ pub async fn del_with_hook(
     user_id: PubkyId,
     hook: &dyn TargetDeleteHook,
 ) -> Result<(), EventProcessorError> {
+    lock_scope(del_with_hook_scoped(user_id, hook)).await
+}
+
+async fn del_with_hook_scoped(
+    user_id: PubkyId,
+    hook: &dyn TargetDeleteHook,
+) -> Result<(), EventProcessorError> {
     debug!("Deleting user profile:  {}", user_id);
 
     // 1. Graph query to check if there is any edge at all to this user. It takes the user's write lock
@@ -75,6 +83,7 @@ pub async fn del_with_hook(
     // A deleted user is a user whose profile is empty and has username `"[DELETED]"`
     match outcome {
         Ok(OperationOutcome::CreatedOrDeleted) => {
+            txn.hold(&LockTarget::User(&user_id).key());
             let result = async {
                 hook.at(TargetDeleteStep::Checked).await?;
                 // UserSearch::delete reads UserDetails from the index to find the username,

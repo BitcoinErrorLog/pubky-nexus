@@ -1,6 +1,7 @@
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 
+use nexus_common::db::graph::lock::{lock_scope, LockTarget};
 use nexus_common::db::queries::get::post_is_safe_to_delete;
 use nexus_common::db::{exec_single_row, OperationOutcome};
 use nexus_common::db::{execute_graph_operation_in, queries, start_graph_txn, GraphTxn, RedisOps};
@@ -341,6 +342,14 @@ pub async fn del_with_hook(
     post_id: String,
     hook: &dyn TargetDeleteHook,
 ) -> Result<(), EventProcessorError> {
+    lock_scope(del_with_hook_scoped(author_id, post_id, hook)).await
+}
+
+async fn del_with_hook_scoped(
+    author_id: PubkyId,
+    post_id: String,
+    hook: &dyn TargetDeleteHook,
+) -> Result<(), EventProcessorError> {
     debug!("Deleting post: {}/{}", author_id, post_id);
 
     // Graph query to check if there is any edge at all to this post other than AUTHORED, is a reply or is a repost.
@@ -357,6 +366,13 @@ pub async fn del_with_hook(
     // A deleted post is a post whose content is EXACTLY `"[DELETED]"`
     match outcome {
         Ok(OperationOutcome::CreatedOrDeleted) => {
+            txn.hold(
+                &LockTarget::Post {
+                    author_id: &author_id,
+                    post_id: &post_id,
+                }
+                .key(),
+            );
             let result = async {
                 hook.at(TargetDeleteStep::Checked).await?;
                 sync_del_in_txn(&mut txn, &author_id, &post_id).await
@@ -398,10 +414,21 @@ pub async fn del_with_hook(
 /// post's write lock until every index is cleaned. A tag PUT or untag on the
 /// post either finished first or starts after the deletion and finds no post.
 pub async fn sync_del(author_id: PubkyId, post_id: String) -> Result<(), EventProcessorError> {
+    lock_scope(sync_del_scoped(author_id, post_id)).await
+}
+
+async fn sync_del_scoped(author_id: PubkyId, post_id: String) -> Result<(), EventProcessorError> {
     let mut txn = start_graph_txn().await?;
     let result = async {
         txn.fetch_row(queries::del::lock_post(&author_id, &post_id))
             .await?;
+        txn.hold(
+            &LockTarget::Post {
+                author_id: &author_id,
+                post_id: &post_id,
+            }
+            .key(),
+        );
         sync_del_in_txn(&mut txn, &author_id, &post_id).await
     }
     .await;

@@ -1,3 +1,4 @@
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::graph::Query;
 use crate::db::kv::RedisResult;
 use crate::db::{
@@ -25,12 +26,15 @@ pub trait UserFollows: Sized + RedisOps + AsRef<[String]> + Default {
         match Self::get_from_index(user_id, skip, limit).await? {
             Some(connections) => Ok(Some(Self::from_vec(connections))),
             None => {
-                let graph_response = Self::get_from_graph(user_id, skip, limit).await?;
-                if let Some(follows) = graph_response {
-                    follows.put_to_index(user_id).await?;
-                    return Ok(Some(follows));
-                }
-                Ok(None)
+                under_target_lock(LockTarget::User(user_id), async {
+                    let graph_response = Self::get_from_graph(user_id, skip, limit).await?;
+                    if let Some(follows) = graph_response {
+                        follows.put_to_index(user_id).await?;
+                        return Ok(Some(follows));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }
@@ -75,13 +79,17 @@ pub trait UserFollows: Sized + RedisOps + AsRef<[String]> + Default {
     }
 
     async fn reindex(user_id: &str) -> ModelResult<()> {
-        match Self::get_from_graph(user_id, None, None).await? {
-            Some(follow) => follow.put_to_index(user_id).await?,
-            None => tracing::error!(
-                "{}: Could not found user follow relationship in the graph",
-                user_id
-            ),
-        }
+        under_target_lock(LockTarget::User(user_id), async {
+            match Self::get_from_graph(user_id, None, None).await? {
+                Some(follow) => follow.put_to_index(user_id).await?,
+                None => tracing::error!(
+                    "{}: Could not found user follow relationship in the graph",
+                    user_id
+                ),
+            }
+            Ok::<_, crate::models::error::ModelError>(Some(()))
+        })
+        .await?;
         Ok(())
     }
 

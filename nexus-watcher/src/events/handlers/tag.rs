@@ -2,6 +2,7 @@ use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 
 use chrono::Utc;
+use nexus_common::db::graph::lock::{lock_scope, LockTarget};
 use nexus_common::db::graph::Query;
 use nexus_common::db::kv::{ScoreAction, SortOrder};
 use nexus_common::db::{
@@ -53,6 +54,13 @@ struct NoopTagWriteHook;
 #[async_trait::async_trait]
 impl TagWriteHook for NoopTagWriteHook {}
 
+/// The target whose homeserver a PUT ingests when the target is missing.
+enum MissingTarget {
+    Post(Box<ParsedUri>),
+    User(Box<PubkyId>),
+    Other,
+}
+
 /// Indexes a tag PUT.
 ///
 /// The edge and every Redis index of the tag are written inside one graph
@@ -80,6 +88,15 @@ pub async fn sync_put_with_hook(
     tag_id: String,
     hook: &dyn TagWriteHook,
 ) -> Result<(), EventProcessorError> {
+    lock_scope(sync_put_with_hook_scoped(tag, tagger_id, tag_id, hook)).await
+}
+
+async fn sync_put_with_hook_scoped(
+    tag: PubkyAppTag,
+    tagger_id: PubkyId,
+    tag_id: String,
+    hook: &dyn TagWriteHook,
+) -> Result<(), EventProcessorError> {
     debug!("Indexing new tag: {} -> {}", tagger_id, tag_id);
 
     // Parse the embeded URI to extract author_id and post_id using parse_tagged_post_uri
@@ -90,6 +107,13 @@ pub async fn sync_put_with_hook(
     let target_dependency_key = RetryEvent::generate_index_key_from_uri(&parsed_uri);
     let indexed_at = Utc::now().timestamp_millis();
 
+    let ingest = match &parsed_uri.resource {
+        Resource::Post(_) => ParsedUri::try_from(tag.uri.as_str())
+            .map(|uri| MissingTarget::Post(Box::new(uri)))
+            .unwrap_or(MissingTarget::Other),
+        Resource::User => MissingTarget::User(Box::new(user_id.clone())),
+        _ => MissingTarget::Other,
+    };
     let mut txn = start_graph_txn().await?;
     let result = match parsed_uri.resource {
         // If post_id is in the tagged URI, we place tag to a post.
@@ -140,7 +164,26 @@ pub async fn sync_put_with_hook(
             "The tagged resource is not Post, User, Listing or Shop, instead is: {other:?}"
         ))),
     };
-    finish_txn(txn, result).await?;
+    let outcome = finish_txn(txn, result).await;
+    // The homeserver of the missing target is ingested only once the
+    // transaction, and the locks it may still hold, are released: the ingest
+    // reads and writes the same nodes.
+    if matches!(outcome, Err(EventProcessorError::MissingDependency { .. })) {
+        match ingest {
+            MissingTarget::Post(uri) => {
+                if let Err(e) = Homeserver::maybe_ingest_for_post(&uri).await {
+                    tracing::error!("Failed to ingest homeserver: {e}");
+                }
+            }
+            MissingTarget::User(user_id) => {
+                if let Err(e) = Homeserver::maybe_ingest_for_user(user_id.as_ref()).await {
+                    tracing::error!("Failed to ingest homeserver: {e}");
+                }
+            }
+            MissingTarget::Other => {}
+        }
+    }
+    outcome?;
 
     // Add tag to search index
     TagSearch::put_to_index(&[tag.label]).await?;
@@ -184,11 +227,6 @@ async fn put_sync_post(
         OperationOutcome::MissingDependency => {
             // Ensure that dependencies follow the same format as the RetryManager keys
             let dependency = vec![format!("{author_id}:posts:{post_id}")];
-            if let Ok(referenced_post_uri) = ParsedUri::try_from(post_uri) {
-                if let Err(e) = Homeserver::maybe_ingest_for_post(&referenced_post_uri).await {
-                    tracing::error!("Failed to ingest homeserver: {e}");
-                }
-            }
             Err(EventProcessorError::MissingDependency { dependency })
         }
         OperationOutcome::CreatedOrDeleted => {
@@ -294,10 +332,6 @@ async fn put_sync_user(
     {
         OperationOutcome::Updated => Ok(()),
         OperationOutcome::MissingDependency => {
-            if let Err(e) = Homeserver::maybe_ingest_for_user(tagged_user_id.as_ref()).await {
-                tracing::error!("Failed to ingest homeserver: {e}");
-            }
-
             let key = RetryEvent::generate_index_key_from_uri(&tagged_user_id.to_uri());
             let dependency = vec![key];
             Err(EventProcessorError::MissingDependency { dependency })
@@ -501,6 +535,14 @@ pub async fn del_with_hook(
     tag_id: String,
     hook: &dyn TagWriteHook,
 ) -> Result<(), EventProcessorError> {
+    lock_scope(del_with_hook_scoped(user_id, tag_id, hook)).await
+}
+
+async fn del_with_hook_scoped(
+    user_id: PubkyId,
+    tag_id: String,
+    hook: &dyn TagWriteHook,
+) -> Result<(), EventProcessorError> {
     debug!("Deleting tag: {} -> {}", user_id, tag_id);
     let mut txn = start_graph_txn().await?;
     let result = del_in_txn(&mut txn, hook, user_id, tag_id).await;
@@ -611,7 +653,7 @@ const TARGET_TAG_ROUNDS: usize = 5;
 /// a re-created target never collides with an old claim.
 const CLAIM_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 
-impl TagTarget<'_> {
+impl<'a> TagTarget<'a> {
     fn edges_query(self) -> Query {
         match self {
             TagTarget::Listing {
@@ -630,6 +672,19 @@ impl TagTarget<'_> {
                 listing_id,
             } => format!("listing:{owner_id}:{listing_id}"),
             TagTarget::Shop { owner_id } => format!("shop:{owner_id}"),
+        }
+    }
+
+    fn lock_target(self) -> LockTarget<'a> {
+        match self {
+            TagTarget::Listing {
+                owner_id,
+                listing_id,
+            } => LockTarget::Listing {
+                owner_id,
+                listing_id,
+            },
+            TagTarget::Shop { owner_id } => LockTarget::Shop { owner_id },
         }
     }
 
@@ -754,6 +809,7 @@ impl TagTarget<'_> {
         if txn.fetch_row(self.lock_query()).await?.is_none() {
             return Ok(true);
         }
+        txn.hold(&self.lock_target().key());
         let edges = txn.fetch_all(self.edges_query()).await?;
         let markers = txn
             .fetch_all(queries::get::tag_cleanup_markers(&self.marker_target()))
@@ -868,6 +924,13 @@ pub async fn del_tagged_target(target: TagTarget<'_>) -> Result<(), EventProcess
 /// callers use [`del_tagged_target`].
 #[doc(hidden)]
 pub async fn del_tagged_target_with_hook(
+    target: TagTarget<'_>,
+    hook: &dyn TargetTagCleanupHook,
+) -> Result<(), EventProcessorError> {
+    lock_scope(del_tagged_target_with_hook_scoped(target, hook)).await
+}
+
+async fn del_tagged_target_with_hook_scoped(
     target: TagTarget<'_>,
     hook: &dyn TargetTagCleanupHook,
 ) -> Result<(), EventProcessorError> {

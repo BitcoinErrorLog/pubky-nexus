@@ -1,3 +1,4 @@
+use crate::db::graph::lock::{under_target_lock, LockTarget};
 use crate::db::kv::RedisResult;
 use crate::db::{
     execute_graph_operation, fetch_row_from_graph, queries, GraphResult, OperationOutcome, RedisOps,
@@ -56,12 +57,15 @@ impl ShopDetails {
         match Self::get_from_index(owner_id).await? {
             Some(details) => Ok(Some(details)),
             None => {
-                let maybe_details = Self::get_from_graph(owner_id).await?;
-                if let Some(details) = maybe_details {
-                    details.put_to_index().await?;
-                    return Ok(Some(details));
-                }
-                Ok(None)
+                under_target_lock(LockTarget::Shop { owner_id }, async {
+                    let maybe_details = Self::get_from_graph(owner_id).await?;
+                    if let Some(details) = maybe_details {
+                        details.put_to_index().await?;
+                        return Ok(Some(details));
+                    }
+                    Ok(None)
+                })
+                .await
             }
         }
     }

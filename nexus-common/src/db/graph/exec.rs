@@ -43,7 +43,13 @@ pub async fn execute_graph_operation_in(
     txn: &mut GraphTxn,
     query: Query,
 ) -> GraphResult<OperationOutcome> {
-    let maybe_row = txn.fetch_row(query).await?;
+    let maybe_row = match txn.fetch_row(query).await {
+        Ok(row) => row,
+        Err(error) if error.is_entity_not_found() => {
+            return Ok(OperationOutcome::MissingDependency)
+        }
+        Err(error) => return Err(error),
+    };
     let Some(row) = maybe_row else {
         return Ok(OperationOutcome::MissingDependency);
     };

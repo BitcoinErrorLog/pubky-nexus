@@ -1,4 +1,5 @@
 use super::UserSearch;
+use crate::db::graph::lock::BatchLock;
 use crate::db::graph::Query;
 use crate::db::kv::RedisResult;
 use crate::db::{queries, GraphResult, GraphTxn, RedisOps};
@@ -16,6 +17,12 @@ impl RedisOps for UserDetails {}
 
 #[async_trait]
 impl Collection<&str> for UserDetails {
+    fn locked_ids(ids: &[&str]) -> Option<BatchLock> {
+        Some(BatchLock::Users(
+            ids.iter().map(|id| id.to_string()).collect(),
+        ))
+    }
+
     fn collection_details_graph_query(id_list: &[&str]) -> Query {
         queries::get::get_users_details_by_ids(id_list)
     }

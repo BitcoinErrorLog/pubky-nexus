@@ -1,8 +1,9 @@
+use crate::db::graph::lock::{finish_txn, BatchLock, LockTarget};
 use crate::db::graph::{GraphResult, Query};
 use crate::db::kv::RedisResult;
-use crate::db::{exec_single_row, queries, RedisOps};
+use crate::db::{queries, start_graph_txn, RedisOps};
 use crate::media::FileVariant;
-use crate::models::error::ModelResult;
+use crate::models::error::{ModelError, ModelResult};
 use crate::models::traits::Collection;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -100,6 +101,12 @@ impl Collection<&[&str]> for FileDetails {
         queries::put::create_file(self)
     }
 
+    fn locked_ids(ids: &[&[&str]]) -> Option<BatchLock> {
+        Some(BatchLock::Files(
+            ids.iter().map(|id| id.join(":")).collect(),
+        ))
+    }
+
     async fn extend_on_index_miss(_: &[std::option::Option<Self>]) -> RedisResult<()> {
         Ok(())
     }
@@ -128,14 +135,28 @@ impl FileDetails {
         }
     }
 
+    /// Deletes the file from the graph and Redis in one transaction holding
+    /// the file's write lock, so a cache fill of the file waits for the
+    /// deletion and then finds no file.
     pub async fn delete(&self) -> ModelResult<()> {
-        exec_single_row(queries::del::delete_file(&self.owner_id, &self.id))
-            .await
-            .inspect_err(|e| tracing::error!("Graph file deletion, {}: {:?}", self.id, e))?;
-        Self::remove_from_index_multiple_json(&[&[&self.owner_id, &self.id]])
-            .await
-            .inspect_err(|e| tracing::error!("Index file deletion, {}: {:?}", self.id, e))?;
-        Ok(())
+        let target = LockTarget::File {
+            owner_id: &self.owner_id,
+            file_id: &self.id,
+        };
+        let mut txn = start_graph_txn().await?;
+        let result = async {
+            txn.fetch_row(target.lock_query()).await?;
+            txn.hold(&target.key());
+            txn.run(queries::del::delete_file(&self.owner_id, &self.id))
+                .await
+                .inspect_err(|e| tracing::error!("Graph file deletion, {}: {:?}", self.id, e))?;
+            Self::remove_from_index_multiple_json(&[&[&self.owner_id, &self.id]])
+                .await
+                .inspect_err(|e| tracing::error!("Index file deletion, {}: {:?}", self.id, e))?;
+            Ok::<(), ModelError>(())
+        }
+        .await;
+        finish_txn(txn, result).await
     }
 
     pub fn file_key_from_uri(uri: &str) -> Option<(String, String)> {

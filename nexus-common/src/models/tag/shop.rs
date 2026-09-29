@@ -1,3 +1,4 @@
+use crate::db::graph::lock::LockTarget;
 use crate::db::graph::Query;
 use crate::db::kv::{RedisResult, ScoreAction};
 use crate::db::{
@@ -36,6 +37,10 @@ impl TagCollection for TagShop {
         SHOP_TAGS_KEY_PARTS
     }
 
+    fn lock_target<'a>(user_id: &'a str, _extra_param: Option<&'a str>) -> LockTarget<'a> {
+        LockTarget::Shop { owner_id: user_id }
+    }
+
     /// The trait default resolves the sorted-set key to the post/user
     /// prefixes; shops have their own.
     async fn update_index_score(
@@ -66,7 +71,12 @@ impl TagCollection for TagShop {
             label,
             indexed_at,
         );
-        execute_graph_operation_in(txn, query).await
+        let outcome = execute_graph_operation_in(txn, query).await?;
+        if !matches!(outcome, OperationOutcome::MissingDependency) {
+            txn.hold(&Self::lock_target(tagged_user_id, None).key());
+            txn.hold(&LockTarget::User(tagger_user_id).key());
+        }
+        Ok(outcome)
     }
 
     fn read_graph_query(user_id: &str, _extra_param: Option<&str>) -> Query {

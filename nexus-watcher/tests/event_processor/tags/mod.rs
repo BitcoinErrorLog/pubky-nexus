@@ -1,5 +1,6 @@
 mod delete_race;
 mod fail_index;
+mod fill_race;
 mod multi_user;
 mod post_del;
 mod post_del_notification;
