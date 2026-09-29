@@ -184,6 +184,10 @@ impl WriteLog {
         hook.at(TagWriteStep::IndexStep(self.steps)).await
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.undo.is_empty()
+    }
+
     /// Undoes every recorded write, newest first. A failing undo is logged
     /// and does not stop the rest.
     pub async fn rollback(&mut self) {

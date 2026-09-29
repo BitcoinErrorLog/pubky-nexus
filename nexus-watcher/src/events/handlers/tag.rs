@@ -41,6 +41,9 @@ pub enum TagWriteStep {
     IndexStep(u32),
     /// Every Redis write is done and the transaction is about to commit.
     BeforeCommit,
+    /// A failed write is about to undo its Redis writes; its transaction is
+    /// still open and holds the target's lock.
+    Undoing,
     /// The transaction has ended and the PUT is about to ingest the homeserver
     /// of the target it did not find.
     IngestingMissingTarget,
@@ -154,6 +157,9 @@ async fn end_tag_write(
         Err(error) => Err(error),
     };
     if result.is_err() {
+        if !log.is_empty() {
+            let _ = hook.at(TagWriteStep::Undoing).await;
+        }
         log.rollback().await;
     }
     let outcome = finish_txn(txn, result).await;

@@ -1244,3 +1244,49 @@ async fn concurrent_tag_puts_finish_and_count_exactly() -> Result<()> {
     w.cleanup(&mut test).await?;
     Ok(())
 }
+
+/// Fails after the second Redis step and records how many transactions are
+/// open when the write starts undoing.
+struct FailAndObserveUndo {
+    open: AtomicUsize,
+}
+
+#[async_trait]
+impl TagWriteHook for FailAndObserveUndo {
+    async fn at(&self, step: TagWriteStep) -> OpResult {
+        match step {
+            TagWriteStep::IndexStep(2) => Err(EventProcessorError::IndexOperationFailed(
+                "injected failure".to_string(),
+            )),
+            TagWriteStep::Undoing => {
+                self.open
+                    .store(nexus_common::db::open_txn_count(), Ordering::SeqCst);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A failed write undoes its Redis writes while its transaction still holds
+/// the target's lock, so nothing else can write the same indexes between the
+/// failure and the undo.
+#[tokio_shared_rt::test(shared)]
+async fn a_failed_tag_write_undoes_its_redis_writes_under_its_lock() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    for kind in Kind::ALL {
+        let w = world(&mut test, kind).await?;
+        let hook = FailAndObserveUndo {
+            open: AtomicUsize::new(usize::MAX),
+        };
+        let failed = tag::sync_put_with_hook(w.tag.clone(), w.tagger(), w.tag_id(), &hook).await;
+        assert!(failed.is_err(), "{kind:?}");
+        assert_eq!(
+            hook.open.load(Ordering::SeqCst),
+            1,
+            "{kind:?}: the undo did not run inside the transaction"
+        );
+        w.cleanup(&mut test).await?;
+    }
+    Ok(())
+}
