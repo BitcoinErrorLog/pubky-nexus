@@ -227,6 +227,46 @@ and Redis write or delete failures still abort the migration. It is safe to
 rerun, and an aborted run remains in the pending backfill phase for the next
 run.
 
+### Runbook: pruning listings whose record is gone from the homeserver (`db prune-stale-listings`)
+
+A listing whose DEL event the watcher never processed stays in Neo4j and Redis
+and keeps showing in the listing stream even though the seller's record is gone.
+`nexusd db prune-stale-listings` finds those rows and removes them through the
+watcher's own listing DEL path: the listing's tags (with each tagger's `tagged`
+count, the label scores, the taggers sets, the by-tag timeline and autocomplete),
+the graph node, the Redis details, and the timeline, per-seller and auction
+sorted sets.
+
+It reads connection settings from `~/.pubky-nexus/migrations/config.toml`, like
+`db migration run`, and needs outbound access to the sellers' homeservers.
+
+```bash
+# 1. Dry run (default): reports the stale listings, changes nothing
+cargo run -p nexusd -- db prune-stale-listings
+
+# 2. Delete them, after checking the list from step 1
+cargo run -p nexusd -- db prune-stale-listings --apply
+
+# 3. Run the dry run again: it should report 0 gone
+cargo run -p nexusd -- db prune-stale-listings
+```
+
+Safety rules:
+
+- Only a **404 from the seller's homeserver** marks a row stale. An unresolvable
+  homeserver, a rate limit, a 5xx or a timeout is counted as "could not be
+  checked", the row is left alone and the command exits non-zero.
+- Before each delete the record is fetched again. A listing whose file exists
+  again is never deleted.
+- More stale rows than `--max-prune` (default 50) aborts before anything is
+  deleted, so a misbehaving homeserver cannot empty the index. Raise the limit
+  only after reading the dry-run list.
+- The run is idempotent and the watcher can keep running. If a seller
+  re-publishes a listing after it was pruned, the normal PUT event indexes it
+  again.
+- Exit code is non-zero when any listing could not be checked or deleted; the
+  summary line says how many. A re-run retries only what is still stale.
+
 ## 🧪 Running Tests
 
 Running tests requires setting up mock data (`docker/test-graph/mocks`) into Neo4j and Redis.
