@@ -18,7 +18,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use nexus_common::db::graph::Query;
-use nexus_common::db::{fetch_key_from_graph, get_redis_conn, Neo4JConfig};
+use nexus_common::db::{fetch_key_from_graph, get_redis_conn, Neo4JConfig, RedisOps};
 use nexus_common::models::event::EventProcessorError;
 use nexus_common::models::marketplace::ListingsByTagSearch;
 use nexus_common::models::post::search::PostsByTagSearch;
@@ -35,7 +35,7 @@ use pubky_app_specs::{
     listing_uri_builder, post_uri_builder, shop_uri_builder, user_uri_builder, PubkyAppListing,
     PubkyAppListingCondition, PubkyAppPost, PubkyAppShop, PubkyAppTag, PubkyAppUser, PubkyId,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -814,5 +814,433 @@ async fn a_cancelled_tag_put_releases_its_locks_and_leaves_no_edge() -> Result<(
         w.assert_deleted_and_clean(&format!("{kind:?}")).await?;
         w.cleanup(&mut test).await?;
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Redis writes against a rolled-back or failed graph transaction, and the
+// connections a lock-holding transaction uses.
+// ---------------------------------------------------------------------------
+
+/// Fails the write after its n-th Redis step.
+struct FailAtIndexStep {
+    step: u32,
+}
+
+#[async_trait]
+impl TagWriteHook for FailAtIndexStep {
+    async fn at(&self, step: TagWriteStep) -> OpResult {
+        if step == TagWriteStep::IndexStep(self.step) {
+            return Err(EventProcessorError::IndexOperationFailed(format!(
+                "injected failure after Redis step {}",
+                self.step
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Counts the Redis steps of a write, then fails it before its commit.
+struct CountThenFail {
+    steps: AtomicU32,
+}
+
+#[async_trait]
+impl TagWriteHook for CountThenFail {
+    async fn at(&self, step: TagWriteStep) -> OpResult {
+        match step {
+            TagWriteStep::IndexStep(n) => {
+                self.steps.fetch_max(n, Ordering::SeqCst);
+                Ok(())
+            }
+            TagWriteStep::BeforeCommit => Err(EventProcessorError::IndexOperationFailed(
+                "injected failure before the commit".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Lets every Redis step finish and makes the commit fail.
+struct FailTheCommit;
+
+#[async_trait]
+impl TagWriteHook for FailTheCommit {
+    async fn at(&self, step: TagWriteStep) -> OpResult {
+        if step == TagWriteStep::BeforeCommit {
+            nexus_common::db::fail_next_commit();
+        }
+        Ok(())
+    }
+}
+
+/// Records how many graph transactions are open when the PUT ingests the
+/// homeserver of the target it did not find.
+struct OpenTxnsAtIngest {
+    open: AtomicUsize,
+    fired: AtomicBool,
+}
+
+#[async_trait]
+impl TagWriteHook for OpenTxnsAtIngest {
+    async fn at(&self, step: TagWriteStep) -> OpResult {
+        if step == TagWriteStep::IngestingMissingTarget {
+            self.open
+                .store(nexus_common::db::open_txn_count(), Ordering::SeqCst);
+            self.fired.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+async fn dump_key(conn: &mut deadpool_redis::Connection, key: &str) -> Result<String> {
+    use deadpool_redis::redis::cmd;
+    let kind: String = cmd("TYPE").arg(key).query_async(conn).await?;
+    let value = match kind.as_str() {
+        "zset" => {
+            let members: Vec<(String, f64)> = cmd("ZRANGE")
+                .arg(key)
+                .arg(0)
+                .arg(-1)
+                .arg("WITHSCORES")
+                .query_async(conn)
+                .await?;
+            format!("{members:?}")
+        }
+        "set" => {
+            let mut members: Vec<String> = cmd("SMEMBERS").arg(key).query_async(conn).await?;
+            members.sort();
+            format!("{members:?}")
+        }
+        "list" => {
+            let items: Vec<String> = cmd("LRANGE")
+                .arg(key)
+                .arg(0)
+                .arg(-1)
+                .query_async(conn)
+                .await?;
+            format!("{items:?}")
+        }
+        "ReJSON-RL" => {
+            let json: Option<String> = cmd("JSON.GET").arg(key).query_async(conn).await?;
+            format!("{json:?}")
+        }
+        "string" => {
+            let value: Option<String> = cmd("GET").arg(key).query_async(conn).await?;
+            format!("{value:?}")
+        }
+        other => other.to_string(),
+    };
+    Ok(format!("{key} = {value}"))
+}
+
+/// Every Redis value a tag write on the world's target can change: the keys
+/// that name the target, the label or the users involved, and the members of
+/// the global sets that hold them.
+async fn redis_state(w: &World) -> Result<Vec<String>> {
+    use deadpool_redis::redis::cmd;
+    let mut conn = get_redis_conn().await?;
+    let (owner, id) = (&w.owner_id, &w.target_id);
+    let mut patterns = vec![
+        format!("*{}*", w.label),
+        format!("*{}*", w.tagger_id),
+        format!("*{owner}:{id}*"),
+    ];
+    match w.kind {
+        Kind::User => patterns.push(format!("*{owner}*")),
+        Kind::Shop => patterns.push(format!("*Shop*{owner}*")),
+        _ => {}
+    }
+    let mut keys: Vec<String> = Vec::new();
+    for pattern in patterns {
+        let mut found: Vec<String> = cmd("KEYS").arg(&pattern).query_async(&mut conn).await?;
+        keys.append(&mut found);
+    }
+    keys.sort();
+    keys.dedup();
+    let mut state = Vec::new();
+    for key in &keys {
+        state.push(dump_key(&mut conn, key).await?);
+    }
+    for (key, member) in [
+        (
+            "Sorted:Posts:Global:TotalEngagement",
+            format!("{owner}:{id}"),
+        ),
+        ("Sorted:Users:Influencers", owner.clone()),
+        ("Sorted:Users:Influencers", w.tagger_id.clone()),
+        ("Sorted:Users:MostFollowed", owner.clone()),
+        ("Sorted:Tags:Label", w.label.clone()),
+    ] {
+        let score: Option<f64> = cmd("ZSCORE")
+            .arg(key)
+            .arg(&member)
+            .query_async(&mut conn)
+            .await?;
+        state.push(format!("{key}[{member}] = {score:?}"));
+    }
+    Ok(state)
+}
+
+/// A tag PUT or untag whose Redis phase, or commit, fails at any point leaves
+/// Redis exactly as it was before the attempt, so the retried event counts
+/// and indexes the tag once.
+#[tokio_shared_rt::test(shared)]
+async fn a_failed_tag_write_leaves_no_redis_write_behind() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    for kind in Kind::ALL {
+        let w = world(&mut test, kind).await?;
+        let context = format!("{kind:?}");
+
+        // PUT: fail after each Redis step, then at the commit.
+        let before = redis_state(&w).await?;
+        let counter = CountThenFail {
+            steps: AtomicU32::new(0),
+        };
+        let failed = tag::sync_put_with_hook(w.tag.clone(), w.tagger(), w.tag_id(), &counter).await;
+        assert!(failed.is_err(), "{context}");
+        let steps = counter.steps.load(Ordering::SeqCst);
+        assert!(steps >= 3, "{context}: only {steps} Redis steps ran");
+        assert_eq!(
+            redis_state(&w).await?,
+            before,
+            "{context}: failure before the commit"
+        );
+        for step in 1..=steps {
+            let failed = tag::sync_put_with_hook(
+                w.tag.clone(),
+                w.tagger(),
+                w.tag_id(),
+                &FailAtIndexStep { step },
+            )
+            .await;
+            assert!(failed.is_err(), "{context}: step {step}");
+            assert_eq!(
+                w.edge_count().await?,
+                0,
+                "{context}: step {step}: edge left"
+            );
+            assert_eq!(
+                redis_state(&w).await?,
+                before,
+                "{context}: a PUT that failed after Redis step {step} left a write behind"
+            );
+        }
+        let failed =
+            tag::sync_put_with_hook(w.tag.clone(), w.tagger(), w.tag_id(), &FailTheCommit).await;
+        assert!(failed.is_err(), "{context}: the commit must fail");
+        assert_eq!(
+            w.edge_count().await?,
+            0,
+            "{context}: commit failure: edge left"
+        );
+        assert_eq!(
+            redis_state(&w).await?,
+            before,
+            "{context}: a PUT whose commit failed left a write behind"
+        );
+        assert_eq!(nexus_common::db::open_txn_count(), 0, "{context}");
+
+        // The retried PUT indexes the tag once.
+        w.put_now().await?;
+        w.assert_kept_with_tag(&context).await?;
+
+        // Untag: the same, from the tagged state.
+        let tagged = redis_state(&w).await?;
+        let counter = CountThenFail {
+            steps: AtomicU32::new(0),
+        };
+        let failed = tag::del_with_hook(w.tagger(), w.tag_id(), &counter).await;
+        assert!(failed.is_err(), "{context}");
+        let steps = counter.steps.load(Ordering::SeqCst);
+        assert!(steps >= 3, "{context}: only {steps} Redis steps ran");
+        assert_eq!(
+            redis_state(&w).await?,
+            tagged,
+            "{context}: untag failure before the commit"
+        );
+        for step in 1..=steps {
+            let failed =
+                tag::del_with_hook(w.tagger(), w.tag_id(), &FailAtIndexStep { step }).await;
+            assert!(failed.is_err(), "{context}: untag step {step}");
+            assert_eq!(
+                w.edge_count().await?,
+                1,
+                "{context}: untag step {step}: edge lost"
+            );
+            assert_eq!(
+                redis_state(&w).await?,
+                tagged,
+                "{context}: an untag that failed after Redis step {step} left a write behind"
+            );
+        }
+        let failed = tag::del_with_hook(w.tagger(), w.tag_id(), &FailTheCommit).await;
+        assert!(failed.is_err(), "{context}: the commit must fail");
+        assert_eq!(
+            w.edge_count().await?,
+            1,
+            "{context}: untag commit failure: edge lost"
+        );
+        assert_eq!(
+            redis_state(&w).await?,
+            tagged,
+            "{context}: an untag whose commit failed left a write behind"
+        );
+
+        // The retried untag applies once.
+        tag::del(w.tagger(), w.tag_id()).await?;
+        assert_eq!(w.edge_count().await?, 0, "{context}");
+        assert_eq!(w.tagged().await, 1, "{context}: the tagger is counted once");
+        w.cleanup(&mut test).await?;
+    }
+    Ok(())
+}
+
+/// The homeserver of a target a PUT did not find is ingested after the
+/// PUT's transaction has ended, not while it still holds a pool connection.
+#[tokio_shared_rt::test(shared)]
+async fn a_missing_target_is_ingested_after_the_transaction_ends() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    for kind in Kind::ALL {
+        let w = world(&mut test, kind).await?;
+        w.delete_now().await?;
+        let hook = OpenTxnsAtIngest {
+            open: AtomicUsize::new(usize::MAX),
+            fired: AtomicBool::new(false),
+        };
+        let landed = tag::sync_put_with_hook(w.tag.clone(), w.tagger(), w.tag_id(), &hook).await;
+        assert!(
+            matches!(landed, Err(EventProcessorError::MissingDependency { .. })),
+            "{kind:?}: {landed:?}"
+        );
+        assert!(
+            hook.fired.load(Ordering::SeqCst),
+            "{kind:?}: no ingest step"
+        );
+        assert_eq!(
+            hook.open.load(Ordering::SeqCst),
+            0,
+            "{kind:?}: the PUT ingested with its transaction open"
+        );
+        w.cleanup(&mut test).await?;
+    }
+    Ok(())
+}
+
+/// A tag write, and a target's hard deletion, use no graph connection but
+/// their transaction's own while they hold the target's lock, even when the
+/// post's relationships are not cached.
+#[tokio_shared_rt::test(shared)]
+async fn a_lock_holding_write_takes_no_second_graph_connection() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    for kind in Kind::ALL {
+        let w = world(&mut test, kind).await?;
+        let context = format!("{kind:?}");
+        if kind == Kind::Post {
+            nexus_common::models::post::PostRelationships::remove_from_index_multiple_json(&[&[
+                &w.owner_id,
+                &w.target_id,
+            ]])
+            .await?;
+        }
+        let statements = nexus_common::db::autocommit_statement_count();
+        w.put_now().await?;
+        assert_eq!(
+            nexus_common::db::autocommit_statement_count(),
+            statements,
+            "{context}: the PUT ran a statement outside its transaction"
+        );
+
+        if kind == Kind::Post {
+            nexus_common::models::post::PostRelationships::remove_from_index_multiple_json(&[&[
+                &w.owner_id,
+                &w.target_id,
+            ]])
+            .await?;
+        }
+        let statements = nexus_common::db::autocommit_statement_count();
+        tag::del(w.tagger(), w.tag_id()).await?;
+        assert_eq!(
+            nexus_common::db::autocommit_statement_count(),
+            statements,
+            "{context}: the untag ran a statement outside its transaction"
+        );
+
+        if matches!(kind, Kind::Post | Kind::User) {
+            if kind == Kind::Post {
+                nexus_common::models::post::PostRelationships::remove_from_index_multiple_json(&[
+                    &[&w.owner_id, &w.target_id],
+                ])
+                .await?;
+            }
+            let statements = nexus_common::db::autocommit_statement_count();
+            w.delete_now().await?;
+            assert_eq!(
+                nexus_common::db::autocommit_statement_count(),
+                statements,
+                "{context}: the deletion ran a statement outside its transaction"
+            );
+        }
+        w.cleanup(&mut test).await?;
+    }
+    Ok(())
+}
+
+/// At most `MAX_OPEN_TXNS` graph transactions are open at once, so blocked
+/// writers cannot take every connection of the pool: the next one waits for a
+/// transaction to end.
+#[tokio_shared_rt::test(shared)]
+async fn open_transactions_are_capped_below_the_pool_size() -> Result<()> {
+    let _test = WatcherTest::setup().await?;
+    let mut held = Vec::new();
+    for _ in 0..nexus_common::db::MAX_OPEN_TXNS {
+        held.push(nexus_common::db::start_graph_txn().await?);
+    }
+    let waiting = tokio::spawn(async { nexus_common::db::start_graph_txn().await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a transaction beyond the cap opened while {} were open",
+        nexus_common::db::MAX_OPEN_TXNS
+    );
+    held.pop().expect("held").rollback().await?;
+    let opened = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .map_err(|_| anyhow!("the waiting transaction never opened"))??;
+    opened?.rollback().await?;
+    for txn in held {
+        txn.rollback().await?;
+    }
+    Ok(())
+}
+
+/// Concurrent tag PUTs on one post, more than the pool has connections, all
+/// finish, and the post and the tagger are counted exactly.
+#[tokio_shared_rt::test(shared)]
+async fn concurrent_tag_puts_finish_and_count_exactly() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let w = world(&mut test, Kind::Post).await?;
+    let puts = 40u32;
+    let mut running = Vec::new();
+    for n in 0..puts {
+        let tag = PubkyAppTag {
+            uri: w.tag.uri.clone(),
+            label: format!("{}c{n}", w.label),
+            created_at: Utc::now().timestamp_millis(),
+        };
+        let (tagger, id) = (w.tagger(), tag.create_id());
+        running.push(tokio::spawn(
+            async move { tag::sync_put(tag, tagger, id).await },
+        ));
+    }
+    for put in running {
+        tokio::time::timeout(Duration::from_secs(120), put)
+            .await
+            .map_err(|_| anyhow!("a concurrent tag PUT never finished"))??
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    assert_eq!(w.tagged().await, 1 + puts);
+    assert_eq!(find_post_counts(&w.owner_id, &w.target_id).await.tags, puts);
+    w.cleanup(&mut test).await?;
     Ok(())
 }
