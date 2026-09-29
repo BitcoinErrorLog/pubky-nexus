@@ -1,3 +1,4 @@
+use crate::events::handlers::listing::is_homeserver_not_found;
 use crate::events::EventProcessorError;
 
 use nexus_common::db::PubkyConnector;
@@ -22,7 +23,13 @@ pub async fn sync_put(
 ) -> Result<(), EventProcessorError> {
     debug!("Indexing new file resource at {}/{}", user_id, file_id);
 
-    let file_meta = ingest(&user_id, file_id.as_str(), &file, files_path).await?;
+    let Some(file_meta) = ingest(&user_id, file_id.as_str(), &file, files_path).await? else {
+        debug!(
+            "File blob {} is already gone from its homeserver; skipping",
+            file.src
+        );
+        return Ok(());
+    };
 
     // Create FileDetails object
     let file_details =
@@ -49,9 +56,13 @@ async fn ingest(
     file_id: &str,
     pubkyapp_file: &PubkyAppFile,
     files_path: PathBuf,
-) -> Result<FileMeta, EventProcessorError> {
+) -> Result<Option<FileMeta>, EventProcessorError> {
     let pubky = PubkyConnector::get()?;
-    let response = pubky.public_storage().get(&pubkyapp_file.src).await?;
+    let response = match pubky.public_storage().get(&pubkyapp_file.src).await {
+        Ok(response) => response,
+        Err(e) if is_homeserver_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
 
     let path = Path::new(&user_id.to_string()).join(file_id);
     let full_path = files_path.join(path.clone());
@@ -73,7 +84,7 @@ async fn ingest(
                 pubkyapp_file.content_type.as_str(),
                 &path,
             );
-            Ok(FileMeta { urls })
+            Ok(Some(FileMeta { urls }))
         }
         _ => Err(EventProcessorError::InvalidEventLine(format!(
             "The file has a source uri that is not a blob path: {}",

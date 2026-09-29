@@ -789,12 +789,19 @@ mod tests {
     }
 
     #[test]
-    fn homeserver_404_is_not_found_but_5xx_is_not() {
+    fn homeserver_404_is_not_found_but_other_http_and_transport_classes_are_not() {
         assert!(is_homeserver_not_found(&server_error(
             pubky::StatusCode::NOT_FOUND
         )));
-        assert!(!is_homeserver_not_found(&server_error(
-            pubky::StatusCode::INTERNAL_SERVER_ERROR
-        )));
+        for status in [
+            pubky::StatusCode::INTERNAL_SERVER_ERROR,
+            pubky::StatusCode::TOO_MANY_REQUESTS,
+            pubky::StatusCode::FORBIDDEN,
+        ] {
+            assert!(!is_homeserver_not_found(&server_error(status)));
+        }
+        let non_http =
+            pubky::Error::Pkarr(pubky::errors::PkarrError::InvalidRecord("test".to_string()));
+        assert!(!is_homeserver_not_found(&non_http));
     }
 }

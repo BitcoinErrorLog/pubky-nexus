@@ -131,6 +131,10 @@ EOF
 nexusd db migration run
 ```
 
-Both migrations are idempotent; re-run on partial failure (e.g. a homeserver
-was briefly unreachable) — already-processed rows are skipped, so a re-run
-only retries the failures. The watcher does not need to be stopped.
+Both migrations are idempotent. The review backfill treats a missing review
+directory or record (homeserver 404) as gone. If a user's homeserver cannot be
+reached while its review directory is listed, that user is logged and counted
+as `unreachable` but skipped so one offline homeserver cannot permanently block
+this migration or the migrations after it. Record-level fetch, parse, and
+ingest failures still fail the migration and are retried on the next run;
+already-indexed reviews are skipped. The watcher does not need to be stopped.

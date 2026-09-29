@@ -122,8 +122,12 @@ pub struct ReviewBackfill {
     /// Reviews already present in the index (skipped without a fetch).
     pub already_indexed: usize,
     /// Reviews listed on the homeserver that were gone by the time they were
-    /// fetched; nothing to index and not a failure.
+    /// fetched, plus missing review directories; nothing to index and not a
+    /// failure.
     pub gone: usize,
+    /// Users whose reviews directory could not be reached. They are logged
+    /// and skipped without blocking this one-shot migration.
+    pub unreachable: usize,
     /// Reviews that could not be fetched, parsed, or ingested this pass.
     pub failed: usize,
 }
@@ -181,6 +185,7 @@ pub async fn backfill_unindexed_reviews() -> Result<ReviewBackfill, DynError> {
                 summary.indexed += user_summary.indexed;
                 summary.already_indexed += user_summary.already_indexed;
                 summary.gone += user_summary.gone;
+                summary.unreachable += user_summary.unreachable;
                 summary.failed += user_summary.failed;
             }
             Ok((user_id, Err(e))) => {
@@ -223,11 +228,22 @@ async fn backfill_user_reviews(
         }
         let entries = match request.send().await {
             Ok(entries) => entries,
-            // A user with no reviews directory answers 404: nothing to do.
-            // Any other failure is reported so the pass counts it and a
-            // re-run retries it.
-            Err(e) if is_homeserver_not_found(&e) => return Ok(()),
-            Err(e) => return Err(e.into()),
+            // A user with no reviews directory answers 404. Other LIST
+            // failures mean this user's homeserver is unreachable. Neither
+            // case may permanently block the one-shot migration.
+            Err(e) if is_homeserver_not_found(&e) => {
+                debug!("Review directory for user {} is gone", user_id);
+                summary.gone += 1;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    "Review directory for user {} is unreachable; skipping: {:?}",
+                    user_id, e
+                );
+                summary.unreachable += 1;
+                return Ok(());
+            }
         };
         if entries.is_empty() {
             return Ok(());
@@ -271,7 +287,7 @@ async fn backfill_user_reviews(
 /// Fetches one review record from the reviewer's homeserver (the canonical
 /// source) and runs the normal ingest. Returns `false` without indexing when
 /// the record no longer exists on the homeserver.
-async fn ingest_review_from_homeserver(
+pub async fn ingest_review_from_homeserver(
     user_id: &str,
     review_id: &str,
 ) -> Result<bool, EventProcessorError> {

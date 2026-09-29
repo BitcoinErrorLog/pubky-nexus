@@ -11,6 +11,9 @@ use nexus_common::models::marketplace::{
     ReviewResponseDetails, ReviewStream, ShopView,
 };
 use nexus_common::types::Pagination;
+use nexus_watcher::events::handlers::review::{
+    backfill_reviews_for_user, ingest_review_from_homeserver,
+};
 use pubky::Keypair;
 use pubky_app_specs::{
     traits::HasPath, PubkyAppListingCondition, PubkyAppReviewRole, PubkyAppShop, PubkyAppUser,
@@ -524,5 +527,61 @@ async fn test_review_backfill_indexes_pre_cursor_reviews() -> Result<()> {
         "The review must survive the idempotent re-run"
     );
 
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn review_backfill_counts_a_missing_directory_as_gone() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let reviewer_kp = Keypair::random();
+    let reviewer_id = test
+        .create_user(
+            &reviewer_kp,
+            &test_user("Watcher:ReviewBackfill:NoDirectory"),
+        )
+        .await?;
+
+    let summary = backfill_reviews_for_user(&reviewer_id).await.unwrap();
+    assert_eq!(summary.gone, 1, "a missing review directory is gone");
+    assert_eq!(summary.unreachable, 0);
+    assert_eq!(summary.failed, 0);
+
+    test.cleanup_user(&reviewer_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn review_backfill_skips_an_unreachable_homeserver_without_failing() -> Result<()> {
+    let _test = WatcherTest::setup().await?;
+    let unreachable_id = Keypair::random().public_key().to_z32();
+
+    let summary = backfill_reviews_for_user(&unreachable_id).await.unwrap();
+    assert_eq!(summary.gone, 0);
+    assert_eq!(
+        summary.unreachable, 1,
+        "an unreachable homeserver must be counted and skipped"
+    );
+    assert_eq!(
+        summary.failed, 0,
+        "an unreachable user must not block the migration"
+    );
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn review_record_404_is_reported_as_gone() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let reviewer_kp = Keypair::random();
+    let reviewer_id = test
+        .create_user(
+            &reviewer_kp,
+            &test_user("Watcher:ReviewBackfill:GoneRecord"),
+        )
+        .await?;
+
+    let present = ingest_review_from_homeserver(&reviewer_id, "0000000000000").await?;
+    assert!(!present, "a missing review record must be reported gone");
+
+    test.cleanup_user(&reviewer_kp).await?;
     Ok(())
 }

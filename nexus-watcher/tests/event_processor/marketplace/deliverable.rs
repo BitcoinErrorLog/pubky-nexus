@@ -35,16 +35,12 @@ async fn deliverable_put_skipped_without_body_read() -> Result<()> {
         .await?;
     let moderation = test.event_processor_runner.moderation.clone();
 
-    // A path with nothing behind it: any GET would come back 404 and fail the
-    // event. Calibrate that on a listing path first.
+    // A PUT whose record disappeared before the fetch is gone, not a retry.
     let absent_listing =
         format!("PUT pubky://{seller_id}/pub/pubky.app/marketplace/v1/listings/0000000000001");
-    assert!(
-        retrieve_and_handle_event_line(&absent_listing, moderation.clone())
-            .await
-            .is_err(),
-        "calibration: a fetched path with no body fails"
-    );
+    retrieve_and_handle_event_line(&absent_listing, moderation.clone())
+        .await
+        .expect("a missing PUT record is skipped");
     let absent_deliverable =
         format!("PUT pubky://{seller_id}{MARKETPLACE_DELIVERABLES_PATH}absent0000000000/1");
     retrieve_and_handle_event_line(&absent_deliverable, moderation.clone())
