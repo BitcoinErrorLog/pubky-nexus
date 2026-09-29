@@ -2,7 +2,7 @@ use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use async_trait::async_trait;
 use nexus_common::db::graph::Query;
-use nexus_common::db::reindex::get_auction_listings_missing_terms;
+use nexus_common::db::reindex::{get_all_listing_ids, get_auction_listings_missing_terms};
 use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome, PubkyConnector, RedisOps};
 use nexus_common::models::marketplace::ListingDetails;
 use nexus_common::types::DynError;
@@ -88,6 +88,198 @@ pub async fn del(user_id: PubkyId, listing_id: String) -> Result<(), EventProces
     ListingDetails::delete_indexes(&user_id, &listing_id).await?;
 
     Ok(())
+}
+
+/// Whether a listing's canonical record is on its seller's homeserver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeserverRecord {
+    Present,
+    /// The homeserver answered 404 for the record.
+    Gone,
+}
+
+/// Asks the seller's homeserver whether the listing record exists. Only a
+/// definitive answer counts: a 404 from the homeserver is `Gone`, a success
+/// is `Present`, and every other outcome (unresolvable homeserver, rate
+/// limit, 5xx, timeout) is an error, so an unreachable homeserver can never
+/// read as a deletion. The Pubky client reports a non-2xx status as an
+/// error, so the 404 is read from that error.
+pub async fn listing_record_on_homeserver(
+    owner_id: &str,
+    listing_id: &str,
+) -> Result<HomeserverRecord, EventProcessorError> {
+    let uri = listing_uri_builder(owner_id.to_string(), listing_id.to_string());
+    let pubky = PubkyConnector::get()?;
+    match pubky.public_storage().get(&uri).await {
+        Ok(_) => Ok(HomeserverRecord::Present),
+        Err(pubky::Error::Request(pubky::errors::RequestError::Server { status, .. }))
+            if status == pubky::StatusCode::NOT_FOUND =>
+        {
+            Ok(HomeserverRecord::Gone)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Result of one [`prune_stale_listings`] run.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StaleListingPrune {
+    /// Listing rows in the graph.
+    pub scanned: usize,
+    /// Rows whose record is still on the seller's homeserver.
+    pub present: usize,
+    /// `(owner_id, listing_id)` of rows the homeserver reports as gone.
+    pub stale: Vec<(String, String)>,
+    /// Stale rows deleted (always 0 in a dry run).
+    pub pruned: usize,
+    /// Rows the homeserver could not answer for, or whose delete failed.
+    /// They are left in place; a re-run retries them.
+    pub failed: usize,
+}
+
+/// Finds listing rows whose canonical record is gone from the seller's
+/// homeserver (missed DEL events) and, when `apply` is set, removes them
+/// through the same path a DEL event takes ([`del`]): tags, graph node,
+/// Redis details and stream memberships.
+///
+/// Each row is checked against its homeserver and only a 404 marks it stale.
+/// More than `max_prune` stale rows aborts the run before anything is
+/// deleted, so a misbehaving homeserver cannot empty the marketplace index.
+/// Each stale row is checked again right before its delete, so a listing the
+/// seller re-published in between is kept. The run is idempotent.
+pub async fn prune_stale_listings(
+    apply: bool,
+    max_prune: usize,
+) -> Result<StaleListingPrune, DynError> {
+    let listings = get_all_listing_ids().await?;
+    prune_stale_listings_among(listings, apply, max_prune).await
+}
+
+/// [`prune_stale_listings`] over an explicit set of `(owner_id, listing_id)`
+/// rows instead of every listing in the graph.
+#[doc(hidden)]
+pub async fn prune_stale_listings_among(
+    listings: Vec<(String, String)>,
+    apply: bool,
+    max_prune: usize,
+) -> Result<StaleListingPrune, DynError> {
+    prune_stale_listings_among_with_hook(listings, apply, max_prune, &NoopStalePruneHook).await
+}
+
+/// Deterministic seam for testing the window between the scan that marks a
+/// row stale and the delete of that row.
+#[doc(hidden)]
+#[async_trait]
+pub trait StalePruneHook: Sync {
+    async fn before_recheck(&self, _owner_id: &str, _listing_id: &str) -> Result<(), DynError> {
+        Ok(())
+    }
+}
+
+struct NoopStalePruneHook;
+
+#[async_trait]
+impl StalePruneHook for NoopStalePruneHook {}
+
+/// [`prune_stale_listings_among`] with the interleaving seam. Production
+/// callers use [`prune_stale_listings`].
+#[doc(hidden)]
+pub async fn prune_stale_listings_among_with_hook(
+    listings: Vec<(String, String)>,
+    apply: bool,
+    max_prune: usize,
+    hook: &dyn StalePruneHook,
+) -> Result<StaleListingPrune, DynError> {
+    let mut summary = StaleListingPrune {
+        scanned: listings.len(),
+        ..Default::default()
+    };
+    info!(
+        "Checking {} listing row(s) against their homeservers",
+        listings.len()
+    );
+
+    for (owner_id, listing_id) in listings {
+        match listing_record_on_homeserver(&owner_id, &listing_id).await {
+            Ok(HomeserverRecord::Present) => summary.present += 1,
+            Ok(HomeserverRecord::Gone) => summary.stale.push((owner_id, listing_id)),
+            Err(e) => {
+                warn!(
+                    "Could not check listing {}/{} on its homeserver, leaving it: {:?}",
+                    owner_id, listing_id, e
+                );
+                summary.failed += 1;
+            }
+        }
+    }
+
+    if summary.stale.len() > max_prune {
+        return Err(format!(
+            "{} stale listing(s) found, more than the limit of {max_prune}; nothing was deleted. Check the homeservers, then re-run with a higher limit",
+            summary.stale.len()
+        )
+        .into());
+    }
+
+    for (owner_id, listing_id) in &summary.stale {
+        let title = ListingDetails::get_from_graph(owner_id, listing_id)
+            .await?
+            .map(|details| details.title)
+            .unwrap_or_default();
+        info!(
+            "Stale listing {}/{} ({:?}): gone from its homeserver",
+            owner_id, listing_id, title
+        );
+    }
+    if !apply {
+        return Ok(summary);
+    }
+
+    for (owner_id, listing_id) in summary.stale.clone() {
+        hook.before_recheck(&owner_id, &listing_id).await?;
+        match listing_record_on_homeserver(&owner_id, &listing_id).await {
+            Ok(HomeserverRecord::Gone) => {}
+            Ok(HomeserverRecord::Present) => {
+                warn!(
+                    "Listing {}/{} is back on its homeserver; keeping it",
+                    owner_id, listing_id
+                );
+                summary
+                    .stale
+                    .retain(|(o, l)| !(o == &owner_id && l == &listing_id));
+                summary.present += 1;
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    "Could not re-check listing {}/{}, leaving it: {:?}",
+                    owner_id, listing_id, e
+                );
+                summary.failed += 1;
+                continue;
+            }
+        }
+        let deleted = match PubkyId::try_from(owner_id.as_str()) {
+            Ok(user_id) => del(user_id, listing_id.clone())
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        match deleted {
+            Ok(()) => {
+                info!("Pruned stale listing {}/{}", owner_id, listing_id);
+                summary.pruned += 1;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to prune stale listing {}/{}: {}",
+                    owner_id, listing_id, e
+                );
+                summary.failed += 1;
+            }
+        }
+    }
+    Ok(summary)
 }
 
 /// Outcome counts of one [`backfill_missing_auction_terms`] run.

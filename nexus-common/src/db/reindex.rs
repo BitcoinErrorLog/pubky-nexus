@@ -151,6 +151,29 @@ async fn get_all_post_ids() -> Result<Vec<(String, String)>, DynError> {
     Ok(post_ids)
 }
 
+/// Returns the `(owner_id, listing_id)` pair of every listing in the graph.
+pub async fn get_all_listing_ids() -> Result<Vec<(String, String)>, DynError> {
+    let query = Query::new(
+        "get_all_listing_ids",
+        "MATCH (l:Listing)
+         RETURN l.owner_id AS owner_id, l.id AS listing_id
+         ORDER BY l.owner_id, l.id",
+    );
+    let rows = fetch_all_rows_from_graph(query).await?;
+
+    let mut listing_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let owner_id: Option<String> = row.get("owner_id")?;
+        let listing_id: Option<String> = row.get("listing_id")?;
+        let (Some(owner_id), Some(listing_id)) = (owner_id, listing_id) else {
+            return Err("Listing row is missing owner_id or id".into());
+        };
+        listing_ids.push((owner_id, listing_id));
+    }
+
+    Ok(listing_ids)
+}
+
 /// Returns the `(owner_id, listing_id)` pairs of every auction listing whose
 /// graph row lacks the auction term fields — rows indexed before the index
 /// carried `auction_starts_at`/`auction_ends_at` and the related prices.

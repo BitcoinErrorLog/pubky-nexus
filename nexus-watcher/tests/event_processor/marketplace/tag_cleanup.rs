@@ -96,7 +96,7 @@ impl TargetTagCleanupHook for UntagAt {
     }
 }
 
-async fn user(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
+pub(super) async fn user(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
     let kp = Keypair::random();
     let user = PubkyAppUser {
         bio: Some("target tag cleanup".to_string()),
@@ -109,7 +109,7 @@ async fn user(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
     Ok((kp, id))
 }
 
-async fn tag(
+pub(super) async fn tag(
     test: &mut WatcherTest,
     kp: &Keypair,
     uri: String,
@@ -124,7 +124,11 @@ async fn tag(
     Ok(tag)
 }
 
-async fn listing_is_untagged(seller_id: &str, listing_id: &str, labels: &[&str]) -> Result<()> {
+pub(super) async fn listing_is_untagged(
+    seller_id: &str,
+    listing_id: &str,
+    labels: &[&str],
+) -> Result<()> {
     let scores = <TagListing as TagCollection>::get_from_index(
         seller_id,
         Some(listing_id),
@@ -161,7 +165,7 @@ async fn listing_is_untagged(seller_id: &str, listing_id: &str, labels: &[&str])
     Ok(())
 }
 
-async fn suggested(label: &str) -> Result<bool> {
+pub(super) async fn suggested(label: &str) -> Result<bool> {
     Ok(TagSearch::get_by_label(label, &Pagination::default())
         .await?
         .is_some_and(|found| {
