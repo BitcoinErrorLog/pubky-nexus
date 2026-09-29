@@ -156,6 +156,19 @@ pub fn shop_tags_to_cleanup_markers(owner_id: &str, target: &str) -> Query {
     .param("target", target)
 }
 
+/// Takes a user's write lock and returns one row when the user exists. See
+/// [`lock_listing`].
+pub fn lock_user(user_id: &str) -> Query {
+    Query::new(
+        "lock_user",
+        "MATCH (user:User {id: $user_id})
+         SET user.tag_cleanup_lock = true
+         REMOVE user.tag_cleanup_lock
+         RETURN true AS locked",
+    )
+    .param("user_id", user_id.to_string())
+}
+
 /// Takes a marketplace listing's write lock and returns one row when the
 /// listing exists. Run it in a transaction: the lock stays held until the
 /// transaction ends, so tag PUTs and untags of the listing wait, and each

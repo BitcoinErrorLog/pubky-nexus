@@ -235,6 +235,25 @@ where
         Ok(None)
     }
 
+    /// [`Self::get_from_graph`] without a viewer, read through `txn`, on the
+    /// transaction's own connection.
+    async fn get_from_graph_in(
+        txn: &mut GraphTxn,
+        user_id: &str,
+        extra_param: Option<&str>,
+    ) -> GraphResult<Option<Vec<TagDetails>>> {
+        let maybe_row = txn
+            .fetch_row(Self::read_graph_query(user_id, extra_param))
+            .await?;
+        if let Some(row) = maybe_row {
+            let user_exists: bool = row.get("exists").unwrap_or(false);
+            if user_exists {
+                return Ok(row.get::<Vec<TagDetails>>("tags").ok());
+            }
+        }
+        Ok(None)
+    }
+
     /// Adds the retrieved tags to a sorted set and a set in Redis.
     /// # Arguments
     /// * user_id - The key of the user.

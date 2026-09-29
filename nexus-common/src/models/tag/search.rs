@@ -103,6 +103,17 @@ impl TagSearch {
         Ok(())
     }
 
+    /// Makes the autocomplete entry of a label match the graph, read through
+    /// `txn`: present when an edge carries the label, absent otherwise.
+    pub async fn sync_label_in(txn: &mut GraphTxn, tag_label: &str) -> ModelResult<()> {
+        if Self::label_in_use_in(txn, tag_label).await? {
+            Self::put_to_index(&[tag_label.to_string()]).await?;
+        } else {
+            Self::del_from_index(tag_label).await?;
+        }
+        Ok(())
+    }
+
     async fn label_in_use_in(txn: &mut GraphTxn, tag_label: &str) -> ModelResult<bool> {
         let row = txn
             .fetch_row(crate::db::queries::get::tag_label_in_use(tag_label))

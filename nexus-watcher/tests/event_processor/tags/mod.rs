@@ -7,6 +7,7 @@ mod post_del_self_notification;
 mod post_multi_user;
 mod post_notification;
 mod post_put;
+mod recovery;
 mod retry_post_tag;
 mod retry_user_tag;
 mod user_del_notification;

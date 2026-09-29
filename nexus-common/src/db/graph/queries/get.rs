@@ -204,6 +204,25 @@ pub fn global_tags_by_post_engagement() -> Query {
     )
 }
 
+/// The engagement score the by-tag engagement sorted sets hold for a post: its
+/// tags, replies, reposts and mentions. `global_tags_by_post_engagement` computes the
+/// same score for every post at once.
+pub fn post_tag_engagement(author_id: &str, post_id: &str) -> Query {
+    Query::new(
+        "post_tag_engagement",
+        "
+        MATCH (:User {id: $author_id})-[:AUTHORED]->(post:Post {id: $post_id})
+        OPTIONAL MATCH (post)<-[reply:REPLIED]-()
+        OPTIONAL MATCH (post)<-[repost:REPOSTED]-()
+        OPTIONAL MATCH (post)-[mention:MENTIONED]->()
+        OPTIONAL MATCH (post)<-[tagged:TAGGED]-()
+        RETURN toFloat(COUNT(DISTINCT tagged) + COUNT(DISTINCT reply) + COUNT(DISTINCT repost) + COUNT(DISTINCT mention)) AS score
+        ",
+    )
+    .param("author_id", author_id)
+    .param("post_id", post_id)
+}
+
 // Retrieve all the tags of the post
 pub fn post_tags(user_id: &str, post_id: &str) -> Query {
     Query::new(
@@ -434,6 +453,8 @@ pub fn user_counts(user_id: &str) -> Query {
         // Count user and post tagging
         COUNT { (u)-[:TAGGED]->(:User) } AS user_tags,
         COUNT { (u)-[:TAGGED]->(:Post) } AS post_tags,
+        COUNT { (u)-[:TAGGED]->(:Listing) } AS listing_tags,
+        COUNT { (u)-[:TAGGED]->(:Shop) } AS shop_tags,
         COUNT { (:User)-[:TAGGED]->(u) } AS tags
 
         RETURN
@@ -444,7 +465,7 @@ pub fn user_counts(user_id: &str) -> Query {
                 friends: friends,
                 posts: posts,
                 replies: replies,
-                tagged: user_tags + post_tags,
+                tagged: user_tags + post_tags + listing_tags + shop_tags,
                 tags: tags,
                 unique_tags: unique_tags,
                 bookmarks: bookmarks

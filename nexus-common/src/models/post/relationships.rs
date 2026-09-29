@@ -101,6 +101,19 @@ impl PostRelationships {
         Ok(row.map(|row| Self::from_row(&row)))
     }
 
+    /// [`Self::get_from_graph`] read through `txn`, on the transaction's own
+    /// connection.
+    pub async fn get_from_graph_in(
+        txn: &mut GraphTxn,
+        author_id: &str,
+        post_id: &str,
+    ) -> ModelResult<Option<PostRelationships>> {
+        let row = txn
+            .fetch_row(queries::get::post_relationships(author_id, post_id))
+            .await?;
+        Ok(row.map(|row| Self::from_row(&row)))
+    }
+
     fn from_row(row: &neo4rs::Row) -> Self {
         let replied_post_id: Option<String> = row.get("replied_post_id").unwrap_or(None);
         let replied_author_id: Option<String> = row.get("replied_author_id").unwrap_or(None);

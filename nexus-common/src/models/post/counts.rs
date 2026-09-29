@@ -1,5 +1,5 @@
 use crate::db::kv::{JsonAction, RedisResult};
-use crate::db::{fetch_row_from_graph, queries, GraphResult, RedisOps};
+use crate::db::{fetch_row_from_graph, queries, GraphResult, GraphTxn, RedisOps};
 use crate::models::error::ModelResult;
 use crate::models::tag::post::POST_TAGS_KEY_PARTS;
 use serde::{Deserialize, Serialize};
@@ -50,16 +50,38 @@ impl PostCounts {
         let query = queries::get::post_counts(author_id, post_id);
         let maybe_row = fetch_row_from_graph(query).await?;
 
-        if let Some(row) = maybe_row {
-            let post_exists: bool = row.get("exists").unwrap_or(false);
-            if post_exists {
-                let counts: PostCounts = row.get("counts")?;
-                let is_reply: bool = row.get("is_reply").unwrap_or(false);
+        maybe_row
+            .as_ref()
+            .map(Self::from_row)
+            .transpose()
+            .map(Option::flatten)
+    }
 
-                return Ok(Some((counts, is_reply)));
-            }
+    /// [`Self::get_from_graph`] read through `txn`, on the transaction's own
+    /// connection.
+    pub async fn get_from_graph_in(
+        txn: &mut GraphTxn,
+        author_id: &str,
+        post_id: &str,
+    ) -> GraphResult<Option<(PostCounts, bool)>> {
+        let maybe_row = txn
+            .fetch_row(queries::get::post_counts(author_id, post_id))
+            .await?;
+        maybe_row
+            .as_ref()
+            .map(Self::from_row)
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn from_row(row: &neo4rs::Row) -> GraphResult<Option<(PostCounts, bool)>> {
+        let post_exists: bool = row.get("exists").unwrap_or(false);
+        if !post_exists {
+            return Ok(None);
         }
-        Ok(None)
+        let counts: PostCounts = row.get("counts")?;
+        let is_reply: bool = row.get("is_reply").unwrap_or(false);
+        Ok(Some((counts, is_reply)))
     }
 
     pub async fn put_to_index(

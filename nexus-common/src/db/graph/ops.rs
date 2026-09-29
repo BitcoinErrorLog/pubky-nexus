@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use neo4rs::Row;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use super::error::GraphResult;
@@ -36,13 +36,16 @@ pub const MAX_OPEN_TXNS: usize = 8;
 static TXN_PERMITS: Semaphore = Semaphore::const_new(MAX_OPEN_TXNS);
 static OPEN_TXNS: AtomicUsize = AtomicUsize::new(0);
 static AUTOCOMMIT_STATEMENTS: AtomicU64 = AtomicU64::new(0);
-static FAIL_NEXT_COMMIT: AtomicBool = AtomicBool::new(false);
+/// 0: none, 1: fail before the commit reaches the server, 2: commit, then
+/// fail as if the reply was lost.
+static FAIL_NEXT_COMMIT: AtomicU8 = AtomicU8::new(0);
 
-/// Makes the next [`GraphTxn::commit`] roll the transaction back and fail, as
-/// a lost connection would. Integration tests only.
+/// Makes the next [`GraphTxn::commit`] fail: without reaching the server (the
+/// transaction is rolled back), or, with `after_applying`, after the server
+/// committed it, as a reply lost on the way back would. Integration tests only.
 #[doc(hidden)]
-pub fn fail_next_commit() {
-    FAIL_NEXT_COMMIT.store(true, Ordering::SeqCst);
+pub fn fail_next_commit(after_applying: bool) {
+    FAIL_NEXT_COMMIT.store(if after_applying { 2 } else { 1 }, Ordering::SeqCst);
 }
 
 /// Graph transactions open right now. Integration tests only.
@@ -109,11 +112,20 @@ impl GraphTxn {
 
     pub async fn commit(mut self) -> GraphResult<()> {
         let txn = self.inner.take().expect("transaction is open");
-        if FAIL_NEXT_COMMIT.swap(false, Ordering::SeqCst) {
-            txn.rollback().await?;
-            return Err(super::error::GraphError::Generic(
-                "injected commit failure".to_string(),
-            ));
+        match FAIL_NEXT_COMMIT.swap(0, Ordering::SeqCst) {
+            1 => {
+                txn.rollback().await?;
+                return Err(super::error::GraphError::Generic(
+                    "injected commit failure".to_string(),
+                ));
+            }
+            2 => {
+                txn.commit().await?;
+                return Err(super::error::GraphError::Generic(
+                    "injected lost commit reply".to_string(),
+                ));
+            }
+            _ => {}
         }
         txn.commit().await.map_err(Into::into)
     }

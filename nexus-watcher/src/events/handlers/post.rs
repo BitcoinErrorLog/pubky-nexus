@@ -15,6 +15,8 @@ use pubky_app_specs::{
 };
 use tracing::debug;
 
+use super::recovery::{recover, PostDeletion, Recovery};
+use super::tag_index::{self, OwnedTarget, StepHook, Steps};
 use super::utils::{
     finish_txn, post_relationships_is_reply, post_relationships_is_reply_in, NoopTargetDeleteHook,
     TargetDeleteHook, TargetDeleteStep,
@@ -333,7 +335,7 @@ pub async fn del(author_id: PubkyId, post_id: String) -> Result<(), EventProcess
     del_with_hook(author_id, post_id, &NoopTargetDeleteHook).await
 }
 
-/// [`del`] with a deterministic interleaving point. Production callers use
+/// [`del`] with deterministic interleaving points. Production callers use
 /// [`del`].
 #[doc(hidden)]
 pub async fn del_with_hook(
@@ -357,12 +359,8 @@ pub async fn del_with_hook(
     // A deleted post is a post whose content is EXACTLY `"[DELETED]"`
     match outcome {
         Ok(OperationOutcome::CreatedOrDeleted) => {
-            let result = async {
-                hook.at(TargetDeleteStep::Checked).await?;
-                sync_del_in_txn(&mut txn, &author_id, &post_id).await
-            }
-            .await;
-            finish_txn(txn, result).await?;
+            let checked = hook.at(TargetDeleteStep::Checked).await;
+            delete_post(txn, hook, &author_id, &post_id, checked).await?;
         }
         Ok(OperationOutcome::Updated) => {
             finish_txn(txn, Ok(())).await?;
@@ -398,166 +396,251 @@ pub async fn del_with_hook(
 /// post's write lock until every index is cleaned. A tag PUT or untag on the
 /// post either finished first or starts after the deletion and finds no post.
 pub async fn sync_del(author_id: PubkyId, post_id: String) -> Result<(), EventProcessorError> {
+    sync_del_with_hook(author_id, post_id, &NoopTargetDeleteHook).await
+}
+
+/// [`sync_del`] with deterministic interleaving points.
+#[doc(hidden)]
+pub async fn sync_del_with_hook(
+    author_id: PubkyId,
+    post_id: String,
+    hook: &dyn TargetDeleteHook,
+) -> Result<(), EventProcessorError> {
     let mut txn = start_graph_txn().await?;
-    let result = async {
-        txn.fetch_row(queries::del::lock_post(&author_id, &post_id))
-            .await?;
-        sync_del_in_txn(&mut txn, &author_id, &post_id).await
+    let locked = txn
+        .fetch_row(queries::del::lock_post(&author_id, &post_id))
+        .await
+        .map(|_| ())
+        .map_err(EventProcessorError::from);
+    delete_post(txn, hook, &author_id, &post_id, locked).await
+}
+
+/// What a post deletion has touched, for its recovery.
+#[derive(Default)]
+struct Touched {
+    taggers: Vec<String>,
+    labels: Vec<String>,
+    deletion: PostDeletion,
+}
+
+/// A notification that a deleted post's parent or reposted post sends, once
+/// the deletion has committed: a notification cannot be taken back.
+struct ChildDeleted {
+    author_id: String,
+    parent_uri: String,
+    parent_user_id: String,
+    deleted_uri: String,
+    source: PostChangedSource,
+}
+
+impl ChildDeleted {
+    async fn send(self) {
+        if let Err(error) = Notification::post_children_changed(
+            &self.author_id,
+            &self.parent_uri,
+            &self.parent_user_id,
+            &self.deleted_uri,
+            self.source,
+            &PostChangedType::Deleted,
+        )
+        .await
+        {
+            tracing::warn!("Sending a post deletion notification failed: {error}");
+        }
     }
-    .await;
-    finish_txn(txn, result).await
+}
+
+/// Deletes the post in `txn`, which holds its lock, and commits. `ready` is
+/// the outcome of what came before (the check or the lock) and stops the
+/// deletion when it failed. If the deletion or its commit fails after a Redis
+/// write started, Redis is rebuilt from the committed graph under the locks
+/// of the post and the users and posts whose counters it moved (see
+/// [`recover`]).
+async fn delete_post(
+    mut txn: GraphTxn,
+    hook: &dyn TargetDeleteHook,
+    author_id: &PubkyId,
+    post_id: &str,
+    ready: Result<(), EventProcessorError>,
+) -> Result<(), EventProcessorError> {
+    let mut steps = Steps::new(StepHook::Delete(hook));
+    let mut touched = Touched::default();
+    let result = match ready {
+        Ok(()) => sync_del_in_txn(&mut txn, &mut steps, &mut touched, author_id, post_id).await,
+        Err(error) => Err(error),
+    };
+    let result = match result {
+        Ok(notifications) => hook
+            .at(TargetDeleteStep::BeforeCommit)
+            .await
+            .map(|_| notifications),
+        Err(error) => Err(error),
+    };
+    let outcome = finish_txn(txn, result).await;
+    if outcome.is_err() && steps.started() {
+        let recovery = Recovery {
+            target: OwnedTarget::Post(author_id.to_string(), post_id.to_string()),
+            taggers: touched.taggers,
+            labels: touched.labels,
+            post: Some(touched.deletion),
+        };
+        if let Err(error) = recover(&recovery, StepHook::Delete(hook)).await {
+            tracing::error!("Recovering a failed post deletion failed: {error}");
+        }
+    }
+    for notification in outcome? {
+        notification.send().await;
+    }
+    Ok(())
 }
 
 async fn sync_del_in_txn(
     txn: &mut GraphTxn,
+    steps: &mut Steps<'_>,
+    touched: &mut Touched,
     author_id: &PubkyId,
     post_id: &str,
-) -> Result<(), EventProcessorError> {
-    let author_id = author_id.clone();
-    let post_id = post_id.to_string();
-    let untagged_by = super::tag::purge_deleted_post_tags(txn, &author_id, &post_id).await?;
-    let deleted_uri = post_uri_builder(author_id.to_string(), post_id.clone());
+) -> Result<Vec<ChildDeleted>, EventProcessorError> {
+    let deleted_uri = post_uri_builder(author_id.to_string(), post_id.to_string());
+    let mut notifications = Vec::new();
 
-    let post_relationships = PostRelationships::get_by_id_in(txn, &author_id, &post_id).await?;
+    let post_relationships = PostRelationships::get_by_id_in(txn, author_id, post_id).await?;
     // If the post is reply, cannot delete from the main feeds
     // In the main feed, we just include the root posts and reposts
     // It could be a situation that relationship would not exist and we will treat the post as a not reply
     let is_reply =
         matches!(&post_relationships, Some(relationship) if relationship.replied.is_some());
+    let mut replied = None;
+    let mut reposted = None;
+    if let Some(relationships) = &post_relationships {
+        if let Some(uri) = &relationships.replied {
+            replied = Some(post_of(uri, "Replied")?);
+        }
+        if let Some(uri) = &relationships.reposted {
+            reposted = Some(post_of(uri, "Reposted")?);
+        }
+    }
+    touched.deletion.replied = replied.clone();
+    touched.deletion.reposted = reposted.clone();
+
+    let (taggers, labels) = super::tag::delete_post_tag_edges(txn, author_id, post_id).await?;
+    touched.taggers = taggers.clone();
+    touched.labels = labels.clone();
+    super::tag::purge_deleted_post_tags(txn, steps, author_id, post_id, &labels).await?;
 
     // DELETE TO INDEX - PHASE 1, decrease post counts
-    let indexing_results = tokio::join!(
-        PostCounts::delete(&author_id, &post_id, !is_reply),
-        UserCounts::decrement(&author_id, "posts", None),
-        async {
-            if is_reply {
-                UserCounts::decrement(&author_id, "replies", None).await?;
-            };
-            Ok::<(), EventProcessorError>(())
-        }
-    );
-
-    indexing_results.0?;
-    indexing_results.1?;
-    indexing_results.2?;
+    steps
+        .run(async {
+            PostCounts::delete(author_id, post_id, !is_reply).await?;
+            Ok(())
+        })
+        .await?;
+    steps
+        .run(tag_index::user_counter(author_id, "posts", false))
+        .await?;
+    if is_reply {
+        steps
+            .run(tag_index::user_counter(author_id, "replies", false))
+            .await?;
+    }
 
     // Use that index wrapper to delete a post reply
     let mut reply_parent_post_key_wrapper: Option<[String; 2]> = None;
 
-    if let Some(relationships) = post_relationships {
-        // PHASE 2: Process POST REPLIES indexes
-        // Decrement counts for parent post if replied
-        if let Some(replied_uri) = relationships.replied {
-            let parent_user_id = replied_uri.user_id.clone();
-            let parent_post_id = match replied_uri.resource.clone() {
-                Resource::Post(id) => id,
-                _ => {
-                    return Err(EventProcessorError::generic(
-                        "Replied uri is not a Post resource",
-                    ))
-                }
-            };
-            let replied_uri_str = replied_uri
-                .try_to_uri_str()
-                .map_err(EventProcessorError::generic)?;
-
-            let parent_post_key_parts: [&str; 2] = [&parent_user_id, &parent_post_id];
-            reply_parent_post_key_wrapper =
-                Some([parent_user_id.to_string(), parent_post_id.clone()]);
-
-            let indexing_results = tokio::join!(
-                PostCounts::decrement_index_field(&parent_post_key_parts, "replies", None),
-                async {
-                    // Post replies cannot be included in the total engagement index after the reply is deleted
-                    if !post_relationships_is_reply_in(txn, &parent_user_id, &parent_post_id)
-                        .await?
-                    {
-                        PostStream::decrement_score_index_sorted_set(
-                            &POST_TOTAL_ENGAGEMENT_KEY_PARTS,
-                            &parent_post_key_parts,
-                        )
-                        .await
-                        .map_err(EventProcessorError::index_operation_failed)?;
-                    }
-                    Ok::<(), EventProcessorError>(())
-                },
-                // Notification: "A reply to your post was deleted"
-                Notification::post_children_changed(
-                    &author_id,
-                    &replied_uri_str,
-                    &parent_user_id,
-                    &deleted_uri,
-                    PostChangedSource::Reply,
-                    &PostChangedType::Deleted,
-                )
-            );
-
-            indexing_results.0?;
-            indexing_results.1?;
-            indexing_results.2?;
-        }
-        // PHASE 3: Process POST REPOSTED indexes
-        // Decrement counts for resposted post if existed
-        if let Some(reposted_uri) = relationships.reposted {
-            let parent_post_id = match reposted_uri.resource.clone() {
-                Resource::Post(id) => id,
-                _ => {
-                    return Err(EventProcessorError::generic(
-                        "Reposted uri is not a Post resource",
-                    ))
-                }
-            };
-            let reposted_uri_str = reposted_uri
-                .try_to_uri_str()
-                .map_err(EventProcessorError::generic)?;
-
-            let parent_post_key_parts: &[&str] = &[&reposted_uri.user_id, &parent_post_id];
-
-            let indexing_results = tokio::join!(
-                PostCounts::decrement_index_field(parent_post_key_parts, "reposts", None),
-                async {
-                    // Post replies cannot be included in the total engagement index after the repost is deleted
-                    if !post_relationships_is_reply_in(txn, &reposted_uri.user_id, &parent_post_id)
-                        .await?
-                    {
-                        PostStream::decrement_score_index_sorted_set(
-                            &POST_TOTAL_ENGAGEMENT_KEY_PARTS,
-                            parent_post_key_parts,
-                        )
-                        .await
-                        .map_err(EventProcessorError::index_operation_failed)?;
-                    }
-                    Ok::<(), EventProcessorError>(())
-                },
-                // Notification: "A repost of your post was deleted"
-                Notification::post_children_changed(
-                    &author_id,
-                    &reposted_uri_str,
-                    &reposted_uri.user_id,
-                    &deleted_uri,
-                    PostChangedSource::Repost,
-                    &PostChangedType::Deleted,
-                )
-            );
-
-            indexing_results.0?;
-            indexing_results.1?;
-            indexing_results.2?;
-        }
+    // PHASE 2: Process POST REPLIES indexes
+    // Decrement counts for parent post if replied
+    if let Some((parent_user_id, parent_post_id)) = &replied {
+        reply_parent_post_key_wrapper = Some([parent_user_id.clone(), parent_post_id.clone()]);
+        decrement_parent(txn, steps, parent_user_id, parent_post_id, "replies").await?;
+        notifications.push(ChildDeleted {
+            author_id: author_id.to_string(),
+            parent_uri: post_uri_builder(parent_user_id.clone(), parent_post_id.clone()),
+            parent_user_id: parent_user_id.clone(),
+            deleted_uri: deleted_uri.clone(),
+            source: PostChangedSource::Reply,
+        });
     }
-    let indexing_results = tokio::join!(
-        PostDetails::delete(txn, &author_id, &post_id, reply_parent_post_key_wrapper),
-        PostRelationships::delete(&author_id, &post_id)
-    );
-
-    indexing_results.0?;
-    indexing_results.1?;
-
-    // Last, so a failure before it rolls the deletion back without a count
-    // to repeat on the retry
-    for tagger_id in untagged_by {
-        UserCounts::decrement(&tagger_id, "tagged", None).await?;
+    // PHASE 3: Process POST REPOSTED indexes
+    // Decrement counts for resposted post if existed
+    if let Some((parent_user_id, parent_post_id)) = &reposted {
+        decrement_parent(txn, steps, parent_user_id, parent_post_id, "reposts").await?;
+        notifications.push(ChildDeleted {
+            author_id: author_id.to_string(),
+            parent_uri: post_uri_builder(parent_user_id.clone(), parent_post_id.clone()),
+            parent_user_id: parent_user_id.clone(),
+            deleted_uri: deleted_uri.clone(),
+            source: PostChangedSource::Repost,
+        });
     }
 
+    steps
+        .run(async {
+            PostDetails::remove_from_index_multiple_json(&[&[author_id, post_id]]).await?;
+            Ok(())
+        })
+        .await?;
+    // Delete post graph node
+    txn.run(queries::del::delete_post(author_id, post_id))
+        .await?;
+    steps
+        .run(async {
+            PostDetails::delete_stream_entries(author_id, post_id, reply_parent_post_key_wrapper)
+                .await?;
+            Ok(())
+        })
+        .await?;
+    steps
+        .run(async {
+            PostRelationships::delete(author_id, post_id).await?;
+            Ok(())
+        })
+        .await?;
+
+    for tagger_id in &taggers {
+        steps
+            .run(tag_index::user_counter(tagger_id, "tagged", false))
+            .await?;
+    }
+
+    Ok(notifications)
+}
+
+/// The `(author_id, post_id)` a relationship URI points at.
+fn post_of(uri: &ParsedUri, what: &str) -> Result<(String, String), EventProcessorError> {
+    match &uri.resource {
+        Resource::Post(post_id) => Ok((uri.user_id.to_string(), post_id.clone())),
+        _ => Err(EventProcessorError::generic(format!(
+            "{what} uri is not a Post resource"
+        ))),
+    }
+}
+
+/// Lowers the parent post's reply or repost count and, when the parent is
+/// not a reply, its total engagement.
+async fn decrement_parent(
+    txn: &mut GraphTxn,
+    steps: &mut Steps<'_>,
+    parent_user_id: &str,
+    parent_post_id: &str,
+    field: &'static str,
+) -> Result<(), EventProcessorError> {
+    steps
+        .run(tag_index::post_counter(
+            parent_user_id,
+            parent_post_id,
+            field,
+            false,
+        ))
+        .await?;
+    // Post replies cannot be included in the total engagement index after the reply or repost is deleted
+    if !post_relationships_is_reply_in(txn, parent_user_id, parent_post_id).await? {
+        steps
+            .run(tag_index::post_engagement(
+                parent_user_id,
+                parent_post_id,
+                false,
+            ))
+            .await?;
+    }
     Ok(())
 }

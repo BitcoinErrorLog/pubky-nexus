@@ -11,6 +11,17 @@ pub enum TargetDeleteStep {
     /// The target's write lock is held and it was found free of
     /// relationships; nothing is deleted yet.
     Checked,
+    /// The n-th Redis write of the deletion is about to start (counting from
+    /// 1); the transaction is open.
+    BeforeIndexStep(u32),
+    /// The n-th Redis write is done, as far as the caller knows: failing here
+    /// is a command that applied and reported failure.
+    IndexStep(u32),
+    /// Every Redis write is done and the transaction is about to commit.
+    BeforeCommit,
+    /// A failed deletion is being recovered: the recovery holds the locks and
+    /// has not rebuilt anything yet.
+    Recovering,
 }
 
 /// Internal deterministic seam for integration-testing a post or user

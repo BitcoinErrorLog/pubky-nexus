@@ -1,5 +1,5 @@
 use crate::db::kv::{JsonAction, RedisResult};
-use crate::db::{fetch_row_from_graph, queries, GraphResult, RedisOps};
+use crate::db::{fetch_row_from_graph, queries, GraphResult, GraphTxn, RedisOps};
 use crate::models::error::ModelResult;
 use crate::models::tag::user::USER_TAGS_KEY_PARTS;
 use serde::{Deserialize, Serialize};
@@ -47,19 +47,28 @@ impl UserCounts {
         let query = queries::get::user_counts(user_id);
         let maybe_row = fetch_row_from_graph(query).await?;
 
-        if let Some(row) = maybe_row {
-            let user_exists: bool = row.get("exists").unwrap_or(false);
-            if user_exists {
-                match row.get("counts") {
-                    Ok(user_counts) => return Ok(Some(user_counts)),
-                    // Like this we give a chance, in the next request to populate index
-                    // If we populate the cache with default value, from that point we will have
-                    // inconsistent state
-                    Err(_e) => return Ok(None),
-                }
-            }
+        Ok(maybe_row.as_ref().and_then(Self::from_row))
+    }
+
+    /// [`Self::get_from_graph`] read through `txn`, on the transaction's own
+    /// connection.
+    pub async fn get_from_graph_in(
+        txn: &mut GraphTxn,
+        user_id: &str,
+    ) -> GraphResult<Option<UserCounts>> {
+        let maybe_row = txn.fetch_row(queries::get::user_counts(user_id)).await?;
+        Ok(maybe_row.as_ref().and_then(Self::from_row))
+    }
+
+    fn from_row(row: &neo4rs::Row) -> Option<UserCounts> {
+        let user_exists: bool = row.get("exists").unwrap_or(false);
+        if !user_exists {
+            return None;
         }
-        Ok(None)
+        // Like this we give a chance, in the next request to populate index
+        // If we populate the cache with default value, from that point we will have
+        // inconsistent state
+        row.get("counts").ok()
     }
 
     pub async fn get_from_index(user_id: &str) -> RedisResult<Option<UserCounts>> {

@@ -594,27 +594,15 @@ pub trait RedisOps: Serialize + DeserializeOwned + Send + Sync {
         sorted_sets::put_score(SORTED_PREFIX, &key, &member_key, score_mutation).await
     }
 
-    /// Puts a sorted-set member back to the score it had before a write that
-    /// is being undone (`None` removes it). Without `recreate`, a member that
-    /// is absent now stays absent.
-    async fn restore_sorted_set_member(
-        key_parts: &[&str],
-        member: &[&str],
-        before: Option<isize>,
-        recreate: bool,
-    ) -> RedisResult<()> {
-        let key = key_parts.join(":");
-        sorted_sets::restore(SORTED_PREFIX, &key, &member.join(":"), before, recreate).await
+    /// Deletes a whole Redis set.
+    async fn delete_set_index(key_parts: &[&str]) -> RedisResult<()> {
+        let prefix = Self::prefix().await;
+        sets::delete_key(&prefix, &key_parts.join(":")).await
     }
 
-    /// Adds `delta` to a sorted-set member's score only if the member exists.
-    async fn put_score_index_sorted_set_if_present(
-        key_parts: &[&str],
-        member: &[&str],
-        delta: f64,
-    ) -> RedisResult<()> {
-        let key = key_parts.join(":");
-        sorted_sets::put_score_if_present(SORTED_PREFIX, &key, &member.join(":"), delta).await
+    /// Deletes a whole Redis sorted set.
+    async fn delete_sorted_set_index(key_parts: &[&str]) -> RedisResult<()> {
+        sorted_sets::delete_key(SORTED_PREFIX, &key_parts.join(":")).await
     }
 
     /// Sets a numeric field of an existing JSON document to `value`.

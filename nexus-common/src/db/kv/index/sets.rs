@@ -371,3 +371,14 @@ pub async fn get_random_members(
 
     Ok(Some(random_members))
 }
+
+/// Deletes a whole Redis set.
+pub async fn delete_key(prefix: &str, key: &str) -> RedisResult<()> {
+    let mut redis_conn = get_redis_conn().await?;
+    let index_key = format!("{prefix}:{key}");
+    deadpool_redis::redis::cmd("DEL")
+        .arg(index_key)
+        .exec_async(&mut redis_conn)
+        .await?;
+    Ok(())
+}

@@ -57,17 +57,30 @@ impl PostDetails {
         let query = queries::get::get_post_by_id(author_id, post_id);
         let maybe_row = fetch_row_from_graph(query).await?;
 
-        let Some(row) = maybe_row else {
-            return Ok(None);
-        };
+        maybe_row.as_ref().map(Self::from_row).transpose()
+    }
 
+    /// [`Self::get_from_graph`] read through `txn`, on the transaction's own
+    /// connection.
+    pub async fn get_from_graph_in(
+        txn: &mut GraphTxn,
+        author_id: &str,
+        post_id: &str,
+    ) -> GraphResult<Option<(PostDetails, Option<(String, String)>)>> {
+        let maybe_row = txn
+            .fetch_row(queries::get::get_post_by_id(author_id, post_id))
+            .await?;
+        maybe_row.as_ref().map(Self::from_row).transpose()
+    }
+
+    fn from_row(row: &neo4rs::Row) -> GraphResult<(PostDetails, Option<(String, String)>)> {
         let post: PostDetails = row.get("details")?;
-        let reply_value: Vec<(String, String)> = row.get("reply").unwrap_or(Vec::new());
+        let reply_value: Vec<(String, String)> = row.get("reply").unwrap_or_default();
         let reply_key = match reply_value.is_empty() {
             true => None,
             false => Some(reply_value[0].clone()),
         };
-        Ok(Some((post, reply_key)))
+        Ok((post, reply_key))
     }
 
     pub async fn put_to_index(
@@ -137,20 +150,13 @@ impl PostDetails {
         execute_graph_operation(query).await
     }
 
-    /// Deletes the post's Redis details, its graph node and its feed
-    /// memberships. The node is deleted in `txn`, which holds the post's
-    /// write lock; the caller commits after this returns.
-    pub async fn delete(
-        txn: &mut GraphTxn,
+    /// Removes the post from the feeds it is indexed in. Replies are not in
+    /// the global feeds.
+    pub async fn delete_stream_entries(
         author_id: &str,
         post_id: &str,
         parent_post_key_wrapper: Option<[String; 2]>,
     ) -> ModelResult<()> {
-        // Delete user_details on Redis
-        Self::remove_from_index_multiple_json(&[&[author_id, post_id]]).await?;
-        // Delete post graph node
-        txn.run(queries::del::delete_post(author_id, post_id))
-            .await?;
         // The replies are not indexed in the global feeds
         match parent_post_key_wrapper {
             None => {
