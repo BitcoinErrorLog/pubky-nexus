@@ -14,7 +14,7 @@ const PRODUCTION_ENVIRONMENT_ID = "aa35d5df-634d-4cdd-9e53-49b0d9c73efc";
 
 // Pinned to the live GHCR digest. Bump in the same PR as each IMAGE connect.
 const LIVE_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-nexus@sha256:8498ef94de425512fada9e361fd00975f1902073756456d71b62881e44f3dcca";
+  "ghcr.io/bitcoinerrorlog/pubky-nexus@sha256:832591a4f10500793817a708fa638036ffd0058072ca5bb19f2bbec0c349edac";
 
 const operationalEnv = {
   NEXUS_EVENTS_LIMIT: preserve(),
