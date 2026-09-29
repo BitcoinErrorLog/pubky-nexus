@@ -33,9 +33,11 @@ impl Migration for ReviewBackfill1787905961 {
     async fn backfill(&self) -> Result<(), DynError> {
         let summary = backfill_unindexed_reviews().await?;
         tracing::info!(
-            "Review backfill: {} newly indexed, {} already indexed, {} failed",
+            "Review backfill: {} newly indexed, {} already indexed, {} gone, {} unreachable users skipped, {} failed",
             summary.indexed,
             summary.already_indexed,
+            summary.gone,
+            summary.unreachable,
             summary.failed
         );
         // Stay in the backfill phase when anything failed: indexed reviews

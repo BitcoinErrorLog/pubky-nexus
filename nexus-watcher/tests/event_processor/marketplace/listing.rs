@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use nexus_common::db::graph::Query;
 use nexus_common::db::kv::SortOrder;
 use nexus_common::db::reindex::get_auction_listings_missing_terms;
-use nexus_common::db::{exec_single_row, fetch_key_from_graph, RedisOps};
+use nexus_common::db::{exec_single_row, fetch_key_from_graph, PubkyConnector, RedisOps};
 use nexus_common::models::event::{EventProcessorError, EventType};
 use nexus_common::models::marketplace::{
     ListingDetails, ListingSaleFormat, ListingStream, ListingStreamFilters, ListingStreamSorting,
@@ -94,6 +94,16 @@ fn rfc3339_ms(value: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(value)
         .unwrap()
         .timestamp_millis()
+}
+
+async fn delete_homeserver_record_without_event(
+    keypair: &Keypair,
+    path: &ResourcePath,
+) -> Result<()> {
+    let pubky = PubkyConnector::get()?;
+    let session = pubky.signer(keypair.clone()).signin().await?;
+    session.storage().delete(path).await?;
+    Ok(())
 }
 
 /// Reads the auction end-time sorted set entries within the given
@@ -859,6 +869,58 @@ async fn test_auction_terms_backfill_reindexes_pre_term_rows() -> Result<()> {
     test.del(&user_kp, &listing_path).await?;
     test.cleanup_user(&user_kp).await?;
 
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_auction_terms_backfill_reports_missing_record_as_gone() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let user_kp = Keypair::random();
+    let user = PubkyAppUser {
+        bio: None,
+        image: None,
+        links: None,
+        name: "Watcher:AuctionBackfill:Gone".to_string(),
+        status: None,
+    };
+    let user_id = test.create_user(&user_kp, &user).await?;
+    let listing = test_auction_listing(
+        &user_id,
+        "Gone before backfill",
+        "collectibles",
+        "2025-02-01T00:00:00Z",
+        "2025-02-08T00:00:00Z",
+    );
+    let (listing_id, listing_path) = test.create_listing(&user_kp, &listing).await?;
+
+    let indexed_listing = ListingDetails::get_from_index(&user_id, &listing_id)
+        .await?
+        .expect("The auction listing details were not indexed");
+    let legacy_details = ListingDetails {
+        auction_starts_at: None,
+        auction_ends_at: None,
+        auction_buy_now_price_minor: None,
+        auction_minimum_increment_minor: None,
+        ..indexed_listing
+    };
+    legacy_details.put_to_graph().await?;
+    legacy_details.put_to_index(true).await?;
+    delete_homeserver_record_without_event(&user_kp, &listing_path).await?;
+
+    let summary = backfill_missing_auction_terms().await.unwrap();
+    assert_eq!(summary.reindexed, 0, "missing records cannot be reindexed");
+    assert_eq!(summary.gone, 1, "the missing record must be reported gone");
+    assert_eq!(
+        summary.failed, 0,
+        "a definitive homeserver 404 is not a backfill failure"
+    );
+
+    nexus_watcher::events::handlers::listing::del(
+        PubkyId::try_from(user_id.as_str()).unwrap(),
+        listing_id,
+    )
+    .await?;
+    test.cleanup_user(&user_kp).await?;
     Ok(())
 }
 

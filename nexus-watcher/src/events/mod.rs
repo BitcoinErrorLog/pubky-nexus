@@ -27,21 +27,17 @@ pub async fn handle_put_event(
     debug!("Handling PUT event for URI: {}", event.uri);
 
     let pubky = PubkyConnector::get()?;
-    let response = pubky.public_storage().get(&event.uri).await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unable to read body>".to_string());
-
-        let err_msg = format!(
-            "Fetch resource failed {}: HTTP {status} - {body}",
-            event.uri
-        );
-        return Err(EventProcessorError::client_error(err_msg));
-    }
+    let response = match pubky.public_storage().get(&event.uri).await {
+        Ok(response) => response,
+        Err(e) if handlers::listing::is_homeserver_not_found(&e) => {
+            debug!(
+                "PUT record {} is already gone from its homeserver; skipping",
+                event.uri
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let blob = response
         .bytes()
