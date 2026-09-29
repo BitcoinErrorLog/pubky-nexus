@@ -78,6 +78,21 @@ pub enum DbCommands {
     /// Manage database migrations
     #[command(subcommand)]
     Migration(MigrationCommands),
+
+    /// Find marketplace listings whose record is gone from the seller's
+    /// homeserver (missed DEL events) and optionally delete them
+    PruneStaleListings(PruneStaleListingsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PruneStaleListingsArgs {
+    /// Delete the stale listings. Without it the command only reports them
+    #[arg(long)]
+    pub apply: bool,
+
+    /// Abort before deleting anything when more stale listings are found
+    #[arg(long, default_value_t = 50)]
+    pub max_prune: usize,
 }
 
 #[derive(Args, Debug)]
