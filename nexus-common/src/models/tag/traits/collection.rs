@@ -324,8 +324,8 @@ where
     }
 
     /// Inserts a tag relationship into the graph database inside `txn`. The
-    /// statement takes the write locks of the tagged target and the tagger,
-    /// which stay held until the caller ends `txn`: the caller writes the
+    /// statement takes the write lock of the tagged target (and creating the
+    /// edge locks the tagger), which stays held until the caller ends `txn`: the caller writes the
     /// tag's Redis indexes before it commits, so a deletion of the target
     /// waits for them and a deletion that finished first leaves no target to
     /// tag ([`OperationOutcome::MissingDependency`]).
@@ -393,11 +393,10 @@ where
 
     /// Deletes a tag relationship between a user and a tagged target
     /// (User, Post, marketplace Listing, or marketplace Shop) in the graph database
-    /// inside `txn`. The target's and the tagger's write locks are taken
-    /// first and stay held until the caller ends `txn`; the edge is read
-    /// after they are granted, so an edge a target's cleanup removed in the
-    /// meantime is reported as absent and its indexes are not decremented
-    /// twice.
+    /// inside `txn`. The target's write lock is taken first and stays held
+    /// until the caller ends `txn`; the edge is read after it is granted, so
+    /// an edge a target's cleanup removed in the meantime is reported as
+    /// absent and its indexes are not decremented twice.
     /// # Arguments
     /// * `txn` - The transaction the untag's graph and Redis writes belong to.
     /// * `user_id` - The ID of the user who owns the tag relationship.

@@ -1,10 +1,10 @@
 //! A tag write (PUT or untag) and the deletion of its target can interleave
 //! between the tag's graph write and its Redis writes. The tag write holds the
-//! write locks of the target and the tagger from its graph statement through
-//! its Redis writes, and the deletion takes the same lock before it checks or
-//! removes anything, so each interleaving below ends in one of two states: the
-//! target is gone and no index names it, or the target is kept and its tag
-//! indexes match its edges.
+//! target's write lock from its graph statement through its Redis writes, and
+//! the deletion takes the same lock before it checks or removes anything, so
+//! each interleaving below ends in one of two states: the target is gone and
+//! no index names it, or the target is kept and its tag indexes match its
+//! edges.
 //!
 //! Every interleaving is deterministic: a hook holds one side at a chosen
 //! point, the other side is observed `Blocked` on the lock in
@@ -561,7 +561,7 @@ async fn wait_until_blocked<T>(operation: &JoinHandle<T>) -> Result<()> {
 }
 
 async fn joined(operation: JoinHandle<OpResult>) -> Result<OpResult> {
-    Ok(operation.await.map_err(|e| anyhow!("task failed: {e}"))?)
+    operation.await.map_err(|e| anyhow!("task failed: {e}"))
 }
 
 /// A tag PUT holds the target's lock through its Redis writes. The target's
@@ -758,45 +758,6 @@ async fn a_target_deletion_leaves_the_taggers_other_tags_alone() -> Result<()> {
     w.assert_deleted_and_clean("listing").await?;
     assert!(suggested(&w.baseline_label).await?);
     w.cleanup(&mut test).await?;
-    Ok(())
-}
-
-/// A tag PUT takes the tagger's lock along with the target's, in its graph
-/// statement. Another writer holding the tagger therefore stops the PUT
-/// before it writes any Redis index; without it the PUT would write its
-/// indexes and only then wait for the tagger at commit, where a deadlock
-/// abort would strand them.
-#[tokio_shared_rt::test(shared)]
-async fn a_tag_put_waits_for_the_tagger_before_it_writes_any_index() -> Result<()> {
-    let mut test = WatcherTest::setup().await?;
-    for kind in Kind::ALL {
-        let w = world(&mut test, kind).await?;
-        let mut holder = nexus_common::db::start_graph_txn().await?;
-        holder
-            .run(
-                Query::new(
-                    "race_hold_tagger",
-                    "MATCH (u:User {id: $id})
-                     SET u.tag_cleanup_lock = true
-                     REMOVE u.tag_cleanup_lock",
-                )
-                .param("id", w.tagger_id.as_str()),
-            )
-            .await?;
-
-        let put = w.spawn_put(Arc::new(NoHook));
-        wait_until_blocked(&put).await?;
-        assert_eq!(
-            w.tagged().await,
-            1,
-            "{kind:?}: the PUT wrote Redis before it held the tagger"
-        );
-        holder.rollback().await?;
-
-        joined(put).await??;
-        w.assert_kept_with_tag(&format!("{kind:?}")).await?;
-        w.cleanup(&mut test).await?;
-    }
     Ok(())
 }
 

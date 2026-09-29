@@ -75,21 +75,17 @@ pub fn delete_bookmark(user_id: &str, bookmark_id: &str) -> Query {
     .param("bookmark_id", bookmark_id)
 }
 
-/// Takes the write locks a tag's untag needs, target first and then the
-/// tagger, and returns one row when the tag exists. Run it in the untag's
-/// transaction before [`delete_tag`]: the locks stay held until the
-/// transaction ends, so a cleanup that removes the same edge waits for the
-/// untag's Redis writes, and [`delete_tag`] reads the edge after any such
-/// cleanup finished.
+/// Takes the write lock of a tag's target and returns one row when the tag
+/// exists. Run it in the untag's transaction before [`delete_tag`]: the lock
+/// stays held until the transaction ends, so a cleanup that removes the same
+/// edge waits for the untag's Redis writes, and [`delete_tag`] reads the edge
+/// after any such cleanup finished. Deleting the edge locks the tagger.
 pub fn lock_tag_target(user_id: &str, tag_id: &str) -> Query {
     Query::new(
         "lock_tag_target",
-        "MATCH (user:User {id: $user_id})-[:TAGGED {id: $tag_id}]->(target)
+        "MATCH (:User {id: $user_id})-[:TAGGED {id: $tag_id}]->(target)
          SET target.tag_cleanup_lock = true
          REMOVE target.tag_cleanup_lock
-         WITH user
-         SET user.tag_cleanup_lock = true
-         REMOVE user.tag_cleanup_lock
          RETURN true AS locked",
     )
     .param("user_id", user_id)

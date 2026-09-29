@@ -243,14 +243,13 @@ pub fn create_post_tag(
         "MATCH (user:User {id: $user_id})
         // We assume these nodes are already created. If not we would not be able to add a tag
         MATCH (author:User {id: $author_id})-[:AUTHORED]->(post:Post {id: $post_id})
-        // Write locks on the target, then the tagger, held until the caller's
-        // transaction ends: a deletion of either waits for the tag's Redis
-        // writes, and sees the edge once they are done
+        // Write lock on the target, taken before the relationship is created
+        // (creating it locks the tagger and the target) and held until the
+        // caller's transaction ends: a deletion of the target waits for the
+        // tag's Redis writes and then sees the edge, and taking the target
+        // first keeps the lock order the deletion has
         SET post.tag_cleanup_lock = true
         REMOVE post.tag_cleanup_lock
-        WITH user, post
-        SET user.tag_cleanup_lock = true
-        REMOVE user.tag_cleanup_lock
         WITH user, post
         // Check if tag already existed
         OPTIONAL MATCH (user)-[existing:TAGGED {label: $label}]->(post)
@@ -286,12 +285,9 @@ pub fn create_user_tag(
         "create_user_tag",
         "MATCH (tagged_used:User {id: $tagged_user_id})
         MATCH (tagger:User {id: $tagger_user_id})
-        // Write locks on the target, then the tagger (see `create_post_tag`)
+        // Write lock on the target first (see `create_post_tag`)
         SET tagged_used.tag_cleanup_lock = true
         REMOVE tagged_used.tag_cleanup_lock
-        WITH tagger, tagged_used
-        SET tagger.tag_cleanup_lock = true
-        REMOVE tagger.tag_cleanup_lock
         WITH tagger, tagged_used
         // Check if tag already existed
         OPTIONAL MATCH (tagger)-[existing:TAGGED {label: $label}]->(tagged_used)
@@ -330,12 +326,9 @@ pub fn create_listing_tag(
         "MATCH (user:User {id: $user_id})
         // We assume these nodes are already created. If not we would not be able to add a tag
         MATCH (listing:Listing {id: $listing_id, owner_id: $seller_id})
-        // Write locks on the target, then the tagger (see `create_post_tag`)
+        // Write lock on the target first (see `create_post_tag`)
         SET listing.tag_cleanup_lock = true
         REMOVE listing.tag_cleanup_lock
-        WITH user, listing
-        SET user.tag_cleanup_lock = true
-        REMOVE user.tag_cleanup_lock
         WITH user, listing
         // Check if tag already existed
         OPTIONAL MATCH (user)-[existing:TAGGED {label: $label}]->(listing)
@@ -373,12 +366,9 @@ pub fn create_shop_tag(
         "MATCH (user:User {id: $user_id})
         // We assume these nodes are already created. If not we would not be able to add a tag
         MATCH (:User {id: $owner_id})-[:HAS_SHOP]->(shop:Shop {owner_id: $owner_id})
-        // Write locks on the target, then the tagger (see `create_post_tag`)
+        // Write lock on the target first (see `create_post_tag`)
         SET shop.tag_cleanup_lock = true
         REMOVE shop.tag_cleanup_lock
-        WITH user, shop
-        SET user.tag_cleanup_lock = true
-        REMOVE user.tag_cleanup_lock
         WITH user, shop
         // Check if tag already existed
         OPTIONAL MATCH (user)-[existing:TAGGED {label: $label}]->(shop)

@@ -30,15 +30,12 @@ use super::utils::{finish_txn, post_relationships_is_reply};
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagWriteStep {
-    /// The tag PUT wrote its edge in its open transaction, holding the write
-    /// locks of the target and the tagger; no Redis index is written yet.
+    /// The tag PUT wrote its edge in its open transaction, holding the
+    /// target's write lock; no Redis index is written yet.
     GraphWritten,
-    /// The untag deleted the edge in its open transaction, holding the write
-    /// locks of the target and the tagger; no Redis index is changed yet.
+    /// The untag deleted the edge in its open transaction, holding the
+    /// target's write lock; no Redis index is changed yet.
     EdgeDeleted,
-    /// Every Redis index of the write is done; the transaction is not
-    /// committed yet.
-    IndexesWritten,
 }
 
 /// Internal deterministic seam for integration-testing tag writes against a
@@ -59,8 +56,8 @@ impl TagWriteHook for NoopTagWriteHook {}
 /// Indexes a tag PUT.
 ///
 /// The edge and every Redis index of the tag are written inside one graph
-/// transaction that holds the write locks of the tagged target and the
-/// tagger. A deletion of the target locks the same node: it waits for the
+/// transaction that holds the write lock of the tagged target. A deletion of
+/// the target locks the same node: it waits for the
 /// tag's Redis writes and then sees the committed edge, and a deletion that
 /// finished first leaves no target, so the PUT writes nothing. Any failure
 /// rolls the edge back, so the retried event starts from a clean state. The
@@ -262,7 +259,6 @@ async fn put_sync_post(
             indexing_results.6?;
             indexing_results.7?;
 
-            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
@@ -342,7 +338,6 @@ async fn put_sync_user(
             indexing_results.3?;
             indexing_results.4?;
 
-            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
@@ -419,7 +414,6 @@ async fn put_sync_listing(
             indexing_results.2?;
             indexing_results.3?;
 
-            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
@@ -484,7 +478,6 @@ async fn put_sync_shop(
             indexing_results.1?;
             indexing_results.2?;
 
-            hook.at(TagWriteStep::IndexesWritten).await?;
             Ok(())
         }
     }
@@ -493,8 +486,8 @@ async fn put_sync_shop(
 /// Indexes a tag DEL (an untag).
 ///
 /// Like [`sync_put`], the edge deletion and every Redis index change run in
-/// one graph transaction holding the write locks of the target and the
-/// tagger, so a deletion of the target cannot interleave: it waits for the
+/// one graph transaction holding the target's write lock, so a deletion of
+/// the target cannot interleave: it waits for the
 /// untag, or it finished first and the untag finds no edge.
 pub async fn del(user_id: PubkyId, tag_id: String) -> Result<(), EventProcessorError> {
     del_with_hook(user_id, tag_id, &NoopTagWriteHook).await
@@ -557,7 +550,6 @@ async fn del_in_txn(
     } else {
         return Err(EventProcessorError::SkipIndexing);
     }
-    hook.at(TagWriteStep::IndexesWritten).await?;
     Ok(())
 }
 
