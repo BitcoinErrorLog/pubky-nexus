@@ -1,3 +1,4 @@
+use crate::events::handlers::listing::is_homeserver_not_found;
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use nexus_common::db::reindex::{get_all_user_ids, get_indexed_review_ids};
@@ -120,6 +121,9 @@ pub struct ReviewBackfill {
     pub indexed: usize,
     /// Reviews already present in the index (skipped without a fetch).
     pub already_indexed: usize,
+    /// Reviews listed on the homeserver that were gone by the time they were
+    /// fetched; nothing to index and not a failure.
+    pub gone: usize,
     /// Reviews that could not be fetched, parsed, or ingested this pass.
     pub failed: usize,
 }
@@ -176,6 +180,7 @@ pub async fn backfill_unindexed_reviews() -> Result<ReviewBackfill, DynError> {
             Ok((_, Ok(user_summary))) => {
                 summary.indexed += user_summary.indexed;
                 summary.already_indexed += user_summary.already_indexed;
+                summary.gone += user_summary.gone;
                 summary.failed += user_summary.failed;
             }
             Ok((user_id, Err(e))) => {
@@ -219,7 +224,10 @@ async fn backfill_user_reviews(
         let entries = match request.send().await {
             Ok(entries) => entries,
             // A user with no reviews directory answers 404: nothing to do.
-            Err(_) => return Ok(()),
+            // Any other failure is reported so the pass counts it and a
+            // re-run retries it.
+            Err(e) if is_homeserver_not_found(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
         };
         if entries.is_empty() {
             return Ok(());
@@ -235,7 +243,14 @@ async fn backfill_user_reviews(
                 continue;
             }
             match ingest_review_from_homeserver(user_id, review_id).await {
-                Ok(()) => summary.indexed += 1,
+                Ok(true) => summary.indexed += 1,
+                Ok(false) => {
+                    debug!(
+                        "Review {}/{} left the homeserver after it was listed; skipping",
+                        user_id, review_id
+                    );
+                    summary.gone += 1;
+                }
                 Err(e) => {
                     warn!(
                         "Review backfill could not ingest {}/{}: {:?}",
@@ -254,22 +269,21 @@ async fn backfill_user_reviews(
 }
 
 /// Fetches one review record from the reviewer's homeserver (the canonical
-/// source) and runs the normal ingest.
+/// source) and runs the normal ingest. Returns `false` without indexing when
+/// the record no longer exists on the homeserver.
 async fn ingest_review_from_homeserver(
     user_id: &str,
     review_id: &str,
-) -> Result<(), EventProcessorError> {
+) -> Result<bool, EventProcessorError> {
     let reviewer = PubkyId::try_from(user_id).map_err(EventProcessorError::generic)?;
     let uri = marketplace_review_uri_builder(user_id.to_string(), review_id.to_string());
 
     let pubky = PubkyConnector::get()?;
-    let response = pubky.public_storage().get(&uri).await?;
-    if !response.status().is_success() {
-        return Err(EventProcessorError::client_error(format!(
-            "Fetch resource failed {uri}: HTTP {}",
-            response.status()
-        )));
-    }
+    let response = match pubky.public_storage().get(&uri).await {
+        Ok(response) => response,
+        Err(e) if is_homeserver_not_found(&e) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
     let blob = response
         .bytes()
         .await
@@ -280,7 +294,8 @@ async fn ingest_review_from_homeserver(
         PubkyAppObject::from_resource(&resource, &blob).map_err(EventProcessorError::generic)?;
     match pubky_object {
         PubkyAppObject::MarketplaceReview(review) => {
-            sync_put(review, reviewer, review_id.to_string()).await
+            sync_put(review, reviewer, review_id.to_string()).await?;
+            Ok(true)
         }
         _ => Err(EventProcessorError::generic(format!(
             "Expected a marketplace review record at {uri}"

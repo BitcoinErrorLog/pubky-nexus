@@ -153,12 +153,24 @@ pub enum HomeserverRecord {
     Gone,
 }
 
+/// Whether a Pubky client error is the homeserver's definitive "not found".
+/// The client reports every non-2xx response as an `Err` carrying the status,
+/// so a 404 never arrives as a response to inspect: it is read from here.
+/// Rate limits, 5xx, transport failures, and unresolvable homeservers are not
+/// "not found" and must stay failures.
+pub fn is_homeserver_not_found(error: &pubky::Error) -> bool {
+    matches!(
+        error,
+        pubky::Error::Request(pubky::errors::RequestError::Server { status, .. })
+            if *status == pubky::StatusCode::NOT_FOUND
+    )
+}
+
 /// Asks the seller's homeserver whether the listing record exists. Only a
 /// definitive answer counts: a 404 from the homeserver is `Gone`, a success
 /// is `Present`, and every other outcome (unresolvable homeserver, rate
 /// limit, 5xx, timeout) is an error, so an unreachable homeserver can never
-/// read as a deletion. The Pubky client reports a non-2xx status as an
-/// error, so the 404 is read from that error.
+/// read as a deletion.
 pub async fn listing_record_on_homeserver(
     owner_id: &str,
     listing_id: &str,
@@ -167,11 +179,7 @@ pub async fn listing_record_on_homeserver(
     let pubky = PubkyConnector::get()?;
     match pubky.public_storage().get(&uri).await {
         Ok(_) => Ok(HomeserverRecord::Present),
-        Err(pubky::Error::Request(pubky::errors::RequestError::Server { status, .. }))
-            if status == pubky::StatusCode::NOT_FOUND =>
-        {
-            Ok(HomeserverRecord::Gone)
-        }
+        Err(e) if is_homeserver_not_found(&e) => Ok(HomeserverRecord::Gone),
         Err(e) => Err(e.into()),
     }
 }
@@ -742,21 +750,11 @@ pub async fn reindex_from_homeserver(
     let uri = listing_uri_builder(owner_id.to_string(), listing_id.to_string());
 
     let pubky = PubkyConnector::get()?;
-    let response = pubky.public_storage().get(&uri).await?;
-
-    if response.status().as_u16() == 404 {
-        return Ok(false);
-    }
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unable to read body>".to_string());
-        return Err(EventProcessorError::client_error(format!(
-            "Fetch resource failed {uri}: HTTP {status} - {body}"
-        )));
-    }
+    let response = match pubky.public_storage().get(&uri).await {
+        Ok(response) => response,
+        Err(e) if is_homeserver_not_found(&e) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
 
     let blob = response
         .bytes()
@@ -775,5 +773,28 @@ pub async fn reindex_from_homeserver(
         _ => Err(EventProcessorError::generic(format!(
             "Expected a listing record at {uri}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_homeserver_not_found;
+
+    fn server_error(status: pubky::StatusCode) -> pubky::Error {
+        pubky::errors::RequestError::Server {
+            status,
+            message: "test response".to_string(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn homeserver_404_is_not_found_but_5xx_is_not() {
+        assert!(is_homeserver_not_found(&server_error(
+            pubky::StatusCode::NOT_FOUND
+        )));
+        assert!(!is_homeserver_not_found(&server_error(
+            pubky::StatusCode::INTERNAL_SERVER_ERROR
+        )));
     }
 }
