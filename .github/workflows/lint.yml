@@ -36,4 +36,6 @@ jobs:
           cache-on-failure: true
 
       - name: Run clippy
-        run: cargo clippy --tests -- -D warnings # Fail on clippy warnings (checks main code and tests)
+        # Same scope as scripts/prepush.sh: every package and target (lib,
+        # bins, tests, examples, benches), warnings fail.
+        run: cargo clippy --workspace --all-targets -- -D warnings

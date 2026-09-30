@@ -91,6 +91,9 @@ jobs:
       - name: Run API integration tests
         run: cargo nextest run -p nexus-webapi --no-fail-fast
 
+      - name: Run nexusd unit tests
+        run: cargo nextest run -p nexusd --no-fail-fast
+
       # This test suite uses the TEST_PUBKY_CONNECTION_STRING env variable
       - name: Run WATCHER integration tests
         run: cargo nextest run -p nexus-watcher --no-fail-fast
