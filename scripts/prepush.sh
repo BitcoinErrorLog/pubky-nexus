@@ -36,6 +36,13 @@ if [ ! -t 0 ]; then
   fi
 fi
 
+sha="$(git rev-parse HEAD)"
+# shellcheck source=prepush-stamp.sh
+source "$ROOT/scripts/prepush-stamp.sh"
+if prepush_reuse "$sha"; then
+  exit 0
+fi
+
 # Sibling worktrees share one Cargo target unless this gate overrides it.
 # A shared target can run another tree's test binary. This checkout gets its own.
 shared_target="${CARGO_TARGET_DIR:-}"
@@ -67,21 +74,16 @@ set -a
 . docker/.env-sample
 set +a
 
-port="${PREPUSH_PG_PORT:-55434}"
-name="${PREPUSH_PG_CONTAINER:-prepush-nexus-pg}"
+# A fresh container and data volume for this worktree every gate. Tests
+# create a database per run, and a long-lived container kept thousands.
+# shellcheck source=prepush-pg.sh
+source "$ROOT/scripts/prepush-pg.sh"
+nexus_pg_legacy_cleanup
+name="${PREPUSH_PG_CONTAINER:-$(nexus_pg_name "$ROOT")}"
+port="$(nexus_pg_recreate "$name" "$ROOT" "${PREPUSH_PG_PORT:-}")"
+echo "prepush: postgres ${name} on 127.0.0.1:${port}"
 export POSTGRES_PORT="$port"
 export TEST_PUBKY_CONNECTION_STRING="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${port}/${POSTGRES_DB}?pubky-test=true"
-
-if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  docker run -d --name "$name" \
-    -e POSTGRES_USER="$POSTGRES_USER" \
-    -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-    -e POSTGRES_DB="$POSTGRES_DB" \
-    -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
-    -p "127.0.0.1:${port}:5432" \
-    postgres:18-alpine >/dev/null
-fi
 
 ready=0
 for _ in $(seq 1 60); do
@@ -155,6 +157,6 @@ echo "prepush: cargo test"
 # Redis and Neo4j.
 run_heavy cargo bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --lib --bins --tests --exclude nexus-watcher --no-fail-fast -- --test-threads=1 && cargo nextest run -p nexus-watcher --no-fail-fast -j 1'
 
-sha="$(git rev-parse HEAD)"
+prepush_stamp "$sha"
 seconds="$(( $(date +%s) - start ))"
 echo "PREPUSH OK ${sha} ${seconds}"
