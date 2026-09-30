@@ -74,21 +74,16 @@ set -a
 . docker/.env-sample
 set +a
 
-port="${PREPUSH_PG_PORT:-55434}"
-name="${PREPUSH_PG_CONTAINER:-prepush-nexus-pg}"
+# A fresh container and data volume for this worktree every gate. Tests
+# create a database per run, and a long-lived container kept thousands.
+# shellcheck source=prepush-pg.sh
+source "$ROOT/scripts/prepush-pg.sh"
+nexus_pg_legacy_cleanup
+name="${PREPUSH_PG_CONTAINER:-$(nexus_pg_name "$ROOT")}"
+port="$(nexus_pg_recreate "$name" "$ROOT" "${PREPUSH_PG_PORT:-}")"
+echo "prepush: postgres ${name} on 127.0.0.1:${port}"
 export POSTGRES_PORT="$port"
 export TEST_PUBKY_CONNECTION_STRING="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${port}/${POSTGRES_DB}?pubky-test=true"
-
-# A fresh container and data volume every gate. Tests create a database per
-# run, and a long-lived container kept thousands of them.
-docker rm -f -v "$name" >/dev/null 2>&1 || true
-docker run -d --name "$name" \
-  -e POSTGRES_USER="$POSTGRES_USER" \
-  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-  -e POSTGRES_DB="$POSTGRES_DB" \
-  -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
-  -p "127.0.0.1:${port}:5432" \
-  postgres:18-alpine >/dev/null
 
 ready=0
 for _ in $(seq 1 60); do
