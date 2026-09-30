@@ -36,6 +36,13 @@ if [ ! -t 0 ]; then
   fi
 fi
 
+sha="$(git rev-parse HEAD)"
+# shellcheck source=prepush-stamp.sh
+source "$ROOT/scripts/prepush-stamp.sh"
+if prepush_reuse "$sha"; then
+  exit 0
+fi
+
 # Sibling worktrees share one Cargo target unless this gate overrides it.
 # A shared target can run another tree's test binary. This checkout gets its own.
 shared_target="${CARGO_TARGET_DIR:-}"
@@ -155,6 +162,6 @@ echo "prepush: cargo test"
 # Redis and Neo4j.
 run_heavy cargo bash -c 'cargo run -p nexusd -- db mock && cargo test --workspace --lib --bins --tests --exclude nexus-watcher --no-fail-fast -- --test-threads=1 && cargo nextest run -p nexus-watcher --no-fail-fast -j 1'
 
-sha="$(git rev-parse HEAD)"
+prepush_stamp "$sha"
 seconds="$(( $(date +%s) - start ))"
 echo "PREPUSH OK ${sha} ${seconds}"
