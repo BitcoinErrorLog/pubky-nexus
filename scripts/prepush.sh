@@ -79,16 +79,16 @@ name="${PREPUSH_PG_CONTAINER:-prepush-nexus-pg}"
 export POSTGRES_PORT="$port"
 export TEST_PUBKY_CONNECTION_STRING="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${port}/${POSTGRES_DB}?pubky-test=true"
 
-if ! docker ps --format '{{.Names}}' | grep -qx "$name"; then
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  docker run -d --name "$name" \
-    -e POSTGRES_USER="$POSTGRES_USER" \
-    -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-    -e POSTGRES_DB="$POSTGRES_DB" \
-    -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
-    -p "127.0.0.1:${port}:5432" \
-    postgres:18-alpine >/dev/null
-fi
+# A fresh container and data volume every gate. Tests create a database per
+# run, and a long-lived container kept thousands of them.
+docker rm -f -v "$name" >/dev/null 2>&1 || true
+docker run -d --name "$name" \
+  -e POSTGRES_USER="$POSTGRES_USER" \
+  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+  -e POSTGRES_DB="$POSTGRES_DB" \
+  -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
+  -p "127.0.0.1:${port}:5432" \
+  postgres:18-alpine >/dev/null
 
 ready=0
 for _ in $(seq 1 60); do
