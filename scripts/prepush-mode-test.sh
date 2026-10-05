@@ -214,7 +214,7 @@ commit_change nexusd/src/lib.rs
 st="$(gate)"
 expect_ok "$st" "nexusd fast" fast
 [ "$(cargo_log)" = "fmt --check
-clippy -p nexusd --all-targets -- -D warnings
+clippy -p nexusd --all-targets -- -D warnings -A clippy::double_must_use
 run -p nexusd -- db mock
 test -p nexusd --lib --bins --tests --no-fail-fast -- --test-threads=1" ] \
   || fail "nexusd fast: cargo calls: $(cargo_log)"
@@ -224,7 +224,7 @@ commit_change nexus-watcher/src/lib.rs
 st="$(gate)"
 expect_ok "$st" "watcher fast" fast
 [ "$(cargo_log)" = "fmt --check
-clippy -p nexus-examples -p nexus-watcher -p nexusd --all-targets -- -D warnings
+clippy -p nexus-examples -p nexus-watcher -p nexusd --all-targets -- -D warnings -A clippy::double_must_use
 run -p nexusd -- db mock
 test -p nexus-examples -p nexusd --lib --bins --tests --no-fail-fast -- --test-threads=1
 nextest run -p nexus-watcher --no-fail-fast -j 1" ] \
@@ -235,7 +235,7 @@ commit_change nexus-common/src/lib.rs
 st="$(gate)"
 expect_ok "$st" "common fast" fast
 [ "$(cargo_log)" = "fmt --check
-clippy -p nexus-common -p nexus-examples -p nexus-watcher -p nexus-webapi -p nexusd --all-targets -- -D warnings
+clippy -p nexus-common -p nexus-examples -p nexus-watcher -p nexus-webapi -p nexusd --all-targets -- -D warnings -A clippy::double_must_use
 run -p nexusd -- db mock
 test -p nexus-common -p nexus-examples -p nexus-webapi -p nexusd --lib --bins --tests --no-fail-fast -- --test-threads=1
 nextest run -p nexus-watcher --no-fail-fast -j 1" ] \
@@ -251,7 +251,7 @@ for tool in docker nc curl; do
 done
 
 workspace_calls="fmt --check
-clippy --workspace --all-targets -- -D warnings
+clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
 run -p nexusd -- db mock
 test --workspace --exclude nexus-watcher --lib --bins --tests --no-fail-fast -- --test-threads=1
 nextest run -p nexus-watcher --no-fail-fast -j 1"

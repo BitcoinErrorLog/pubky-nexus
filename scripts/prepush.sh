@@ -227,7 +227,8 @@ if [ "$neo_ready" != 1 ]; then
 fi
 
 echo "prepush: cargo clippy"
-run_heavy cargo cargo clippy "${clippy_scope[@]}" --all-targets -- -D warnings
+# Same lint set as .github/workflows/lint.yml.
+run_heavy cargo cargo clippy "${clippy_scope[@]}" --all-targets -- -D warnings -A clippy::double_must_use
 
 echo "prepush: cargo test"
 echo "  ${test_cmd}"
