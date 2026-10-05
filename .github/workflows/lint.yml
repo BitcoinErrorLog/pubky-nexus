@@ -37,5 +37,7 @@ jobs:
 
       - name: Run clippy
         # Same scope as scripts/prepush.sh: every package and target (lib,
-        # bins, tests, examples, benches), warnings fail.
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # bins, tests, examples, benches), warnings fail. Clippy 1.99 reports
+        # double_must_use on every #[async_trait] method (the macro adds
+        # #[must_use] to a boxed future), so that lint is allowed.
+        run: cargo clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
