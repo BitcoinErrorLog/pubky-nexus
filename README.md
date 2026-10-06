@@ -2,6 +2,15 @@
 
 # Pubky Nexus
 
+> **Frozen since 6 Oct 2026.** Marketplace Nexus development continues in
+> [`pubky/marketplace-nexus`](https://github.com/pubky/marketplace-nexus),
+> which holds this fork's full history. `main` here is locked. This fork stays
+> open only to host the branches of open pull requests to
+> [`pubky/pubky-nexus`](https://github.com/pubky/pubky-nexus), and will be
+> archived once those are closed. The published images
+> (`ghcr.io/bitcoinerrorlog/pubky-nexus`) are kept, because they hold the
+> production and rollback digests.
+
 ## This fork: Pubky Marketplace project
 
 This is `BitcoinErrorLog/pubky-nexus` (branch `feat/marketplace-indexing`),
